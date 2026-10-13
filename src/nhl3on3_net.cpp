@@ -42,6 +42,7 @@
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
+#include <rex/system/xam/user_profile.h>
 #include <rex/system/xsocket.h>
 #include <rex/system/xmemory.h>
 
@@ -68,6 +69,12 @@ REXCVAR_DEFINE_STRING(online_xuid, "", "NHL3on3/Online",
 REXCVAR_DEFINE_STRING(online_gamertag, "", "NHL3on3/Online",
                       "Gamertag shown online, up to 15 characters (empty = profile name); "
                       "each local instance needs its own")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(online_local_users, 1, "NHL3on3/Online",
+                     "Local players signed in to LIVE (1-4), one per controller; extra "
+                     "players get their own XUID and a guest-style gamertag such as 'Name(1)'")
+    .range(1, 4)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(online_service_port, 42127, "NHL3on3/Online",
@@ -237,12 +244,38 @@ void FillXnAddr(XnAddr& xna, uint32_t ip) {
   StoreBE32(xna.online, ip);
 }
 
-// Overwrites a NUL-terminated guest name buffer when online_gamertag is set.
-void StoreGamertag(uint8_t* buffer, uint32_t size) {
-  const std::string gamertag = REXCVAR_GET(online_gamertag);
-  if (gamertag.empty() || size == 0) {
+uint32_t LocalUsers() {
+  return uint32_t(std::clamp(REXCVAR_GET(online_local_users), 1, 4));
+}
+
+bool IsOnlineUser(uint32_t user_index) {
+  return Online() && user_index < LocalUsers();
+}
+
+uint64_t UserXuid(uint32_t user_index) {
+  return State().xuid + (uint64_t(user_index) << 32);
+}
+
+// Extra local players are named like Xbox guests: "Gamertag(1)", "Gamertag(2)".
+std::string UserGamertag(uint32_t user_index) {
+  std::string gamertag = REXCVAR_GET(online_gamertag);
+  if (gamertag.empty()) {
+    gamertag = REX_KERNEL_STATE()->user_profile()->name();
+  }
+  if (user_index == 0) {
+    return gamertag.substr(0, 15);
+  }
+  const std::string suffix = "(" + std::to_string(user_index) + ")";
+  return gamertag.substr(0, 15 - suffix.size()) + suffix;
+}
+
+// Overwrites a NUL-terminated guest name buffer with the user's gamertag. User
+// 0 keeps the profile name unless online_gamertag is set.
+void StoreGamertag(uint32_t user_index, uint8_t* buffer, uint32_t size) {
+  if (size == 0 || (user_index == 0 && REXCVAR_GET(online_gamertag).empty())) {
     return;
   }
+  const std::string gamertag = UserGamertag(user_index);
   const size_t n = std::min<size_t>(gamertag.size(), size - 1);
   std::memset(buffer, 0, size);
   std::memcpy(buffer, gamertag.data(), n);
@@ -322,7 +355,7 @@ extern "C" REX_FUNC(__imp__XamUserGetSigninState) {
   if (!Online()) {
     return original(ctx, base);
   }
-  ctx.r3.u64 = ctx.r3.u32 == 0 ? kSigninStateSignedInToLive : 0;
+  ctx.r3.u64 = IsOnlineUser(ctx.r3.u32) ? kSigninStateSignedInToLive : 0;
 }
 
 extern "C" REX_FUNC(__imp__XamUserGetSigninInfo) {
@@ -331,11 +364,12 @@ extern "C" REX_FUNC(__imp__XamUserGetSigninInfo) {
   const uint32_t user_index = ctx.r3.u32;
   const uint32_t info = ctx.r5.u32;
   original(ctx, base);
-  if (Online() && user_index == 0 && info && ctx.r3.u32 == 0) {
-    StoreBE64(base + info, State().xuid);
+  if (IsOnlineUser(user_index) && info) {
+    StoreBE64(base + info, UserXuid(user_index));
     StoreBE32(base + info + 12, kSigninStateSignedInToLive);
     // X_USER_SIGNIN_INFO::szUserName[16]
-    StoreGamertag(base + info + 0x18, 16);
+    StoreGamertag(user_index, base + info + 0x18, 16);
+    ctx.r3.u64 = 0;
   }
 }
 
@@ -345,18 +379,19 @@ extern "C" REX_FUNC(__imp__XamUserGetName) {
   NHL3ON3_ORIGINAL(__imp__XamUserGetName);
   const uint32_t user_index = ctx.r3.u32, buffer = ctx.r4.u32, length = ctx.r5.u32;
   original(ctx, base);
-  if (Online() && user_index == 0 && buffer && ctx.r3.u32 == 0) {
-    StoreGamertag(base + buffer, std::min<uint32_t>(length, 16));
+  if (IsOnlineUser(user_index) && buffer && length) {
+    StoreGamertag(user_index, base + buffer, std::min<uint32_t>(length, 16));
+    ctx.r3.u64 = 0;
   }
 }
 
 extern "C" REX_FUNC(__imp__XamUserGetXUID) {
   NHL3ON3_TRACE("XamUserGetXUID");
   NHL3ON3_ORIGINAL(__imp__XamUserGetXUID);
-  if (!Online() || ctx.r3.u32 != 0 || !ctx.r5.u32) {
+  if (!IsOnlineUser(ctx.r3.u32) || !ctx.r5.u32) {
     return original(ctx, base);
   }
-  StoreBE64(base + ctx.r5.u32, State().xuid);
+  StoreBE64(base + ctx.r5.u32, UserXuid(ctx.r3.u32));
   ctx.r3.u64 = 0;
 }
 
@@ -1410,7 +1445,16 @@ NHL3ON3_TRACE_PASSTHROUGH(XamShowSigninUI)
 NHL3ON3_TRACE_PASSTHROUGH(XamSessionCreateHandle)
 NHL3ON3_TRACE_PASSTHROUGH(XamSessionRefObjByHandle)
 NHL3ON3_TRACE_PASSTHROUGH(XamUserAreUsersFriends)
-NHL3ON3_TRACE_PASSTHROUGH(XamUserReadProfileSettings)
+// (title, user_index, xuid_count, xuids, ...). The SDK only has user 0's
+// profile, so extra local players read its settings.
+extern "C" REX_FUNC(__imp__XamUserReadProfileSettings) {
+  NHL3ON3_ORIGINAL(__imp__XamUserReadProfileSettings);
+  NHL3ON3_TRACE("XamUserReadProfileSettings");
+  if (ctx.r4.u32 != 0 && ctx.r5.u32 == 0 && IsOnlineUser(ctx.r4.u32)) {
+    ctx.r4.u64 = 0;
+  }
+  original(ctx, base);
+}
 NHL3ON3_TRACE_PASSTHROUGH(XamUserCreateStatsEnumerator)
 NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetTitleID)
 NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetMachineID)
