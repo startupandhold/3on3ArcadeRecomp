@@ -7,12 +7,15 @@
 // string inside the image is used as the format, with the following registers
 // as its arguments.
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -21,13 +24,20 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
 
 REXCVAR_DEFINE_BOOL(guest_log, false, "NHL3on3/Debug",
                     "Log the game's built-in debug messages (online/login diagnostics)");
 
 REXCVAR_DEFINE_STRING(guest_log_backtrace, "Disconnecting from Lobby", "NHL3on3/Debug",
-                      "Log the guest call stack for game messages containing this text");
+                      "Log the guest call stack for game messages containing this text ('|' separates alternatives)");
 
 namespace {
 
@@ -232,9 +242,21 @@ void LogGuestMessage(const char* source, PPCContext& ctx, uint8_t* base) {
   repeats = 0;
   REXLOG_INFO("[{}] {}", source, line);
 
-  const std::string trigger = REXCVAR_GET(guest_log_backtrace);
-  if (!trigger.empty() && line.find(trigger) != std::string::npos) {
-    REXLOG_INFO("[{}]   backtrace: {}", source, Backtrace(ctx, base));
+  // Each distinct call stack is logged once, so per-frame messages can be traced.
+  const std::string triggers = REXCVAR_GET(guest_log_backtrace);
+  bool matched = false;
+  for (size_t start = 0; !matched && start <= triggers.size();) {
+    const size_t end = std::min(triggers.find('|', start), triggers.size());
+    const std::string_view trigger(triggers.data() + start, end - start);
+    matched = !trigger.empty() && line.find(trigger) != std::string::npos;
+    start = end + 1;
+  }
+  if (matched) {
+    static std::unordered_set<std::string> seen;
+    const std::string trace = Backtrace(ctx, base);
+    if (seen.insert(trace).second) {
+      REXLOG_INFO("[{}]   backtrace: {}", source, trace);
+    }
   }
 }
 
@@ -325,3 +347,61 @@ extern "C" REX_FUNC(sub_82830A88) {
 extern "C" REX_FUNC(sub_82CC2940) {
   LogGuestMessage("dirtysdk", ctx, base);
 }
+
+#ifdef _WIN32
+namespace {
+
+// Reports which recompiled function faulted before the SDK's handler ends the
+// process. Runs first-chance, so MMIO and physical-memory watch ranges (which
+// the SDK resolves itself) are skipped.
+LONG CALLBACK GuestCrashReporter(EXCEPTION_POINTERS* info) {
+  const EXCEPTION_RECORD* record = info->ExceptionRecord;
+  if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  const uint8_t* base = GuestBase();
+  const auto host = uintptr_t(record->ExceptionInformation[1]);
+  if (!base || host < uintptr_t(base) || host - uintptr_t(base) > 0xFFFFFFFFull) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  const auto guest = uint32_t(host - uintptr_t(base));
+  if ((guest >= 0x7F000000 && guest < 0x80000000) || guest >= 0xA0000000) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  auto* ts = rex::runtime::ThreadState::Get();
+  static std::atomic<int> reports{0};
+  if (!ts || !ts->context() || reports.fetch_add(1) >= 4) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+
+  const DWORD64 rip = info->ContextRecord->Rip;
+  std::string function = fmt::format("host {:X}", rip);
+  static std::once_flag sym_once;
+  std::call_once(sym_once, [] {
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+  });
+  alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+  auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+  symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+  symbol->MaxNameLen = 255;
+  DWORD64 displacement = 0;
+  if (SymFromAddr(GetCurrentProcess(), rip, &displacement, symbol)) {
+    function = fmt::format("{}+0x{:X}", symbol->Name, displacement);
+  }
+
+  const PPCContext& ctx = *ts->context();
+  REXLOG_INFO("[crash] guest {} of {:08X} in {} (guest thread {:X})",
+              record->ExceptionInformation[0] ? "write" : "read", guest, function,
+              ts->thread_id());
+  REXLOG_INFO("[crash]   r1 {:08X} r3 {:08X} r4 {:08X} r5 {:08X} r29 {:08X} r30 {:08X} r31 {:08X}",
+              ctx.r1.u32, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r29.u32, ctx.r30.u32,
+              ctx.r31.u32);
+  REXLOG_INFO("[crash]   backtrace: {}", Backtrace(ctx, base));
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+const PVOID crash_reporter = AddVectoredExceptionHandler(1, GuestCrashReporter);
+
+}  // namespace
+#endif

@@ -77,6 +77,13 @@ REXCVAR_DEFINE_INT32(online_local_users, 1, "NHL3on3/Online",
     .range(1, 4)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(team_play, 0, "NHL3on3/Online",
+                     "Experimental team play: consoles per online match (3-6), each with "
+                     "its own player; 0 = the normal two-console game. The lobby server "
+                     "needs the same --match-size")
+    .range(0, 6)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(online_service_port, 42127, "NHL3on3/Online",
                      "Port reported for the game's Xbox LIVE service (XOnlineGetServiceInfo)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -771,6 +778,19 @@ void CountDatagram(const char* what, uint32_t socket, uint32_t ip, uint16_t port
   }
 }
 
+// Logs each distinct guest call stack that sends on a datagram socket, to find
+// the game code behind its in-match traffic.
+void LogDatagramStack(uint32_t socket, const PPCContext& ctx, const uint8_t* base) {
+  constexpr size_t kMaxStacks = 64;
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  const std::string stack = Nhl3on3GuestBacktrace(ctx, base);
+  std::lock_guard lock(mutex);
+  if (seen.size() < kMaxStacks && seen.insert(stack).second) {
+    REXLOG_INFO("[net] send stack {:X}: {}", socket, stack);
+  }
+}
+
 bool IsDatagram(uint32_t socket) {
   std::lock_guard lock(g_dgram_mutex);
   return g_dgram_sockets.count(socket) != 0;
@@ -945,6 +965,30 @@ extern "C" REX_FUNC(__imp__NetDll_recvfrom) {
   ctx.r3.u64 = uint32_t(n);
 }
 
+// (caller, socket, sockaddr* name, int* namelen). The runtime only stubs this.
+// CommUDP reads each open socket's bound port to share one socket between all
+// peers on the game port; without it a second peer gets a socket of its own
+// whose bind fails, and that connection never comes up.
+extern "C" REX_FUNC(__imp__NetDll_getsockname) {
+  const uint32_t socket = ctx.r4.u32, name = ctx.r5.u32, namelen = ctx.r6.u32;
+  NativeSocket native;
+  sockaddr_in local{};
+  NativeSockLen len = sizeof(local);
+  if (!name || !namelen || LoadBE32(base + namelen) < 16 || !NativeHandle(socket, native) ||
+      ::getsockname(native, reinterpret_cast<sockaddr*>(&local), &len) != 0) {
+    t_forced_error = 10022;  // WSAEINVAL
+    ctx.r3.u64 = 0xFFFFFFFF;
+    return;
+  }
+  uint8_t* sa = base + name;
+  std::memset(sa, 0, 16);
+  StoreBE16(sa, AF_INET);
+  StoreBE16(sa + 2, ntohs(local.sin_port));
+  StoreBE32(sa + 4, ntohl(local.sin_addr.s_addr));
+  StoreBE32(base + namelen, 16);
+  ctx.r3.u64 = 0;
+}
+
 // (caller, socket, buffer, length, flags, const sockaddr* to, tolen)
 // DirtySDK's send-address remap table turns the peer's address into 127.0.0.1
 // on the wire, while CommUDP keeps matching replies against the real peer
@@ -979,6 +1023,7 @@ extern "C" REX_FUNC(__imp__NetDll_sendto) {
     t_forced_error = error;
   } else {
     CountDatagram("send", socket, ip, port, base + buffer, n);
+    LogDatagramStack(socket, ctx, base);
   }
   LogOnChange("sendto", socket,
               fmt::format("to {}:{}{} = {} error {}", FormatIp(requested), port,
@@ -1249,6 +1294,23 @@ extern "C" REX_FUNC(sub_827623F0) {
               uint32_t(ctx.lr));
 }
 
+extern "C" void __imp__sub_82753958(PPCContext& __restrict ctx, uint8_t* base);
+
+// DirtySDK send-address remap(out, in) -> sockaddr to use. It rewrites peer
+// addresses to 127.0.0.1, which on one PC hides which instance a packet is
+// for; with more than one peer, each keeps its own loopback address instead.
+extern "C" REX_FUNC(sub_82753958) {
+  const uint32_t in = ctx.r4.u32;
+  const uint32_t requested = in ? LoadBE32(base + in + 4) : 0;
+  __imp__sub_82753958(ctx, base);
+  const uint32_t out = ctx.r3.u32;
+  if (Online() && out && out != in && IsLoopback(State().local_ip) &&
+      IsLoopback(requested) && requested != kLoopbackIp &&
+      LoadBE32(base + out + 4) == kLoopbackIp) {
+    StoreBE32(base + out + 4, requested);
+  }
+}
+
 extern "C" void __imp__sub_8275E0A8(PPCContext& __restrict ctx, uint8_t* base);
 
 // DirtySDK NetConnStatus(selector, data, buffer, size): logs each selector's
@@ -1342,8 +1404,15 @@ extern "C" REX_FUNC(sub_82761188) {
 
 extern "C" void __imp__sub_82768468(PPCContext& __restrict ctx, uint8_t* base);
 
-// XSession wrapper control(session, selector, value, ..., data).
+// XSession wrapper control(session, selector, value, ..., data). 'slot' sets the
+// public slot count that XSessionCreate/XSessionModify receive; the game asks
+// for 2, which leaves no room for a third console.
 extern "C" REX_FUNC(sub_82768468) {
+  constexpr uint32_t kSlot = 0x736C6F74;  // 'slot'
+  if (ctx.r4.u32 == kSlot && REXCVAR_GET(team_play) >= 3 &&
+      ctx.r5.u32 < uint32_t(REXCVAR_GET(team_play))) {
+    ctx.r5.u64 = uint32_t(REXCVAR_GET(team_play));
+  }
   const uint32_t session = ctx.r3.u32, selector = ctx.r4.u32, value = ctx.r5.u32,
                  data = ctx.r7.u32;
   __imp__sub_82768468(ctx, base);
@@ -1352,6 +1421,59 @@ extern "C" REX_FUNC(sub_82768468) {
                 value, data, int32_t(ctx.r3.u32), SessionState(base, session));
   }
 }
+
+extern "C" void __imp__sub_82761E08(PPCContext& __restrict ctx, uint8_t* base);
+
+// ConnApiCreate(game port, max clients, callback, user data, ...). The match's
+// ConnApi takes 2 clients (itself and one opponent); later lobby members are
+// dropped from its list and never connected.
+extern "C" REX_FUNC(sub_82761E08) {
+  const int32_t team = REXCVAR_GET(team_play);
+  if (team >= 3 && ctx.r4.u32 == 2) {
+    REXLOG_INFO("[mm] team play: ConnApi port {} max clients 2 -> {}", ctx.r3.u32, team);
+    ctx.r4.u64 = uint32_t(team);
+  }
+  __imp__sub_82761E08(ctx, base);
+}
+
+// The online module's config (from the manager at 0x83216B34, virtual 192)
+// holds the session's maximum user count at +184. It is 2, and sizes the
+// game session's user pool, game setup and peer connection tables, and the
+// match ConnApi; a third console overruns them. Every reader raises it first.
+void ApplyTeamPlayConfig(PPCContext& caller, uint8_t* base) {
+  const int32_t team = REXCVAR_GET(team_play);
+  const uint32_t manager = LoadBE32(base + 0x83216B34);
+  if (team < 3 || !manager) {
+    return;
+  }
+  PPCFunc* get_config =
+      rex::runtime::ResolveIndirectFunction(LoadBE32(base + LoadBE32(base + manager) + 192));
+  if (!get_config) {
+    return;
+  }
+  PPCContext ctx = caller;
+  ctx.r3.u64 = manager;
+  get_config(ctx, base);
+  const uint32_t config = ctx.r3.u32;
+  if (config && LoadBE32(base + config + 184) < uint32_t(team)) {
+    REXLOG_INFO("[mm] team play: session max users {} -> {}", LoadBE32(base + config + 184), team);
+    StoreBE32(base + config + 184, uint32_t(team));
+  }
+}
+
+#define TEAM_PLAY_CONFIG_READER(name)                                  \
+  extern "C" void __imp__##name(PPCContext& __restrict ctx, uint8_t* base); \
+  extern "C" REX_FUNC(name) {                                          \
+    ApplyTeamPlayConfig(ctx, base);                                    \
+    __imp__##name(ctx, base);                                          \
+  }
+
+TEAM_PLAY_CONFIG_READER(sub_82AE5628)
+TEAM_PLAY_CONFIG_READER(sub_82AE57F8)
+TEAM_PLAY_CONFIG_READER(sub_82AE59B8)
+TEAM_PLAY_CONFIG_READER(sub_82BC9840)  // peer connection manager
+TEAM_PLAY_CONFIG_READER(sub_82BDC148)  // game session (user pool)
+TEAM_PLAY_CONFIG_READER(sub_82BDC8D8)  // GameSetupConcrete constructor
 
 extern "C" void __imp__sub_82767968(PPCContext& __restrict ctx, uint8_t* base);
 

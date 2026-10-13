@@ -88,6 +88,9 @@ def lobby_fields(body):
 LKEY = "3fcf27540c92935b0a66fd3b0000283c"
 ROOM_ID = 1
 RANKED_SYSFLAG = 1 << 18
+# Consoles per quick match (--match-size). The game asks for 2; more is the
+# experimental team play mode, with every console in one game.
+match_size = 2
 
 
 class Client:
@@ -105,6 +108,11 @@ class Client:
         self.game = None
         self.userflags = "0"
         self.userparams = ""
+        # The client's guest list exactly as its gset GUEST sent it, e.g.
+        # Alpha(1) or "Alpha(1),Alpha(2)"; returned verbatim as OPGUEST. The
+        # game maps each guest's "(N)" suffix to its controller, so any other
+        # value (even "0") becomes a guest with no controller.
+        self.guest_field = ""
 
     @property
     def ip(self):
@@ -180,8 +188,8 @@ def game_info(game):
         "SYSFLAGS": sysflags,
         "COUNT": len(game.players),
         "PRIV": req.get("PRIV", 0),
-        "MINSIZE": req.get("MINSIZE", 2),
-        "MAXSIZE": req.get("MAXSIZE", 2),
+        "MINSIZE": match_size if match_size > 2 else req.get("MINSIZE", 2),
+        "MAXSIZE": match_size if match_size > 2 else req.get("MAXSIZE", 2),
         "NUMPART": 1,
         "SEED": game.id * 7919,
         "WHEN": f"{game.when:%Y.%m.%d-%H:%M:%S}",
@@ -203,7 +211,8 @@ def game_info(game):
             f"OPPARAM{i}": p.userparams,
             f"OPFLAG{i}": p.userflags,
             f"PRES{i}": 0,
-            f"PARTSIZE{i}": req.get("MAXSIZE", 2),
+            f"OPGUEST{i}": p.guest_field,
+            f"PARTSIZE{i}": match_size if match_size > 2 else req.get("MAXSIZE", 2),
             f"PARTPARAMS{i}": "",
         })
     return info
@@ -227,6 +236,7 @@ def leave_game(client):
     if client in quick_queue:
         quick_queue.remove(client)
     game, client.game = client.game, None
+    client.guest_field = ""
     if not game:
         return
     game.players.remove(client)
@@ -237,7 +247,7 @@ def leave_game(client):
 
 
 def quick_match(client, request):
-    """gqwk MODE=2 waits until another player searches; the two are then put in
+    """gqwk MODE=2 waits until match_size players search; they are then put in
     one game, the first searcher hosting. MODE=3 cancels.
 
     The game's LobbyMatchupGameModule reports a match only after both its own
@@ -255,14 +265,16 @@ def quick_match(client, request):
     leave_game(client)
     client.userflags = "0"
     client.search = request
-    if not quick_queue:
+    if len(quick_queue) + 1 < match_size:
         quick_queue.append(client)
-        log(f"quick match: {client.persona}#{client.id} waiting for an opponent")
+        log(f"quick match: {client.persona}#{client.id} waiting "
+            f"({len(quick_queue)}/{match_size} searching)")
         return
-    host = quick_queue.pop(0)
-    game = Game(host.search, [host, client])
-    log(f"quick match: game {game.id} host {host.persona}#{host.id} ({host.ip}) "
-        f"vs {client.persona}#{client.id} ({client.ip})")
+    players = quick_queue[:match_size - 1] + [client]
+    del quick_queue[:match_size - 1]
+    game = Game(players[0].search, players)
+    log(f"quick match: game {game.id} host {players[0].persona}#{players[0].id} with "
+        + ", ".join(f"{p.persona}#{p.id} ({p.ip})" for p in players))
 
     def notify():
         if not game.players:
@@ -327,6 +339,10 @@ def lobby_reply(cmd, server_ip, request, client):
     if cmd == b"gset":
         client.userflags = request.get("USERFLAGS", client.userflags)
         client.userparams = request.get("USERPARAMS", client.userparams)
+        if "GUEST" in request:
+            client.guest_field = request["GUEST"]
+            names = [g for g in client.guest_field.strip('"').split(",") if g]
+            log(f"guests: {client.persona}#{client.id} now has {names}")
         if client.game:
             if client is client.game.players[0]:
                 client.game.request.update(
@@ -432,7 +448,11 @@ def main():
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--respond", action="store_true",
                     help="answer the lobby directory request (@dir) instead of only logging")
+    ap.add_argument("--match-size", type=int, default=2,
+                    help="consoles per quick match; above 2 is experimental team play")
     args = ap.parse_args()
+    global match_size
+    match_size = max(2, args.match_size)
 
     sel = selectors.DefaultSelector()
     for port in filter(None, args.tcp.split(",")):
