@@ -2,9 +2,12 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
-#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
@@ -15,19 +18,123 @@
 REXCVAR_DEFINE_BOOL(skip_intro, true, "NHL3on3/General",
                     "Skip the EA Sports Freestyle intro movie at boot");
 
+REXCVAR_DEFINE_STRING(menu_renames, "XBOX LIVE=ONLINE MULTIPLAYER", "NHL3on3/General",
+                      "Front-end text replacements, 'OLD=NEW' pairs separated by ';'. "
+                      "Matches whole localized strings exactly (they are upper case)");
+
 REXCVAR_DEFINE_BOOL(log_ui_text, false, "NHL3on3/General",
-                    "Log every string the front end localizes (for finding menu text)");
+                    "Log every string the front end localizes (to find text for menu_renames)");
 
 namespace {
-
-uint8_t* GuestBase() {
-  auto* memory = REX_KERNEL_MEMORY();
-  return memory ? memory->virtual_membase() : nullptr;
-}
 
 uint32_t Load32(const uint8_t* base, uint32_t address) {
   const uint8_t* p = base + address;
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+}
+
+void Store32(uint8_t* base, uint32_t address, uint32_t value) {
+  uint8_t* p = base + address;
+  p[0] = uint8_t(value >> 24);
+  p[1] = uint8_t(value >> 16);
+  p[2] = uint8_t(value >> 8);
+  p[3] = uint8_t(value);
+}
+
+// The LocalizeString natives keep their result in a string object at sp+80:
+// +0 allocator, +4 char* (NUL-terminated UTF-8).
+constexpr uint32_t kResultOffset = 80;
+constexpr uint32_t kDataOffset = 4;
+
+struct Renames {
+  std::mutex mutex;
+  std::string source;
+  std::unordered_map<std::string, std::string> text;
+  std::unordered_map<std::string, uint32_t> guest;  // replacement -> guest copy
+};
+
+Renames& GetRenames() {
+  static Renames renames;
+  return renames;
+}
+
+void Parse(Renames& r, const std::string& spec) {
+  r.source = spec;
+  r.text.clear();
+  size_t start = 0;
+  while (start <= spec.size()) {
+    size_t end = spec.find(';', start);
+    if (end == std::string::npos) end = spec.size();
+    const std::string pair = spec.substr(start, end - start);
+    const size_t eq = pair.find('=');
+    if (eq != std::string::npos && eq > 0) {
+      r.text[pair.substr(0, eq)] = pair.substr(eq + 1);
+    }
+    start = end + 1;
+  }
+}
+
+// Returns the guest address of the replacement for `text`, or 0.
+uint32_t FindReplacement(rex::memory::Memory* memory, const std::string& text) {
+  Renames& r = GetRenames();
+  std::lock_guard lock(r.mutex);
+  const std::string spec = REXCVAR_GET(menu_renames);
+  if (spec != r.source) {
+    Parse(r, spec);
+  }
+  const auto it = r.text.find(text);
+  if (it == r.text.end()) {
+    return 0;
+  }
+  auto& address = r.guest[it->second];
+  if (!address) {
+    const uint32_t size = uint32_t(it->second.size() + 1);
+    address = memory->SystemHeapAlloc(size);
+    if (address) {
+      std::memcpy(memory->TranslateVirtual(address), it->second.c_str(), size);
+    }
+  }
+  return address;
+}
+
+// Original data pointers swapped out, keyed by the native's stack pointer.
+thread_local std::vector<std::pair<uint32_t, uint32_t>> t_swapped;
+
+void AfterLookup(uint32_t sp) {
+  auto* memory = REX_KERNEL_MEMORY();
+  if (!memory) {
+    return;
+  }
+  uint8_t* base = memory->virtual_membase();
+  const uint32_t field = sp + kResultOffset + kDataOffset;
+  const uint32_t data = Load32(base, field);
+  if (!data) {
+    return;
+  }
+  const std::string text(reinterpret_cast<const char*>(base + data));
+  if (REXCVAR_GET(log_ui_text)) {
+    REXLOG_INFO("[ui] localized '{}'", text);
+  }
+  if (const uint32_t replacement = FindReplacement(memory, text)) {
+    t_swapped.emplace_back(sp, data);
+    Store32(base, field, replacement);
+    if (REXCVAR_GET(log_ui_text)) {
+      REXLOG_INFO("[ui]   -> '{}'", reinterpret_cast<const char*>(base + replacement));
+    }
+  }
+}
+
+// The string has been copied into a script value; put the original buffer back
+// before the destructor frees it.
+void AfterConvert(uint32_t sp) {
+  if (t_swapped.empty() || t_swapped.back().first != sp) {
+    return;
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  if (memory) {
+    Store32(memory->virtual_membase(), sp + kResultOffset + kDataOffset,
+            t_swapped.back().second);
+  }
+  t_swapped.pop_back();
 }
 
 }  // namespace
@@ -48,31 +155,10 @@ void Nhl3on3MovieStateHook(PPCRegister& r3) {
   }
 }
 
-// Diagnostic: LocalizeString (sub_82AC3FC0) right after the lookup fills the
-// string object at sp+80.
-void Nhl3on3LocalizeHook(PPCRegister& r1) {
-  uint8_t* base = GuestBase();
-  if (!base || !REXCVAR_GET(log_ui_text)) {
-    return;
-  }
-  const uint32_t obj = r1.u32 + 80;
-  std::string words;
-  for (uint32_t i = 0; i < 4; ++i) {
-    words += fmt::format(" {:08X}", Load32(base, obj + i * 4));
-  }
-  std::string text;
-  for (uint32_t i = 0; i < 2; ++i) {
-    const uint32_t p = Load32(base, obj + i * 4);
-    if (p < 0x40000000 || p >= 0xF0000000) {
-      continue;
-    }
-    std::string s;
-    for (uint32_t j = 0; j < 96; ++j) {
-      const uint8_t c = base[p + j];
-      if (!c) break;
-      s += (c >= 0x20 && c < 0x7F) ? char(c) : '.';
-    }
-    text += fmt::format(" [{}]='{}'", i, s);
-  }
-  REXLOG_INFO("[ui] localize obj{}{}", words, text);
+void Nhl3on3LocalizeLookupHook(PPCRegister& r1) {
+  AfterLookup(r1.u32);
+}
+
+void Nhl3on3LocalizeConvertHook(PPCRegister& r1) {
+  AfterConvert(r1.u32);
 }

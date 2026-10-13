@@ -231,11 +231,28 @@ name = "Nhl3on3MovieStateHook"
 address = 0x82A11668
 registers = ["r3"]
 
-# Menu text: LocalizeString (sub_82AC3FC0) after the localization interface has
-# filled the result string at sp+80, before it is converted for the script.
+# Menu text: the LocalizeString (sub_82AC3FC0) and LocalizeStringMixedCase
+# (sub_82AC4040) script natives. Lookup hooks run once the result string at
+# sp+80 is filled; convert hooks run after it was copied into a script value
+# and before its destructor.
 [[midasm_hook]]
-name = "Nhl3on3LocalizeHook"
+name = "Nhl3on3LocalizeLookupHook"
 address = 0x82AC400C
+registers = ["r1"]
+
+[[midasm_hook]]
+name = "Nhl3on3LocalizeConvertHook"
+address = 0x82AC4014
+registers = ["r1"]
+
+[[midasm_hook]]
+name = "Nhl3on3LocalizeLookupHook"
+address = 0x82AC408C
+registers = ["r1"]
+
+[[midasm_hook]]
+name = "Nhl3on3LocalizeConvertHook"
+address = 0x82AC4094
 registers = ["r1"]
 
 # Online diagnostics (--guest_log): the LobbyApi reply loop in sub_8278C2A0 and
