@@ -223,6 +223,21 @@ name = "Nhl3on3ScreenWidthHook"
 address = 0x82724AE8
 registers = ["f0"]
 
+# Intro skip: sub_82A11638 compares a movie player's state (r3, just returned
+# by the player's vtable +88) against the last one seen and fires the script
+# callbacks for "playing" (2) and "stopped" (4).
+[[midasm_hook]]
+name = "Nhl3on3MovieStateHook"
+address = 0x82A11668
+registers = ["r3"]
+
+# Menu text: LocalizeString (sub_82AC3FC0) after the localization interface has
+# filled the result string at sp+80, before it is converted for the script.
+[[midasm_hook]]
+name = "Nhl3on3LocalizeHook"
+address = 0x82AC400C
+registers = ["r1"]
+
 # Online diagnostics (--guest_log): the LobbyApi reply loop in sub_8278C2A0 and
 # the 'logn' status query in sub_8278AF88, which reads the persona at +6132.
 [[midasm_hook]]

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -134,6 +135,25 @@ std::string Format(const uint8_t* base, const std::string& fmt, const uint64_t* 
                       wide ? (unsigned long long)take() : (unsigned long long)uint32_t(take()));
         out += spec;
         break;
+      // Variadic doubles are passed as raw bits in the next GPR slot.
+      case 'f':
+      case 'F':
+      case 'e':
+      case 'E':
+      case 'g':
+      case 'G': {
+        const uint64_t bits = take();
+        double value;
+        std::memcpy(&value, &bits, sizeof(value));
+        const std::string float_spec = fmt.substr(start, i - start + 1);
+        if (float_spec.find('*') != std::string::npos) {
+          out += float_spec;
+          break;
+        }
+        std::snprintf(spec, sizeof(spec), float_spec.c_str(), value);
+        out += spec;
+        break;
+      }
       default:
         take();
         out += fmt.substr(start, i - start + 1);

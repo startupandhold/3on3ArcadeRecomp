@@ -10,7 +10,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # The Windows clang presets leave the per-config flags empty, which builds the
 # recompiled guest code at -O0.
-add_compile_options($<$<CONFIG:Release,RelWithDebInfo>:-O2>)
+add_compile_options($<$<CONFIG:RelWithDebInfo>:-O2>)
+
+# Release is the shipping build: ThinLTO over the recompiled code and a portable
+# x86-64-v3 (AVX2) target. Never -march=native: on AMD it enables SSE4a, whose
+# EXTRQ/INSERTQ crash on Intel CPUs.
+set(NHL3ON3_RELEASE_ARCH "x86-64-v3" CACHE STRING "-march for Release builds")
+add_compile_options(
+    $<$<CONFIG:Release>:-O3>
+    $<$<CONFIG:Release>:-DNDEBUG>
+    $<$<CONFIG:Release>:-march=${NHL3ON3_RELEASE_ARCH}>
+    $<$<CONFIG:Release>:-flto=thin>)
+add_link_options($<$<CONFIG:Release>:-flto=thin>)
 
 include(generated/rexglue.cmake)
 
@@ -22,6 +33,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_display.cpp
     src/nhl3on3_net.cpp
     src/nhl3on3_guest_log.cpp
+    src/nhl3on3_ui.cpp
 )
 
 if(WIN32)
