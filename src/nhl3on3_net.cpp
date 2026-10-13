@@ -1,0 +1,1420 @@
+// Xbox LIVE emulation for online play.
+//
+// The SDK's XNet layer is a stub (no link, loopback address, empty service
+// lookups), so the game never gets past its network checks. With --online the
+// overrides below present a signed-in LIVE profile and a working XNet stack:
+//   - XNADDRs carry the machine's real IPv4 address, so peers can resolve each
+//     other with XNetXnAddrToInAddr.
+//   - DNS and LSP (XNetServerToInAddr) lookups resolve to --online_server,
+//     where a Blaze-compatible server is expected.
+// Every lookup and outgoing connection is logged with the "[net]" prefix.
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+#include <rex/cvar.h>
+#include <rex/kernel/xboxkrnl/threading.h>
+#include <rex/logging.h>
+#include <rex/ppc/func.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
+#include <rex/system/xsocket.h>
+#include <rex/system/xmemory.h>
+
+#include "runtime_export.h"
+
+REXCVAR_DEFINE_BOOL(online, false, "NHL3on3/Online",
+                    "Emulate a signed-in Xbox LIVE profile and network stack for online play")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(online_server, "127.0.0.1", "NHL3on3/Online",
+                      "Host or IPv4 address of the Blaze server; all game DNS/LSP lookups "
+                      "resolve here")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(online_ip, "", "NHL3on3/Online",
+                      "IPv4 address advertised to other players (empty = detect the LAN "
+                      "address; set to a VPN address such as Radmin/ZeroTier to play over it)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(online_xuid, "", "NHL3on3/Online",
+                      "Online XUID as 16 hex digits (empty = derived from the advertised IP)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(online_gamertag, "", "NHL3on3/Online",
+                      "Gamertag shown online, up to 15 characters (empty = profile name); "
+                      "each local instance needs its own")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(online_service_port, 42127, "NHL3on3/Online",
+                     "Port reported for the game's Xbox LIVE service (XOnlineGetServiceInfo)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+
+using nhl3on3::GuestFunc;
+using nhl3on3::ResolveRuntimeExport;
+
+constexpr uint32_t kSigninStateSignedInToLive = 2;
+constexpr uint32_t kEthernetLinkActive100Full = 0x01 | 0x02 | 0x08;
+// XNET_GET_XNADDR_DHCP | _GATEWAY | _DNS | _ONLINE
+constexpr uint32_t kXnAddrStatusOnline = 0x08 | 0x20 | 0x40 | 0x80;
+constexpr uint32_t kConnectStatusConnected = 2;
+// XNET_XNQOSINFO_COMPLETE | _TARGET_CONTACTED
+constexpr uint8_t kQosInfoContacted = 0x01 | 0x02;
+constexpr uint16_t kVdpPort = 1000;
+
+uint32_t LoadBE32(const uint8_t* p) {
+  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+}
+void StoreBE16(uint8_t* p, uint16_t v) {
+  p[0] = uint8_t(v >> 8);
+  p[1] = uint8_t(v);
+}
+void StoreBE32(uint8_t* p, uint32_t v) {
+  p[0] = uint8_t(v >> 24);
+  p[1] = uint8_t(v >> 16);
+  p[2] = uint8_t(v >> 8);
+  p[3] = uint8_t(v);
+}
+void StoreBE64(uint8_t* p, uint64_t v) {
+  StoreBE32(p, uint32_t(v >> 32));
+  StoreBE32(p + 4, uint32_t(v));
+}
+
+std::string FormatIp(uint32_t ip) {
+  return std::to_string(ip >> 24) + "." + std::to_string((ip >> 16) & 0xFF) + "." +
+         std::to_string((ip >> 8) & 0xFF) + "." + std::to_string(ip & 0xFF);
+}
+
+// Guest XNet structures (big-endian, IN_ADDRs stored in network order).
+struct XnAddr {
+  uint8_t ina[4];
+  uint8_t ina_online[4];
+  uint8_t port_online[2];
+  uint8_t enet[6];
+  uint8_t online[20];
+};
+static_assert(sizeof(XnAddr) == 36);
+
+struct XnDns {
+  uint8_t status[4];
+  uint8_t count[4];
+  uint8_t addrs[8][4];
+};
+
+struct XnQosInfo {
+  uint8_t flags;
+  uint8_t reserved;
+  uint8_t probes_xmit[2];
+  uint8_t probes_recv[2];
+  uint8_t data_size[2];
+  uint8_t data_ptr[4];
+  uint8_t rtt_min[2];
+  uint8_t rtt_med[2];
+  uint8_t up_bps[4];
+  uint8_t down_bps[4];
+};
+static_assert(sizeof(XnQosInfo) == 24);
+
+struct XnQos {
+  uint8_t count[4];
+  uint8_t count_pending[4];
+  XnQosInfo info[1];
+};
+
+struct NetState {
+  uint32_t local_ip = 0x7F000001;
+  uint32_t server_ip = 0x7F000001;
+  uint64_t xuid = 0;
+};
+
+uint32_t ResolveIpv4(const std::string& host) {
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  addrinfo* result = nullptr;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || !result) {
+    return 0;
+  }
+  uint32_t ip = ntohl(reinterpret_cast<sockaddr_in*>(result->ai_addr)->sin_addr.s_addr);
+  freeaddrinfo(result);
+  return ip;
+}
+
+// The source address the OS would use to reach the internet; no packet is sent.
+uint32_t DetectLocalIp() {
+  auto sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in remote{};
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(53);
+  inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
+  uint32_t ip = 0;
+  if (connect(sock, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) == 0) {
+    sockaddr_in local{};
+    socklen_t len = sizeof(local);
+    if (getsockname(sock, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+      ip = ntohl(local.sin_addr.s_addr);
+    }
+  }
+#if defined(_WIN32)
+  closesocket(sock);
+#else
+  close(sock);
+#endif
+  return ip;
+}
+
+const NetState& State() {
+  static const NetState state = [] {
+#if defined(_WIN32)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    NetState s;
+    const std::string ip_setting = REXCVAR_GET(online_ip);
+    uint32_t ip = ip_setting.empty() ? DetectLocalIp() : ResolveIpv4(ip_setting);
+    if (ip) {
+      s.local_ip = ip;
+    }
+    if (uint32_t server = ResolveIpv4(REXCVAR_GET(online_server))) {
+      s.server_ip = server;
+    } else {
+      REXLOG_ERROR("[net] could not resolve online_server '{}'", REXCVAR_GET(online_server));
+    }
+    const std::string xuid_setting = REXCVAR_GET(online_xuid);
+    if (!xuid_setting.empty()) {
+      s.xuid = std::stoull(xuid_setting, nullptr, 16);
+    } else {
+      s.xuid = 0x0009000000000000ull | (uint64_t(0xEA09) << 32) | s.local_ip;
+    }
+    REXLOG_INFO("[net] online: local {} server {} xuid {:016X}", FormatIp(s.local_ip),
+                FormatIp(s.server_ip), s.xuid);
+    return s;
+  }();
+  return state;
+}
+
+bool Online() {
+  return REXCVAR_GET(online);
+}
+
+// The most recent remote address handed out by XNetXnAddrToInAddr.
+std::atomic<uint32_t> g_last_peer_ip{0};
+
+void FillXnAddr(XnAddr& xna, uint32_t ip) {
+  std::memset(&xna, 0, sizeof(xna));
+  StoreBE32(xna.ina, ip);
+  StoreBE32(xna.ina_online, ip);
+  StoreBE16(xna.port_online, kVdpPort);
+  // Deterministic per-address MAC; DirtySDK and others seed IDs from abEnet.
+  xna.enet[0] = 0x00;
+  xna.enet[1] = 0x22;
+  StoreBE32(xna.enet + 2, ip);
+  StoreBE32(xna.online, ip);
+}
+
+// Overwrites a NUL-terminated guest name buffer when online_gamertag is set.
+void StoreGamertag(uint8_t* buffer, uint32_t size) {
+  const std::string gamertag = REXCVAR_GET(online_gamertag);
+  if (gamertag.empty() || size == 0) {
+    return;
+  }
+  const size_t n = std::min<size_t>(gamertag.size(), size - 1);
+  std::memset(buffer, 0, size);
+  std::memcpy(buffer, gamertag.data(), n);
+}
+
+bool IsLoopback(uint32_t ip) {
+  return (ip >> 24) == 127;
+}
+
+uint32_t XnAddrToIp(const XnAddr& xna) {
+  uint32_t online = LoadBE32(xna.ina_online);
+  return online ? online : LoadBE32(xna.ina);
+}
+
+void SignalEvent(uint32_t handle) {
+  if (handle) {
+    rex::kernel::xboxkrnl::xeNtSetEvent(handle, nullptr);
+  }
+}
+
+template <typename T>
+T* GuestAlloc(uint8_t* base, uint32_t& guest_address) {
+  guest_address = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(T));
+  auto* host = reinterpret_cast<T*>(base + guest_address);
+  std::memset(host, 0, sizeof(T));
+  return host;
+}
+
+void LogSockaddr(const char* what, uint32_t socket, const uint8_t* sa) {
+  uint16_t port = uint16_t((sa[2] << 8) | sa[3]);
+  REXLOG_INFO("[net] {}(socket {:X}) -> {}:{}", what, socket, FormatIp(LoadBE32(sa + 4)), port);
+}
+
+}  // namespace
+
+#define NHL3ON3_ORIGINAL(name) \
+  static const GuestFunc original = ResolveRuntimeExport(#name)
+
+// Logs a call with its arguments and result whenever its result differs from
+// the last call with the same first argument, plus every 256th call.
+#define NHL3ON3_TRACE(name)                                                              \
+  static std::array<std::atomic<uint64_t>, 16> trace_last_{};                            \
+  static std::atomic<uint32_t> trace_count_{0};                                          \
+  const uint32_t trace_args_[4] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};      \
+  struct TraceOnExit {                                                                   \
+    PPCContext& ctx;                                                                     \
+    const uint32_t* args;                                                                \
+    ~TraceOnExit() {                                                                     \
+      if (!Online()) {                                                                   \
+        return;                                                                          \
+      }                                                                                  \
+      uint64_t key = (uint64_t(args[0]) << 32) | ctx.r3.u32 | (1ull << 63);              \
+      uint32_t n = trace_count_++;                                                       \
+      auto& slot = trace_last_[(args[0] ^ (args[0] >> 4)) & 15];                         \
+      if (slot.exchange(key) != key || n % 256 == 0) {                                   \
+        REXLOG_INFO("[net] " name "({:X}, {:X}, {:X}, {:X}) = {:X}  [call {}]", args[0], \
+                    args[1], args[2], args[3], ctx.r3.u32, n + 1);                       \
+      }                                                                                  \
+    }                                                                                    \
+  } trace_on_exit_{ctx, trace_args_}
+
+// Forwards to the SDK implementation, tracing the call.
+#define NHL3ON3_TRACE_PASSTHROUGH(name)          \
+  extern "C" REX_FUNC(__imp__##name) {           \
+    NHL3ON3_ORIGINAL(__imp__##name);             \
+    NHL3ON3_TRACE(#name);                        \
+    original(ctx, base);                         \
+  }
+
+//----------------------------------------------------------------------------
+// Profile: signed in to LIVE with an online XUID.
+//----------------------------------------------------------------------------
+
+extern "C" REX_FUNC(__imp__XamUserGetSigninState) {
+  NHL3ON3_TRACE("XamUserGetSigninState");
+  NHL3ON3_ORIGINAL(__imp__XamUserGetSigninState);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  ctx.r3.u64 = ctx.r3.u32 == 0 ? kSigninStateSignedInToLive : 0;
+}
+
+extern "C" REX_FUNC(__imp__XamUserGetSigninInfo) {
+  NHL3ON3_TRACE("XamUserGetSigninInfo");
+  NHL3ON3_ORIGINAL(__imp__XamUserGetSigninInfo);
+  const uint32_t user_index = ctx.r3.u32;
+  const uint32_t info = ctx.r5.u32;
+  original(ctx, base);
+  if (Online() && user_index == 0 && info && ctx.r3.u32 == 0) {
+    StoreBE64(base + info, State().xuid);
+    StoreBE32(base + info + 12, kSigninStateSignedInToLive);
+    // X_USER_SIGNIN_INFO::szUserName[16]
+    StoreGamertag(base + info + 0x18, 16);
+  }
+}
+
+// (user_index, char* buffer, buffer_len)
+extern "C" REX_FUNC(__imp__XamUserGetName) {
+  NHL3ON3_TRACE("XamUserGetName");
+  NHL3ON3_ORIGINAL(__imp__XamUserGetName);
+  const uint32_t user_index = ctx.r3.u32, buffer = ctx.r4.u32, length = ctx.r5.u32;
+  original(ctx, base);
+  if (Online() && user_index == 0 && buffer && ctx.r3.u32 == 0) {
+    StoreGamertag(base + buffer, std::min<uint32_t>(length, 16));
+  }
+}
+
+extern "C" REX_FUNC(__imp__XamUserGetXUID) {
+  NHL3ON3_TRACE("XamUserGetXUID");
+  NHL3ON3_ORIGINAL(__imp__XamUserGetXUID);
+  if (!Online() || ctx.r3.u32 != 0 || !ctx.r5.u32) {
+    return original(ctx, base);
+  }
+  StoreBE64(base + ctx.r5.u32, State().xuid);
+  ctx.r3.u64 = 0;
+}
+
+extern "C" REX_FUNC(__imp__XamUserCheckPrivilege) {
+  NHL3ON3_TRACE("XamUserCheckPrivilege");
+  NHL3ON3_ORIGINAL(__imp__XamUserCheckPrivilege);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  if (ctx.r5.u32) {
+    StoreBE32(base + ctx.r5.u32, 1);
+  }
+  ctx.r3.u64 = 0;
+}
+
+//----------------------------------------------------------------------------
+// XNet addressing.
+//----------------------------------------------------------------------------
+
+extern "C" REX_FUNC(__imp__NetDll_XNetGetEthernetLinkStatus) {
+  NHL3ON3_TRACE("XNetGetEthernetLinkStatus");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetGetEthernetLinkStatus);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  ctx.r3.u64 = kEthernetLinkActive100Full;
+}
+
+extern "C" REX_FUNC(__imp__NetDll_XNetGetTitleXnAddr) {
+  NHL3ON3_TRACE("XNetGetTitleXnAddr");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetGetTitleXnAddr);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  if (ctx.r4.u32) {
+    FillXnAddr(*reinterpret_cast<XnAddr*>(base + ctx.r4.u32), State().local_ip);
+  }
+  ctx.r3.u64 = kXnAddrStatusOnline;
+}
+
+// (caller, const XNADDR*, const XNKID*, IN_ADDR* out)
+extern "C" REX_FUNC(__imp__NetDll_XNetXnAddrToInAddr) {
+  NHL3ON3_TRACE("XNetXnAddrToInAddr");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetXnAddrToInAddr);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  if (!ctx.r4.u32 || !ctx.r6.u32) {
+    ctx.r3.u64 = 0x2726;  // WSAEINVAL
+    return;
+  }
+  uint32_t ip = XnAddrToIp(*reinterpret_cast<const XnAddr*>(base + ctx.r4.u32));
+  StoreBE32(base + ctx.r6.u32, ip);
+  if (ip != State().local_ip) {
+    g_last_peer_ip.store(ip);
+  }
+  REXLOG_INFO("[net] XNetXnAddrToInAddr -> {}", FormatIp(ip));
+  ctx.r3.u64 = 0;
+}
+
+// (caller, IN_ADDR, XNADDR* out, XNKID* out)
+extern "C" REX_FUNC(__imp__NetDll_XNetInAddrToXnAddr) {
+  NHL3ON3_TRACE("XNetInAddrToXnAddr");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetInAddrToXnAddr);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  if (ctx.r5.u32) {
+    FillXnAddr(*reinterpret_cast<XnAddr*>(base + ctx.r5.u32), ctx.r4.u32);
+  }
+  if (ctx.r6.u32) {
+    std::memset(base + ctx.r6.u32, 0, 8);
+  }
+  ctx.r3.u64 = 0;
+}
+
+// (caller, IN_ADDR server, DWORD service_id, IN_ADDR* out)
+extern "C" REX_FUNC(__imp__NetDll_XNetServerToInAddr) {
+  NHL3ON3_TRACE("XNetServerToInAddr");
+  if (!Online()) {
+    ctx.r3.u64 = 0x2726;
+    return;
+  }
+  REXLOG_INFO("[net] XNetServerToInAddr({}, service {:08X})", FormatIp(ctx.r4.u32),
+              ctx.r5.u32);
+  if (ctx.r6.u32) {
+    StoreBE32(base + ctx.r6.u32, ctx.r4.u32);
+  }
+  ctx.r3.u64 = 0;
+}
+
+extern "C" REX_FUNC(__imp__NetDll_XNetConnect) {
+  NHL3ON3_TRACE("XNetConnect");
+  if (Online()) {
+    REXLOG_INFO("[net] XNetConnect({})", FormatIp(ctx.r4.u32));
+  }
+  ctx.r3.u64 = 0;
+}
+
+extern "C" REX_FUNC(__imp__NetDll_XNetGetConnectStatus) {
+  NHL3ON3_TRACE("XNetGetConnectStatus");
+  ctx.r3.u64 = Online() ? kConnectStatusConnected : 0;
+}
+
+//----------------------------------------------------------------------------
+// Session keys. Secure-association keys are meaningless without the real XNet
+// crypto, but the game must get valid-looking ones back.
+//----------------------------------------------------------------------------
+
+// (caller, XNKID* out, XNKEY* out)
+extern "C" REX_FUNC(__imp__NetDll_XNetCreateKey) {
+  NHL3ON3_TRACE("XNetCreateKey");
+  static std::mutex mutex;
+  static std::mt19937_64 rng{std::random_device{}()};
+  std::lock_guard lock(mutex);
+  if (ctx.r4.u32) {
+    uint8_t* kid = base + ctx.r4.u32;
+    StoreBE64(kid, rng());
+    kid[0] = uint8_t((kid[0] & 0x0F) | 0x80);  // XNET_XNKID_ONLINE_PEER
+  }
+  if (ctx.r5.u32) {
+    StoreBE64(base + ctx.r5.u32, rng());
+    StoreBE64(base + ctx.r5.u32 + 8, rng());
+  }
+  ctx.r3.u64 = 0;
+}
+
+extern "C" REX_FUNC(__imp__NetDll_XNetRegisterKey) {
+  NHL3ON3_TRACE("XNetRegisterKey");
+  ctx.r3.u64 = 0;
+}
+
+extern "C" REX_FUNC(__imp__NetDll_XNetUnregisterKey) {
+  NHL3ON3_TRACE("XNetUnregisterKey");
+  ctx.r3.u64 = 0;
+}
+
+// (app, message, arg1, arg2). DirtySDK requires XOnlineGetServiceInfo (app FC,
+// message 58007) to report an address for the title's LIVE service, otherwise
+// NetConn fails with '-svc' and the game shows "sign-in required".
+extern "C" REX_FUNC(__imp__XMsgInProcessCall) {
+  NHL3ON3_ORIGINAL(__imp__XMsgInProcessCall);
+  constexpr uint32_t kXLiveBaseApp = 0xFC;
+  constexpr uint32_t kGetServiceInfo = 0x00058007;
+  if (!Online() || ctx.r3.u32 != kXLiveBaseApp || ctx.r4.u32 != kGetServiceInfo) {
+    return original(ctx, base);
+  }
+  const uint32_t service_id = ctx.r5.u32, info = ctx.r6.u32;
+  const uint16_t port = uint16_t(REXCVAR_GET(online_service_port));
+  REXLOG_INFO("[net] XOnlineGetServiceInfo(service {:08X}) -> {}:{}", service_id,
+              FormatIp(State().server_ip), port);
+  if (info) {
+    // XONLINE_SERVICE_INFO { DWORD dwServiceID; IN_ADDR serviceIP; WORD wServicePort; WORD wReserved; }
+    StoreBE32(base + info, service_id);
+    StoreBE32(base + info + 4, State().server_ip);
+    StoreBE16(base + info + 8, port);
+    StoreBE16(base + info + 10, 0);
+  }
+  ctx.r3.u64 = 0;
+}
+
+//----------------------------------------------------------------------------
+// Service discovery: everything points at the configured server.
+//----------------------------------------------------------------------------
+
+// (caller, const char* host, WSAEVENT, XNDNS** out)
+extern "C" REX_FUNC(__imp__NetDll_XNetDnsLookup) {
+  NHL3ON3_TRACE("XNetDnsLookup");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetDnsLookup);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  const char* host = ctx.r4.u32 ? reinterpret_cast<const char*>(base + ctx.r4.u32) : "";
+  const uint32_t ip = State().server_ip;
+  REXLOG_INFO("[net] XNetDnsLookup('{}') -> {}", host, FormatIp(ip));
+  if (ctx.r6.u32) {
+    uint32_t guest = 0;
+    XnDns* dns = GuestAlloc<XnDns>(base, guest);
+    StoreBE32(dns->count, 1);
+    StoreBE32(dns->addrs[0], ip);
+    StoreBE32(base + ctx.r6.u32, guest);
+  }
+  SignalEvent(ctx.r5.u32);
+  ctx.r3.u64 = 0;
+}
+
+// (caller, DWORD flags, WSAEVENT, XNQOS** out)
+extern "C" REX_FUNC(__imp__NetDll_XNetQosServiceLookup) {
+  NHL3ON3_TRACE("XNetQosServiceLookup");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetQosServiceLookup);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  REXLOG_INFO("[net] XNetQosServiceLookup(flags {:X})", ctx.r4.u32);
+  if (ctx.r6.u32) {
+    uint32_t guest = 0;
+    XnQos* qos = GuestAlloc<XnQos>(base, guest);
+    StoreBE32(qos->count, 1);
+    XnQosInfo& info = qos->info[0];
+    info.flags = kQosInfoContacted;
+    StoreBE16(info.probes_xmit, 4);
+    StoreBE16(info.probes_recv, 4);
+    StoreBE16(info.rtt_min, 20);
+    StoreBE16(info.rtt_med, 25);
+    StoreBE32(info.up_bps, 10'000'000);
+    StoreBE32(info.down_bps, 50'000'000);
+    StoreBE32(base + ctx.r6.u32, guest);
+  }
+  SignalEvent(ctx.r5.u32);
+  ctx.r3.u64 = 0;
+}
+
+//----------------------------------------------------------------------------
+// Socket tracing, to discover which servers and ports the game expects.
+//----------------------------------------------------------------------------
+
+extern "C" REX_FUNC(__imp__NetDll_connect) {
+  NHL3ON3_TRACE("connect");
+  NHL3ON3_ORIGINAL(__imp__NetDll_connect);
+  if (Online() && ctx.r5.u32) {
+    LogSockaddr("connect", ctx.r4.u32, base + ctx.r5.u32);
+  }
+  original(ctx, base);
+}
+
+// (caller, socket, const sockaddr*, namelen). Instances sharing one PC advertise
+// distinct loopback addresses (127.0.0.2, 127.0.0.3, ...); binding each one's
+// wildcard sockets to its own address lets both use the game's fixed ports.
+extern "C" REX_FUNC(__imp__NetDll_bind) {
+  NHL3ON3_TRACE("bind");
+  NHL3ON3_ORIGINAL(__imp__NetDll_bind);
+  uint8_t* sa = ctx.r5.u32 ? base + ctx.r5.u32 : nullptr;
+  const bool pin = Online() && sa && LoadBE32(sa + 4) == 0 && IsLoopback(State().local_ip);
+  if (pin) {
+    StoreBE32(sa + 4, State().local_ip);
+  }
+  if (Online() && sa) {
+    LogSockaddr("bind", ctx.r4.u32, sa);
+  }
+  original(ctx, base);
+  if (pin) {
+    StoreBE32(sa + 4, 0);
+  }
+}
+
+namespace {
+
+// Logs a socket call unless it repeats the previous call to the same function
+// with the same arguments and result.
+void LogSocketCall(const char* name, std::atomic<uint64_t>& last, const uint32_t args[3],
+                   uint32_t result, uint32_t last_error) {
+  if (!Online()) {
+    return;
+  }
+  const uint64_t key = (uint64_t(args[0] ^ args[1] * 31 ^ args[2] * 131) << 32) | result;
+  if (last.exchange(key) == key) {
+    return;
+  }
+  REXLOG_INFO("[net] {}({:X}, {:X}, {:X}) = {:X}  (WSAGetLastError {})", name, args[0], args[1],
+              args[2], result, last_error);
+}
+
+}  // namespace
+
+extern "C" REX_FUNC(__imp__NetDll_WSAGetLastError);
+
+namespace {
+
+// The runtime reads the host's last error lazily, so any host call made on the
+// guest thread between a failed socket call and WSAGetLastError (logging, XAM)
+// can reset it to 0, which DirtySDK treats as a fatal socket error. Socket
+// wrappers capture the error at the point of failure instead.
+thread_local uint32_t t_socket_error = 0;
+
+// Error the guest's next WSAGetLastError on this thread reports, ahead of the
+// runtime's own.
+thread_local uint32_t t_forced_error = 0;
+
+uint32_t ResolveStaleSocketError(uint32_t socket, uint32_t error);
+
+uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
+  PPCContext probe = ctx;
+  probe.r3.u64 = 1;
+  __imp__NetDll_WSAGetLastError(probe, base);
+  if (probe.r3.u32) {
+    t_socket_error = probe.r3.u32;
+  }
+  return probe.r3.u32;
+}
+
+}  // namespace
+
+// Traces (socket, arg, arg) and the error code the game will see on failure.
+#define NHL3ON3_SOCKET_TRACE(name)                                             \
+  extern "C" REX_FUNC(__imp__NetDll_##name) {                                  \
+    NHL3ON3_ORIGINAL(__imp__NetDll_##name);                                    \
+    static std::atomic<uint64_t> last{0};                                      \
+    const uint32_t args[3] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};             \
+    original(ctx, base);                                                       \
+    const uint32_t result = ctx.r3.u32;                                        \
+    uint32_t error = 0;                                                        \
+    if (result == 0xFFFFFFFF) {                                                \
+      error = CaptureSocketError(ctx, base);                                   \
+      const uint32_t resolved = ResolveStaleSocketError(args[0], error);       \
+      if (resolved != error) {                                                 \
+        error = t_socket_error = t_forced_error = resolved;                    \
+      }                                                                        \
+      if (Online() && error != 10035) {                                        \
+        last.store(0);                                                         \
+      }                                                                        \
+    }                                                                          \
+    LogSocketCall(#name, last, args, result, error);                           \
+    ctx.r3.u64 = result;                                                       \
+  }
+
+NHL3ON3_SOCKET_TRACE(recv)
+NHL3ON3_SOCKET_TRACE(send)
+std::string Nhl3on3GuestBacktrace(const PPCContext& ctx, const uint8_t* base);
+
+//----------------------------------------------------------------------------
+// Datagram sockets. The runtime's UDP path cannot carry peer traffic: sendto
+// byte-swaps the destination twice and WSARecvFrom is a stub that fails
+// without an error code. Online, datagram sockets bypass it and use their
+// native handles directly.
+//----------------------------------------------------------------------------
+
+namespace {
+
+void LogOnChange(const char* what, uint64_t key, const std::string& text);
+
+constexpr uint32_t kWsaIoIncomplete = 996;
+constexpr uint32_t kWsaIoPending = 997;
+constexpr uint32_t kWsaEWouldBlock = 10035;
+constexpr uint32_t kWsaEConnReset = 10054;
+constexpr uint32_t kLoopbackIp = 0x7F000001;
+
+#ifdef _WIN32
+using NativeSocket = SOCKET;
+using NativeSockLen = int;
+#else
+using NativeSocket = int;
+using NativeSockLen = socklen_t;
+#endif
+
+// An overlapped WSARecvFrom waiting for data; the watcher thread signals its
+// event once the socket is readable.
+struct PendingRecv {
+  uint32_t socket;
+  NativeSocket native;
+  uint32_t buffer, length, from, fromlen, event;
+  bool signaled = false;
+};
+
+std::mutex g_dgram_mutex;
+std::condition_variable g_dgram_cv;
+std::unordered_set<uint32_t> g_dgram_sockets;
+std::unordered_map<uint32_t, PendingRecv> g_pending_recvs;  // by guest OVERLAPPED
+
+// Logs the first datagram and then every power-of-two count per socket and
+// direction, so both ends' traffic is visible without flooding the log.
+void CountDatagram(const char* what, uint32_t socket, uint32_t ip, uint16_t port,
+                   const uint8_t* data, int length) {
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, uint32_t> counts;
+  uint32_t n;
+  {
+    std::lock_guard lock(mutex);
+    n = ++counts[(uint64_t(socket) << 1) | (what[0] == 'r')];
+  }
+  if (n <= 12 || (n & (n - 1)) == 0) {
+    std::string hex;
+    for (int i = 0; i < std::min(length, 48); ++i) {
+      hex += fmt::format("{:02X}", data[i]);
+    }
+    REXLOG_INFO("[net] {} {:X} #{} {} {}:{} len {} [{}]", what, socket, n,
+                what[0] == 'r' ? "from" : "to", FormatIp(ip), port, length, hex);
+  }
+}
+
+bool IsDatagram(uint32_t socket) {
+  std::lock_guard lock(g_dgram_mutex);
+  return g_dgram_sockets.count(socket) != 0;
+}
+
+bool NativeHandle(uint32_t socket, NativeSocket& out) {
+  auto object = REX_KERNEL_OBJECTS()->LookupObject<rex::system::XSocket>(socket);
+  if (!object) {
+    return false;
+  }
+  out = NativeSocket(object->native_handle());
+  return true;
+}
+
+// The runtime's stream recv/send can fail without setting a socket error, so
+// the guest reads whatever the thread last left behind (e.g. 2 from a missing
+// game file) and DirtySDK drops the lobby connection. A non-Winsock code is
+// replaced by the socket's real pending error, or WSAEWOULDBLOCK if none.
+uint32_t ResolveStaleSocketError(uint32_t socket, uint32_t error) {
+  constexpr uint32_t kSdkWouldBlock = 31;
+  if (error >= 10000 || error == kSdkWouldBlock || error == 996 || error == 997) {
+    return error;
+  }
+  NativeSocket native;
+  if (!NativeHandle(socket, native)) {
+    return error;
+  }
+  int pending = 0;
+  NativeSockLen len = sizeof(pending);
+  if (::getsockopt(native, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&pending), &len) != 0) {
+    return error;
+  }
+  const uint32_t resolved = pending ? uint32_t(pending) : kWsaEWouldBlock;
+  static std::atomic<uint64_t> last{0};
+  const uint64_t key = (uint64_t(socket) << 32) | (error << 16) ^ resolved;
+  if (Online() && last.exchange(key) != key) {
+    REXLOG_INFO("[net] socket {:X}: stale error {} replaced by {}", socket, error, resolved);
+  }
+  return resolved;
+}
+
+uint32_t NativeError() {
+#ifdef _WIN32
+  return uint32_t(WSAGetLastError());
+#else
+  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    return kWsaEWouldBlock;
+  }
+  return errno == ECONNREFUSED ? kWsaEConnReset : 10000 + uint32_t(errno);
+#endif
+}
+
+bool Readable(NativeSocket native) {
+  fd_set set;
+  FD_ZERO(&set);
+  FD_SET(native, &set);
+  timeval timeout{};
+  return ::select(int(native) + 1, &set, nullptr, nullptr, &timeout) > 0;
+}
+
+// Receives one pending datagram without blocking, reporting the sender in
+// guest XSOCKADDR_IN form. Returns the length, or -1 with `error` set.
+int ReceiveDatagram(uint8_t* base, uint32_t socket, NativeSocket native, uint32_t buffer,
+                    uint32_t length, uint32_t from, uint32_t fromlen, uint32_t& error) {
+  for (;;) {
+    if (!Readable(native)) {
+      error = kWsaEWouldBlock;
+      return -1;
+    }
+    sockaddr_in addr{};
+    NativeSockLen addr_len = sizeof(addr);
+    const int n = ::recvfrom(native, reinterpret_cast<char*>(base + buffer), int(length), 0,
+                             reinterpret_cast<sockaddr*>(&addr), &addr_len);
+    if (n < 0) {
+      error = NativeError();
+      // An ICMP port-unreachable from an earlier send; not a receive failure.
+      if (error == kWsaEConnReset) {
+        continue;
+      }
+      return -1;
+    }
+    const uint32_t ip = ntohl(addr.sin_addr.s_addr);
+    CountDatagram("recv", socket, ip, ntohs(addr.sin_port), base + buffer, n);
+    if (from) {
+      uint8_t* sa = base + from;
+      StoreBE16(sa, AF_INET);
+      std::memcpy(sa + 2, &addr.sin_port, 2);
+      StoreBE32(sa + 4, ip);
+      std::memset(sa + 8, 0, 8);
+    }
+    if (fromlen) {
+      StoreBE32(base + fromlen, 16);
+    }
+    return n;
+  }
+}
+
+void WatchPendingRecvs() {
+  for (;;) {
+    std::vector<std::pair<uint32_t, NativeSocket>> armed;
+    {
+      std::unique_lock lock(g_dgram_mutex);
+      g_dgram_cv.wait(lock, [&] {
+        armed.clear();
+        for (const auto& [overlapped, op] : g_pending_recvs) {
+          if (!op.signaled) {
+            armed.emplace_back(overlapped, op.native);
+          }
+        }
+        return !armed.empty();
+      });
+    }
+    fd_set set;
+    FD_ZERO(&set);
+    int max_fd = 0;
+    for (const auto& [overlapped, native] : armed) {
+      FD_SET(native, &set);
+      max_fd = std::max(max_fd, int(native));
+    }
+    timeval timeout{0, 5000};
+    const int ready = ::select(max_fd + 1, &set, nullptr, nullptr, &timeout);
+    if (ready < 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (ready <= 0) {
+      continue;
+    }
+    std::vector<uint32_t> events;
+    {
+      std::lock_guard lock(g_dgram_mutex);
+      for (const auto& [overlapped, native] : armed) {
+        auto it = g_pending_recvs.find(overlapped);
+        if (FD_ISSET(native, &set) && it != g_pending_recvs.end() && !it->second.signaled &&
+            it->second.native == native) {
+          it->second.signaled = true;
+          events.push_back(it->second.event);
+        }
+      }
+    }
+    for (uint32_t event : events) {
+      static std::atomic<uint32_t> signals{0};
+      const uint32_t n = ++signals;
+      if ((n & (n - 1)) == 0) {
+        REXLOG_INFO("[net] recv watcher signal #{} event {:X}", n, event);
+      }
+      SignalEvent(event);
+    }
+  }
+}
+
+void StartRecvWatcher() {
+  static std::once_flag once;
+  std::call_once(once, [] { std::thread(WatchPendingRecvs).detach(); });
+}
+
+}  // namespace
+
+// (caller, socket, buffer, length, flags, sockaddr* from, int* fromlen)
+extern "C" REX_FUNC(__imp__NetDll_recvfrom) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_recvfrom);
+  const uint32_t socket = ctx.r4.u32;
+  NativeSocket native;
+  if (!Online() || !IsDatagram(socket) || !NativeHandle(socket, native)) {
+    return original(ctx, base);
+  }
+  uint32_t error = 0;
+  const int n = ReceiveDatagram(base, socket, native, ctx.r5.u32, ctx.r6.u32, ctx.r8.u32, ctx.r9.u32,
+                                error);
+  if (n < 0) {
+    t_forced_error = error;
+  }
+  ctx.r3.u64 = uint32_t(n);
+}
+
+// (caller, socket, buffer, length, flags, const sockaddr* to, tolen)
+// DirtySDK's send-address remap table turns the peer's address into 127.0.0.1
+// on the wire, while CommUDP keeps matching replies against the real peer
+// address. Instances sharing one PC listen on their own loopback address, so
+// that traffic is redirected to the peer XNetXnAddrToInAddr resolved.
+extern "C" REX_FUNC(__imp__NetDll_sendto) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_sendto);
+  const uint32_t socket = ctx.r4.u32, buffer = ctx.r5.u32, length = ctx.r6.u32,
+                 to = ctx.r8.u32;
+  NativeSocket native;
+  if (!Online() || !to || !IsDatagram(socket) || !NativeHandle(socket, native)) {
+    return original(ctx, base);
+  }
+  const uint8_t* sa = base + to;
+  const uint32_t requested = LoadBE32(sa + 4);
+  const uint16_t port = uint16_t((sa[2] << 8) | sa[3]);
+  const uint32_t peer = g_last_peer_ip.load();
+  uint32_t ip = requested;
+  if (requested == kLoopbackIp && peer && IsLoopback(State().local_ip) &&
+      State().local_ip != kLoopbackIp) {
+    ip = peer;
+  }
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(ip);
+  const int n = ::sendto(native, reinterpret_cast<const char*>(base + buffer), int(length), 0,
+                         reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+  uint32_t error = 0;
+  if (n < 0) {
+    error = NativeError();
+    t_forced_error = error;
+  } else {
+    CountDatagram("send", socket, ip, port, base + buffer, n);
+  }
+  LogOnChange("sendto", socket,
+              fmt::format("to {}:{}{} = {} error {}", FormatIp(requested), port,
+                          ip != requested ? " -> " + FormatIp(ip) : "",
+                          n < 0 ? "fail" : "ok", error));
+  ctx.r3.u64 = uint32_t(n);
+}
+
+// (caller, socket, WSABUF* buffers, count, DWORD* received, DWORD* flags,
+//  sockaddr* from, int* fromlen, [stack] OVERLAPPED*, completion routine)
+extern "C" REX_FUNC(__imp__NetDll_WSARecvFrom) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_WSARecvFrom);
+  const uint32_t socket = ctx.r4.u32, buffers = ctx.r5.u32, count = ctx.r6.u32,
+                 received = ctx.r7.u32, flags = ctx.r8.u32, from = ctx.r9.u32,
+                 fromlen = ctx.r10.u32;
+  const uint32_t overlapped = LoadBE32(base + ctx.r1.u32 + 84);
+  NativeSocket native;
+  if (!Online() || !IsDatagram(socket) || !count || !NativeHandle(socket, native)) {
+    return original(ctx, base);
+  }
+  const uint32_t length = LoadBE32(base + buffers), buffer = LoadBE32(base + buffers + 4);
+  const uint32_t event = overlapped ? LoadBE32(base + overlapped + 16) : 0;
+  uint32_t error = 0;
+  const int n = ReceiveDatagram(base, socket, native, buffer, length, from, fromlen, error);
+  if (n >= 0) {
+    if (received) {
+      StoreBE32(base + received, uint32_t(n));
+    }
+    if (flags) {
+      StoreBE32(base + flags, 0);
+    }
+    if (overlapped) {
+      StoreBE32(base + overlapped + 4, uint32_t(n));
+    }
+    SignalEvent(event);
+    ctx.r3.u64 = 0;
+    return;
+  }
+  if (error != kWsaEWouldBlock || !overlapped) {
+    t_forced_error = error;
+    ctx.r3.u64 = 0xFFFFFFFF;
+    return;
+  }
+  {
+    std::lock_guard lock(g_dgram_mutex);
+    g_pending_recvs[overlapped] = {socket, native, buffer, length, from, fromlen, event};
+  }
+  StartRecvWatcher();
+  g_dgram_cv.notify_one();
+  t_forced_error = kWsaIoPending;
+  ctx.r3.u64 = 0xFFFFFFFF;
+}
+
+// (caller, socket, OVERLAPPED*, DWORD* transferred, wait, DWORD* flags)
+extern "C" REX_FUNC(__imp__NetDll_WSAGetOverlappedResult) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_WSAGetOverlappedResult);
+  const uint32_t overlapped = ctx.r5.u32, transferred = ctx.r6.u32, flags = ctx.r8.u32;
+  PendingRecv op;
+  {
+    std::lock_guard lock(g_dgram_mutex);
+    auto it = g_pending_recvs.find(overlapped);
+    if (it == g_pending_recvs.end()) {
+      return original(ctx, base);
+    }
+    op = it->second;
+  }
+  uint32_t error = 0;
+  const int n =
+      ReceiveDatagram(base, op.socket, op.native, op.buffer, op.length, op.from, op.fromlen, error);
+  {
+    std::lock_guard lock(g_dgram_mutex);
+    auto it = g_pending_recvs.find(overlapped);
+    if (it != g_pending_recvs.end()) {
+      if (n < 0 && error == kWsaEWouldBlock) {
+        it->second.signaled = false;
+      } else {
+        g_pending_recvs.erase(it);
+      }
+    }
+  }
+  if (n >= 0) {
+    if (transferred) {
+      StoreBE32(base + transferred, uint32_t(n));
+    }
+    if (flags) {
+      StoreBE32(base + flags, 0);
+    }
+    StoreBE32(base + overlapped + 4, uint32_t(n));
+    ctx.r3.u64 = 1;
+    return;
+  }
+  g_dgram_cv.notify_one();
+  t_forced_error = error == kWsaEWouldBlock ? kWsaIoIncomplete : error;
+  ctx.r3.u64 = 0;
+}
+
+// (count, WSAEVENT* events, wait_all, timeout_ms, alertable)
+// The runtime passes wait_all straight through as the NT wait type, where 0
+// is WaitAll, so a wait for any one event (DirtySDK's receive thread) sleeps
+// until every event fires. It also passes finite timeouts as absolute times.
+extern "C" REX_FUNC(__imp__NetDll_WSAWaitForMultipleEvents) {
+  constexpr uint32_t kWaitAll = 0, kWaitAny = 1, kUserMode = 1;
+  constexpr uint32_t kStatusAlerted = 0x101;
+  constexpr uint32_t kWsaWaitFailed = 0xFFFFFFFF, kErrorInvalidParameter = 87;
+  const uint32_t count = ctx.r3.u32, events = ctx.r4.u32, wait_all = ctx.r5.u32,
+                 timeout_ms = ctx.r6.u32, alertable = ctx.r7.u32;
+  if (count == 0 || count > 64 || !events) {
+    t_forced_error = kErrorInvalidParameter;
+    ctx.r3.u64 = kWsaWaitFailed;
+    return;
+  }
+  uint64_t timeout = uint64_t(-int64_t(timeout_ms) * 10000);
+  uint32_t status;
+  do {
+    status = rex::kernel::xboxkrnl::xeNtWaitForMultipleObjectsEx(
+        count, reinterpret_cast<rex::be<uint32_t>*>(base + events),
+        wait_all ? kWaitAll : kWaitAny, kUserMode, alertable,
+        timeout_ms == 0xFFFFFFFF ? nullptr : &timeout);
+  } while (status == kStatusAlerted);
+  if (status >= 0x40000000) {
+    t_forced_error = kErrorInvalidParameter;
+    ctx.r3.u64 = kWsaWaitFailed;
+    return;
+  }
+  ctx.r3.u64 = status;
+}
+
+extern "C" REX_FUNC(__imp__NetDll_closesocket) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_closesocket);
+  const uint32_t socket = ctx.r4.u32;
+  {
+    std::lock_guard lock(g_dgram_mutex);
+    g_dgram_sockets.erase(socket);
+    for (auto it = g_pending_recvs.begin(); it != g_pending_recvs.end();) {
+      it = it->second.socket == socket ? g_pending_recvs.erase(it) : std::next(it);
+    }
+  }
+  original(ctx, base);
+}
+
+NHL3ON3_SOCKET_TRACE(select)
+NHL3ON3_SOCKET_TRACE(getsockopt)
+NHL3ON3_SOCKET_TRACE(setsockopt)
+NHL3ON3_SOCKET_TRACE(ioctlsocket)
+
+extern "C" REX_FUNC(__imp__NetDll_shutdown) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_shutdown);
+  if (Online()) {
+    REXLOG_INFO("[net] shutdown({:X}, {}) backtrace: {}", ctx.r4.u32, ctx.r5.u32,
+                Nhl3on3GuestBacktrace(ctx, base));
+  }
+  original(ctx, base);
+}
+NHL3ON3_SOCKET_TRACE(WSARecv)
+
+// The SDK reports a pending non-blocking connect/recv as 31; DirtySDK only
+// treats WSAEWOULDBLOCK (10035) and WSA_IO_PENDING (997) as "try again" and
+// closes the socket on anything else.
+extern "C" REX_FUNC(__imp__NetDll_WSAGetLastError) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_WSAGetLastError);
+  constexpr uint32_t kSdkWouldBlock = 31;
+  original(ctx, base);
+  if (t_forced_error) {
+    ctx.r3.u64 = t_forced_error;
+    t_forced_error = 0;
+  }
+  if (ctx.r3.u32 == kSdkWouldBlock) {
+    ctx.r3.u64 = kWsaEWouldBlock;
+  }
+  if (ctx.r3.u32 == 0 && t_socket_error != 0) {
+    ctx.r3.u64 = t_socket_error;
+  }
+  const uint32_t error = ctx.r3.u32;
+  const bool routine = error == 0 || error == kWsaEWouldBlock || error == 996 || error == 997;
+  static std::atomic<uint32_t> last{0};
+  if (Online() && !routine && last.exchange(error) != error) {
+    REXLOG_INFO("[net] WSAGetLastError() = {}", error);
+  }
+}
+
+extern "C" REX_FUNC(__imp__NetDll_socket) {
+  NHL3ON3_TRACE("socket");
+  NHL3ON3_ORIGINAL(__imp__NetDll_socket);
+  const uint32_t af = ctx.r4.u32, type = ctx.r5.u32, proto = ctx.r6.u32;
+  original(ctx, base);
+  if (!Online()) {
+    return;
+  }
+  const uint32_t socket = ctx.r3.u32;
+  REXLOG_INFO("[net] socket(af {}, type {}, proto {}) = {:X}", af, type, proto, socket);
+  NativeSocket native;
+  if (type != 2 || socket == 0xFFFFFFFF || !NativeHandle(socket, native)) {
+    return;
+  }
+  {
+    std::lock_guard lock(g_dgram_mutex);
+    g_dgram_sockets.insert(socket);
+  }
+#ifdef _WIN32
+  // Otherwise an ICMP port-unreachable fails the next recvfrom.
+  constexpr DWORD kSioUdpConnReset = _WSAIOW(IOC_VENDOR, 12);
+  BOOL report = FALSE;
+  DWORD returned = 0;
+  WSAIoctl(native, kSioUdpConnReset, &report, sizeof(report), nullptr, 0, &returned, nullptr,
+           nullptr);
+#endif
+}
+
+//----------------------------------------------------------------------------
+// Diagnostics for the LIVE flow: other XAM/XNet calls the game makes while
+// connecting, and the text of any error dialog it raises.
+//----------------------------------------------------------------------------
+
+namespace {
+
+std::string GuestWideString(const uint8_t* base, uint32_t address) {
+  std::string out;
+  if (!address) {
+    return out;
+  }
+  for (const uint8_t* p = base + address; out.size() < 512; p += 2) {
+    char16_t c = char16_t((p[0] << 8) | p[1]);
+    if (!c) {
+      break;
+    }
+    out.push_back(c < 0x80 ? char(c) : '?');
+  }
+  return out;
+}
+
+}  // namespace
+
+namespace {
+
+std::string FourCC(uint32_t v) {
+  std::string s;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    char c = char(v >> shift);
+    s.push_back(c >= 0x20 && c < 0x7F ? c : '.');
+  }
+  return s;
+}
+
+}  // namespace
+
+extern "C" void __imp__sub_827623F0(PPCContext& __restrict ctx, uint8_t* base);
+
+// DirtySDK SockaddrCompare(a, b): CommUDP drops packets whose source does not
+// match the connection's peer address. Logs the first mismatches.
+extern "C" REX_FUNC(sub_827623F0) {
+  const uint32_t a = ctx.r3.u32, b = ctx.r4.u32;
+  __imp__sub_827623F0(ctx, base);
+  if (!Online() || ctx.r3.u32 == 0) {
+    return;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged++ >= 24) {
+    return;
+  }
+  auto hex = [&](uint32_t address) {
+    std::string out;
+    for (int i = 0; i < 16; ++i) {
+      out += fmt::format("{:02X}", base[address + i]);
+    }
+    return out;
+  };
+  REXLOG_INFO("[net] SockaddrCompare mismatch {} vs {} (lr {:08X})", hex(a), hex(b),
+              uint32_t(ctx.lr));
+}
+
+extern "C" void __imp__sub_8275E0A8(PPCContext& __restrict ctx, uint8_t* base);
+
+// DirtySDK NetConnStatus(selector, data, buffer, size): logs each selector's
+// result whenever it changes.
+extern "C" REX_FUNC(sub_8275E0A8) {
+  const uint32_t selector = ctx.r3.u32, data = ctx.r4.u32;
+  __imp__sub_8275E0A8(ctx, base);
+  if (!Online()) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, uint32_t> last;
+  const uint64_t key = (uint64_t(selector) << 32) | data;
+  std::lock_guard lock(mutex);
+  auto [it, inserted] = last.try_emplace(key, ctx.r3.u32);
+  if (inserted || it->second != ctx.r3.u32) {
+    it->second = ctx.r3.u32;
+    REXLOG_INFO("[net] NetConnStatus('{}', {}) = {:08X} '{}'", FourCC(selector), data,
+                ctx.r3.u32, FourCC(ctx.r3.u32));
+  }
+}
+
+namespace {
+
+std::string GuestText(const uint8_t* base, uint32_t address, size_t max) {
+  std::string out;
+  for (size_t i = 0; i < max && base[address + i]; ++i) {
+    const char c = char(base[address + i]);
+    out.push_back(c >= 0x20 && c < 0x7F ? c : '.');
+  }
+  return out;
+}
+
+// Logs `text` for `key` only when it differs from the last text logged for it.
+void LogOnChange(const char* what, uint64_t key, const std::string& text) {
+  static std::mutex mutex;
+  static std::unordered_map<std::string, std::string> last;
+  std::lock_guard lock(mutex);
+  auto& seen = last[std::string(what) + ":" + std::to_string(key)];
+  if (seen != text) {
+    seen = text;
+    REXLOG_INFO("[mm] {} {:08X}: {}", what, uint32_t(key), text);
+  }
+}
+
+constexpr uint32_t kIdle = 0x69646C65;  // 'idle'
+
+}  // namespace
+
+extern "C" void __imp__sub_82BC0410(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82761188(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82789C60(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82788BE0(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82788FD8(PPCContext& __restrict ctx, uint8_t* base);
+
+// LobbyMatchupGameModule update: search state and the flags that gate
+// EVENT_MATCHUP_SUCCESS (8815 own G changed, 8816 game joined).
+extern "C" REX_FUNC(sub_82BC0410) {
+  const uint32_t module = ctx.r3.u32;
+  __imp__sub_82BC0410(ctx, base);
+  if (!Online()) {
+    return;
+  }
+  const uint8_t* m = base + module;
+  LogOnChange("matchup", module,
+              fmt::format("state {} saved G {} sub {} left {} gchg {} joined {}",
+                          LoadBE32(m + 8796), int32_t(LoadBE32(m + 8808)), m[8813], m[8814],
+                          m[8815], m[8816]));
+}
+
+std::string SessionState(const uint8_t* base, uint32_t session) {
+  if (!session) {
+    return "no session";
+  }
+  const uint8_t* s = base + session;
+  return fmt::format("session {:08X} state {} overlapped {:08X} flags {:X} host {} done {}",
+                     session, LoadBE32(s + 112), LoadBE32(s + 100), LoadBE32(s + 164), s[1131],
+                     s[1128]);
+}
+
+// ConnApi status; success also needs its 'idle' to be non-zero.
+extern "C" REX_FUNC(sub_82761188) {
+  const uint32_t link = ctx.r3.u32, selector = ctx.r4.u32;
+  __imp__sub_82761188(ctx, base);
+  if (Online() && selector == kIdle) {
+    LogOnChange("link idle", link,
+                fmt::format("{} ({})", int32_t(ctx.r3.u32),
+                            SessionState(base, LoadBE32(base + link + 76))));
+  }
+}
+
+extern "C" void __imp__sub_82768468(PPCContext& __restrict ctx, uint8_t* base);
+
+// XSession wrapper control(session, selector, value, ..., data).
+extern "C" REX_FUNC(sub_82768468) {
+  const uint32_t session = ctx.r3.u32, selector = ctx.r4.u32, value = ctx.r5.u32,
+                 data = ctx.r7.u32;
+  __imp__sub_82768468(ctx, base);
+  if (Online() && selector != 0x74696D65) {  // 'time' is polled every frame
+    REXLOG_INFO("[mm] session control '{}' value {} data {:08X} -> {}; {}", FourCC(selector),
+                value, data, int32_t(ctx.r3.u32), SessionState(base, session));
+  }
+}
+
+extern "C" void __imp__sub_82767968(PPCContext& __restrict ctx, uint8_t* base);
+
+// XSession wrapper 'sess' request: (session, is host, session info text).
+extern "C" REX_FUNC(sub_82767968) {
+  const uint32_t session = ctx.r3.u32, host = ctx.r4.u32, info = ctx.r5.u32;
+  const std::string before = Online() ? SessionState(base, session) : "";
+  __imp__sub_82767968(ctx, base);
+  if (Online()) {
+    REXLOG_INFO("[mm] sess request host {} info '{}' -> {}; before: {}; after: {}", host,
+                info ? GuestText(base, info, 96) : "<null>", int32_t(ctx.r3.u32), before,
+                SessionState(base, session));
+    const uint8_t* s = base + session;
+    std::string users;
+    const uint32_t netconn = LoadBE32(base + 0x831BB5F4);
+    for (int i = 0; netconn && i < 4; ++i) {
+      users += fmt::format(" [{} '{}' {:08X}{:08X}]", i, GuestText(base, netconn + 72 + 32 * i, 16),
+                           LoadBE32(base + netconn + 88 + 32 * i),
+                           LoadBE32(base + netconn + 92 + 32 * i));
+    }
+    REXLOG_INFO("[mm]   host xuid {:08X}{:08X} self xuid {:08X}{:08X}; local users{}",
+                LoadBE32(s + 120), LoadBE32(s + 124), LoadBE32(s + 136), LoadBE32(s + 140),
+                users);
+  }
+}
+
+// Lobby game manager status; 'idle' is its state (27768) == 0.
+extern "C" REX_FUNC(sub_82789C60) {
+  const uint32_t gm = ctx.r3.u32, selector = ctx.r4.u32;
+  __imp__sub_82789C60(ctx, base);
+  if (Online() && selector == kIdle) {
+    LogOnChange("gm idle", gm, std::to_string(int32_t(ctx.r3.u32)));
+  }
+}
+
+// Game manager: first sight of a game; hosts create the session, others join
+// the SESS the host published.
+extern "C" REX_FUNC(sub_82788BE0) {
+  const uint32_t gm = ctx.r3.u32, info = ctx.r4.u32;
+  __imp__sub_82788BE0(ctx, base);
+  if (Online()) {
+    REXLOG_INFO("[mm] gm {:08X} start: self '{}' host '{}' sess '{}' count {} -> {} state {}",
+                gm, GuestText(base, gm + 27752, 32), GuestText(base, info + 40, 32),
+                GuestText(base, info + 76, 64), LoadBE32(base + info + 524), ctx.r3.u32,
+                LoadBE32(base + gm + 27768));
+  }
+}
+
+extern "C" REX_FUNC(sub_82788FD8) {
+  const uint32_t gm = ctx.r3.u32;
+  __imp__sub_82788FD8(ctx, base);
+  if (Online()) {
+    LogOnChange("gm", gm,
+                fmt::format("state {} count {}", LoadBE32(base + gm + 27768),
+                            LoadBE32(base + gm + 544)));
+  }
+}
+
+// (user, title, text, button_count, buttons, active, flags, result, overlapped)
+extern "C" REX_FUNC(__imp__XamShowMessageBoxUIEx) {
+  NHL3ON3_ORIGINAL(__imp__XamShowMessageBoxUIEx);
+  if (Online()) {
+    REXLOG_INFO("[net] XamShowMessageBoxUIEx title='{}' text='{}'",
+                GuestWideString(base, ctx.r4.u32), GuestWideString(base, ctx.r5.u32));
+  }
+  original(ctx, base);
+}
+
+// (app id, message id, buffer, buffer size, overlapped)
+extern "C" REX_FUNC(__imp__XMsgStartIORequestEx) {
+  NHL3ON3_ORIGINAL(__imp__XMsgStartIORequestEx);
+  const uint32_t app = ctx.r3.u32, message = ctx.r4.u32;
+  original(ctx, base);
+  if (Online()) {
+    REXLOG_INFO("[net] XMsgStartIORequestEx(app {:X}, message {:X}) = {:X}", app, message,
+                ctx.r3.u32);
+  }
+}
+
+// (listener, match id, DWORD* id out, ULONG_PTR* param out); logs deliveries only.
+extern "C" REX_FUNC(__imp__XNotifyGetNext) {
+  NHL3ON3_ORIGINAL(__imp__XNotifyGetNext);
+  const uint32_t id_ptr = ctx.r5.u32, param_ptr = ctx.r6.u32;
+  original(ctx, base);
+  if (Online() && ctx.r3.u32 && id_ptr) {
+    REXLOG_INFO("[net] XNotifyGetNext delivered id {:08X} param {:08X}",
+                LoadBE32(base + id_ptr), param_ptr ? LoadBE32(base + param_ptr) : 0);
+  }
+}
+NHL3ON3_TRACE_PASSTHROUGH(XamShowSigninUI)
+NHL3ON3_TRACE_PASSTHROUGH(XamSessionCreateHandle)
+NHL3ON3_TRACE_PASSTHROUGH(XamSessionRefObjByHandle)
+NHL3ON3_TRACE_PASSTHROUGH(XamUserAreUsersFriends)
+NHL3ON3_TRACE_PASSTHROUGH(XamUserReadProfileSettings)
+NHL3ON3_TRACE_PASSTHROUGH(XamUserCreateStatsEnumerator)
+NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetTitleID)
+NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetMachineID)
+NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetStartup)
+NHL3ON3_TRACE_PASSTHROUGH(NetDll_WSAStartup)
+NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetQosListen)
+NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetQosLookup)
