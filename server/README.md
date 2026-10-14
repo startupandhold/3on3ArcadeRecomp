@@ -94,11 +94,13 @@ address is required.
    It should end with `PASS`. Run it while nobody is playing, because its fake
    players would land in real players' open games.
 
-6. **Point the game at it.** In the launcher's Online tab, set **Server** to
-   `nhl3on3-yourname.fly.dev` (or the IPv4 from `fly ips list`), keep
+6. **Point the game at it.** The game uses `nhl3on3-turtle.fly.dev` unless
+   told otherwise. For your own server, set **Server** in the launcher's Online
+   tab to `nhl3on3-yourname.fly.dev` (or the IPv4 from `fly ips list`), keep
    **Connect through server** checked, and enable **Online play**. To make
-   it the default for everyone you hand the game to, change the `Default` of
-   `online_server` in `launcher/nhl3on3_launcher.ps1` to that name.
+   it the default for everyone you hand the game to, change the default of
+   `online_server` in both `src/nhl3on3_net.cpp` and the launcher
+   (`launcher/nhl3on3_launcher.ps1`).
 
 ## Updating and operating
 

@@ -45,7 +45,7 @@ $Settings = @(
   @{ Tab = 'Online'; Key = 'online'; Label = 'Online play'; Kind = 'bool'; Toml = 'bool'; Default = 'false' }
   @{ Tab = 'Online'; Key = 'online_gamertag'; Label = 'Gamertag'; Kind = 'text'; Toml = 'string'; Default = ''
      Tip = 'Up to 15 characters; empty uses the profile name.' }
-  @{ Tab = 'Online'; Key = 'online_server'; Label = 'Server'; Kind = 'text'; Toml = 'string'; Default = '127.0.0.1'
+  @{ Tab = 'Online'; Key = 'online_server'; Label = 'Server'; Kind = 'text'; Toml = 'string'; Default = 'nhl3on3-turtle.fly.dev'
      Tip = 'Host name or IP address of the NHL 3 on 3 server.' }
   @{ Tab = 'Online'; Key = 'online_tunnel'; Label = 'Connect through server'; Kind = 'bool'; Toml = 'bool'; Default = 'true'
      Tip = "Sends game traffic through the server so no ports need forwarding.`nTurn off only to connect to players directly (LAN or VPN)." }

@@ -56,7 +56,7 @@ REXCVAR_DEFINE_BOOL(online, false, "NHL3on3/Online",
                     "Emulate a signed-in Xbox LIVE profile and network stack for online play")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_STRING(online_server, "127.0.0.1", "NHL3on3/Online",
+REXCVAR_DEFINE_STRING(online_server, "nhl3on3-turtle.fly.dev", "NHL3on3/Online",
                       "Host or IPv4 address of the Blaze server; all game DNS/LSP lookups "
                       "resolve here")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
