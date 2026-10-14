@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <random>
 #include <string>
@@ -85,6 +86,12 @@ REXCVAR_DEFINE_INT32(team_play, 0, "NHL3on3/Online",
                      "come from the online menu's ONLINE TEAM PLAY entry (the renamed "
                      "unranked quick match); the lobby server needs the same --match-size")
     .range(0, 6)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(online_tunnel, true, "NHL3on3/Online",
+                    "Send game traffic between players through the online server, so no "
+                    "ports need forwarding (needs the dedicated server, server/; falls back "
+                    "to direct play if it does not answer); off = connect to players directly")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(online_service_port, 42127, "NHL3on3/Online",
@@ -205,6 +212,265 @@ uint32_t DetectLocalIp() {
   return ip;
 }
 
+bool Online() {
+  return REXCVAR_GET(online);
+}
+
+//----------------------------------------------------------------------------
+// Tunnel through the dedicated server (server/tunnel.py). The server assigns
+// this instance a virtual address (10.66.x.y) that it advertises instead of
+// its own; datagrams to another virtual address are wrapped and sent to the
+// server, which forwards them to that player. Every player only talks to the
+// server, so nobody needs open ports.
+//
+// Packets (little-endian), header: u32 magic, u8 kind, 3 reserved bytes
+//   kHello     u32 nonce, u32 wanted address    kWelcome  u32 nonce, u32 address
+//   kKeepalive u32 address
+//   kData      out: u32 dest ip, u16 dest port, u16 source port, payload
+//              in:  u32 source ip, u16 source port, u16 dest port, payload
+//   kRelay     one lockstep relay packet (nhl3on3_lockstep_relay.cpp)
+//----------------------------------------------------------------------------
+
+#ifdef _WIN32
+using TunnelSocket = SOCKET;
+constexpr TunnelSocket kNoTunnelSocket = INVALID_SOCKET;
+#else
+using TunnelSocket = int;
+constexpr TunnelSocket kNoTunnelSocket = -1;
+#endif
+
+constexpr uint16_t kTunnelPort = 3670;
+constexpr uint32_t kTunnelMagic = 0x3154484E;  // "NHT1"
+constexpr uint8_t kTunnelHello = 1, kTunnelWelcome = 2, kTunnelKeepalive = 3, kTunnelData = 4,
+                  kTunnelRelay = 5;
+constexpr uint32_t kTunnelNet = 0x0A420000, kTunnelMask = 0xFFFF0000;
+constexpr size_t kTunnelHeader = 8;
+constexpr size_t kTunnelQueueLimit = 256;
+constexpr auto kTunnelKeepaliveInterval = std::chrono::seconds(5);
+
+struct TunnelDatagram {
+  uint32_t ip = 0;
+  uint16_t port = 0;
+  std::vector<uint8_t> data;
+};
+
+struct Tunnel {
+  TunnelSocket socket = kNoTunnelSocket;
+  sockaddr_in server{};
+  std::atomic<uint32_t> vip{0};
+  std::mutex mutex;
+  std::unordered_map<uint16_t, std::deque<TunnelDatagram>> inbox;  // by virtual port
+  std::deque<std::vector<uint8_t>> relay_inbox;
+  // Datagram sockets bind an ephemeral native port; peers address them by the
+  // port the game asked for (by guest socket), so instances sharing one PC
+  // can all use the game's fixed ports.
+  std::unordered_map<uint32_t, uint16_t> ports;
+};
+
+Tunnel g_tunnel;
+
+// Signals overlapped receives waiting on a socket bound to `port`.
+void WakeTunnelReceivers(uint16_t port);
+bool IsDatagram(uint32_t socket);
+bool NativeHandle(uint32_t socket, TunnelSocket& out);
+
+uint16_t NativeLocalPort(TunnelSocket native) {
+  sockaddr_in local{};
+  socklen_t len = sizeof(local);
+  if (::getsockname(native, reinterpret_cast<sockaddr*>(&local), &len) != 0) {
+    return 0;
+  }
+  return ntohs(local.sin_port);
+}
+
+void PutLE16(std::vector<uint8_t>& out, uint16_t v) {
+  out.push_back(uint8_t(v));
+  out.push_back(uint8_t(v >> 8));
+}
+void PutLE32(std::vector<uint8_t>& out, uint32_t v) {
+  for (int i = 0; i < 4; ++i) {
+    out.push_back(uint8_t(v >> (i * 8)));
+  }
+}
+uint16_t GetLE16(const uint8_t* p) {
+  return uint16_t(p[0] | (p[1] << 8));
+}
+uint32_t GetLE32(const uint8_t* p) {
+  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+         (uint32_t(p[3]) << 24);
+}
+
+std::vector<uint8_t> TunnelPacket(uint8_t kind, size_t reserve = 0) {
+  std::vector<uint8_t> packet;
+  packet.reserve(kTunnelHeader + reserve);
+  PutLE32(packet, kTunnelMagic);
+  packet.push_back(kind);
+  packet.insert(packet.end(), 3, 0);
+  return packet;
+}
+
+int TunnelSend(const std::vector<uint8_t>& packet) {
+  return ::sendto(g_tunnel.socket, reinterpret_cast<const char*>(packet.data()),
+                  int(packet.size()), 0, reinterpret_cast<const sockaddr*>(&g_tunnel.server),
+                  sizeof(g_tunnel.server));
+}
+
+bool TunnelReadable(int timeout_ms) {
+  fd_set set;
+  FD_ZERO(&set);
+  FD_SET(g_tunnel.socket, &set);
+  timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  return ::select(int(g_tunnel.socket) + 1, &set, nullptr, nullptr, &timeout) > 0;
+}
+
+void TunnelReceiveOne() {
+  uint8_t buffer[2048];
+  const int n = ::recv(g_tunnel.socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+  if (n < int(kTunnelHeader) || GetLE32(buffer) != kTunnelMagic) {
+    return;
+  }
+  const uint8_t kind = buffer[4];
+  const uint8_t* body = buffer + kTunnelHeader;
+  const size_t size = size_t(n) - kTunnelHeader;
+  if (kind == kTunnelData && size >= 8) {
+    TunnelDatagram d;
+    d.ip = GetLE32(body);
+    d.port = GetLE16(body + 4);
+    const uint16_t dest_port = GetLE16(body + 6);
+    d.data.assign(body + 8, body + size);
+    {
+      std::lock_guard lock(g_tunnel.mutex);
+      auto& queue = g_tunnel.inbox[dest_port];
+      if (queue.size() >= kTunnelQueueLimit) {
+        queue.pop_front();
+      }
+      queue.push_back(std::move(d));
+    }
+    WakeTunnelReceivers(dest_port);
+  } else if (kind == kTunnelRelay) {
+    std::lock_guard lock(g_tunnel.mutex);
+    if (g_tunnel.relay_inbox.size() >= kTunnelQueueLimit * 2) {
+      g_tunnel.relay_inbox.pop_front();
+    }
+    g_tunnel.relay_inbox.emplace_back(body, body + size);
+  }
+}
+
+void TunnelLoop() {
+  auto next_keepalive = std::chrono::steady_clock::now();
+  for (;;) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_keepalive) {
+      auto packet = TunnelPacket(kTunnelKeepalive, 4);
+      PutLE32(packet, g_tunnel.vip.load());
+      TunnelSend(packet);
+      next_keepalive = now + kTunnelKeepaliveInterval;
+    }
+    if (TunnelReadable(250)) {
+      TunnelReceiveOne();
+    }
+  }
+}
+
+// Asks the server for a virtual address; 0 if it does not answer.
+uint32_t TunnelRegister(uint32_t server_ip) {
+  Tunnel& t = g_tunnel;
+  t.socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (t.socket == kNoTunnelSocket) {
+    return 0;
+  }
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  ::bind(t.socket, reinterpret_cast<sockaddr*>(&local), sizeof(local));
+#ifdef _WIN32
+  constexpr DWORD kSioUdpConnReset = _WSAIOW(IOC_VENDOR, 12);
+  BOOL report = FALSE;
+  DWORD returned = 0;
+  WSAIoctl(t.socket, kSioUdpConnReset, &report, sizeof(report), nullptr, 0, &returned, nullptr,
+           nullptr);
+#endif
+  t.server.sin_family = AF_INET;
+  t.server.sin_port = htons(kTunnelPort);
+  t.server.sin_addr.s_addr = htonl(server_ip);
+  const uint32_t nonce = uint32_t(std::random_device{}());
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    auto hello = TunnelPacket(kTunnelHello, 8);
+    PutLE32(hello, nonce);
+    PutLE32(hello, 0);
+    TunnelSend(hello);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < until && TunnelReadable(50)) {
+      uint8_t buffer[64];
+      const int n = ::recv(t.socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+      if (n >= int(kTunnelHeader + 8) && GetLE32(buffer) == kTunnelMagic &&
+          buffer[4] == kTunnelWelcome && GetLE32(buffer + kTunnelHeader) == nonce) {
+        const uint32_t vip = GetLE32(buffer + kTunnelHeader + 4);
+        t.vip.store(vip);
+        std::thread(TunnelLoop).detach();
+        return vip;
+      }
+    }
+  }
+#ifdef _WIN32
+  closesocket(t.socket);
+#else
+  close(t.socket);
+#endif
+  t.socket = kNoTunnelSocket;
+  return 0;
+}
+
+bool TunnelActive() {
+  return g_tunnel.vip.load() != 0;
+}
+
+bool IsTunnelAddress(uint32_t ip) {
+  return TunnelActive() && (ip & kTunnelMask) == kTunnelNet;
+}
+
+int TunnelSendData(uint32_t ip, uint16_t port, uint16_t source_port, const uint8_t* data,
+                   uint32_t length) {
+  auto packet = TunnelPacket(kTunnelData, 8 + length);
+  PutLE32(packet, ip);
+  PutLE16(packet, port);
+  PutLE16(packet, source_port);
+  packet.insert(packet.end(), data, data + length);
+  return TunnelSend(packet) < 0 ? -1 : int(length);
+}
+
+void SetVirtualPort(uint32_t socket, uint16_t port) {
+  std::lock_guard lock(g_tunnel.mutex);
+  if (port) {
+    g_tunnel.ports[socket] = port;
+  } else {
+    g_tunnel.ports.erase(socket);
+  }
+}
+
+// The port a tunneled socket is known by; 0 if it has none.
+uint16_t VirtualPort(uint32_t socket) {
+  std::lock_guard lock(g_tunnel.mutex);
+  auto it = g_tunnel.ports.find(socket);
+  return it == g_tunnel.ports.end() ? 0 : it->second;
+}
+
+bool TunnelPending(uint16_t port) {
+  std::lock_guard lock(g_tunnel.mutex);
+  auto it = g_tunnel.inbox.find(port);
+  return it != g_tunnel.inbox.end() && !it->second.empty();
+}
+
+bool TunnelPop(uint16_t port, TunnelDatagram& out) {
+  std::lock_guard lock(g_tunnel.mutex);
+  auto it = g_tunnel.inbox.find(port);
+  if (it == g_tunnel.inbox.end() || it->second.empty()) {
+    return false;
+  }
+  out = std::move(it->second.front());
+  it->second.pop_front();
+  return true;
+}
+
 const NetState& State() {
   static const NetState state = [] {
 #if defined(_WIN32)
@@ -212,15 +478,29 @@ const NetState& State() {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
     NetState s;
-    const std::string ip_setting = REXCVAR_GET(online_ip);
-    uint32_t ip = ip_setting.empty() ? DetectLocalIp() : ResolveIpv4(ip_setting);
-    if (ip) {
-      s.local_ip = ip;
-    }
     if (uint32_t server = ResolveIpv4(REXCVAR_GET(online_server))) {
       s.server_ip = server;
     } else {
       REXLOG_ERROR("[net] could not resolve online_server '{}'", REXCVAR_GET(online_server));
+    }
+    uint32_t ip = 0;
+    if (Online() && REXCVAR_GET(online_tunnel)) {
+      ip = TunnelRegister(s.server_ip);
+      if (ip) {
+        REXLOG_INFO("[net] tunnel: server {}:{} assigned {}", FormatIp(s.server_ip), kTunnelPort,
+                    FormatIp(ip));
+      } else {
+        REXLOG_WARN("[net] tunnel: no answer from {}:{}; playing direct (other players must "
+                    "be able to reach this address)",
+                    FormatIp(s.server_ip), kTunnelPort);
+      }
+    }
+    if (!ip) {
+      const std::string ip_setting = REXCVAR_GET(online_ip);
+      ip = ip_setting.empty() ? DetectLocalIp() : ResolveIpv4(ip_setting);
+    }
+    if (ip) {
+      s.local_ip = ip;
     }
     const std::string xuid_setting = REXCVAR_GET(online_xuid);
     if (!xuid_setting.empty()) {
@@ -233,10 +513,6 @@ const NetState& State() {
     return s;
   }();
   return state;
-}
-
-bool Online() {
-  return REXCVAR_GET(online);
 }
 
 // The most recent remote address handed out by XNetXnAddrToInAddr.
@@ -647,20 +923,38 @@ extern "C" REX_FUNC(__imp__NetDll_connect) {
 // (caller, socket, const sockaddr*, namelen). Instances sharing one PC advertise
 // distinct loopback addresses (127.0.0.2, 127.0.0.3, ...); binding each one's
 // wildcard sockets to its own address lets both use the game's fixed ports.
+// Through the tunnel, datagram sockets bind an ephemeral port instead and are
+// known to peers by the requested one (see Tunnel::ports).
 extern "C" REX_FUNC(__imp__NetDll_bind) {
   NHL3ON3_TRACE("bind");
   NHL3ON3_ORIGINAL(__imp__NetDll_bind);
+  const uint32_t socket = ctx.r4.u32;
   uint8_t* sa = ctx.r5.u32 ? base + ctx.r5.u32 : nullptr;
-  const bool pin = Online() && sa && LoadBE32(sa + 4) == 0 && IsLoopback(State().local_ip);
+  const bool tunneled = Online() && sa && (State(), TunnelActive()) && IsDatagram(socket);
+  const bool pin = !tunneled && Online() && sa && LoadBE32(sa + 4) == 0 &&
+                   IsLoopback(State().local_ip);
+  if (Online() && sa) {
+    LogSockaddr("bind", socket, sa);
+  }
+  uint8_t saved[6];
+  if (tunneled) {
+    std::memcpy(saved, sa + 2, 6);
+    std::memset(sa + 2, 0, 6);
+  }
   if (pin) {
     StoreBE32(sa + 4, State().local_ip);
-  }
-  if (Online() && sa) {
-    LogSockaddr("bind", ctx.r4.u32, sa);
   }
   original(ctx, base);
   if (pin) {
     StoreBE32(sa + 4, 0);
+  }
+  if (tunneled) {
+    std::memcpy(sa + 2, saved, 6);
+    TunnelSocket native;
+    if (ctx.r3.u32 == 0 && NativeHandle(socket, native)) {
+      const uint16_t requested = uint16_t((saved[0] << 8) | saved[1]);
+      SetVirtualPort(socket, requested ? requested : NativeLocalPort(native));
+    }
   }
 }
 
@@ -770,6 +1064,7 @@ struct PendingRecv {
   NativeSocket native;
   uint32_t buffer, length, from, fromlen, event;
   bool signaled = false;
+  uint16_t port = 0;  // local port, for tunneled datagrams
 };
 
 std::mutex g_dgram_mutex;
@@ -883,8 +1178,38 @@ bool Readable(NativeSocket native) {
 
 // Receives one pending datagram without blocking, reporting the sender in
 // guest XSOCKADDR_IN form. Returns the length, or -1 with `error` set.
+// The port peers address `socket` by: its virtual port through the tunnel.
+uint16_t SocketPort(uint32_t socket, NativeSocket native) {
+  const uint16_t port = VirtualPort(socket);
+  return port ? port : NativeLocalPort(native);
+}
+
+void StoreFrom(uint8_t* base, uint32_t from, uint32_t fromlen, uint32_t ip, uint16_t port) {
+  if (from) {
+    uint8_t* sa = base + from;
+    StoreBE16(sa, AF_INET);
+    StoreBE16(sa + 2, port);
+    StoreBE32(sa + 4, ip);
+    std::memset(sa + 8, 0, 8);
+  }
+  if (fromlen) {
+    StoreBE32(base + fromlen, 16);
+  }
+}
+
 int ReceiveDatagram(uint8_t* base, uint32_t socket, NativeSocket native, uint32_t buffer,
                     uint32_t length, uint32_t from, uint32_t fromlen, uint32_t& error) {
+  if (TunnelActive()) {
+    TunnelDatagram d;
+    if (TunnelPop(SocketPort(socket, native), d)) {
+      const int n = int(std::min<size_t>(length, d.data.size()));
+      std::memcpy(base + buffer, d.data.data(), size_t(n));
+      CountDatagram("recv", socket, d.ip, d.port, base + buffer, n);
+      NoteGamePeer(d.ip, d.port);
+      StoreFrom(base, from, fromlen, d.ip, d.port);
+      return n;
+    }
+  }
   for (;;) {
     if (!Readable(native)) {
       error = kWsaEWouldBlock;
@@ -905,30 +1230,42 @@ int ReceiveDatagram(uint8_t* base, uint32_t socket, NativeSocket native, uint32_
     const uint32_t ip = ntohl(addr.sin_addr.s_addr);
     CountDatagram("recv", socket, ip, ntohs(addr.sin_port), base + buffer, n);
     NoteGamePeer(ip, ntohs(addr.sin_port));
-    if (from) {
-      uint8_t* sa = base + from;
-      StoreBE16(sa, AF_INET);
-      std::memcpy(sa + 2, &addr.sin_port, 2);
-      StoreBE32(sa + 4, ip);
-      std::memset(sa + 8, 0, 8);
-    }
-    if (fromlen) {
-      StoreBE32(base + fromlen, 16);
-    }
+    StoreFrom(base, from, fromlen, ip, ntohs(addr.sin_port));
     return n;
+  }
+}
+
+void WakeTunnelReceivers(uint16_t port) {
+  std::vector<uint32_t> events;
+  {
+    std::lock_guard lock(g_dgram_mutex);
+    for (auto& [overlapped, op] : g_pending_recvs) {
+      if (!op.signaled && op.port == port) {
+        op.signaled = true;
+        events.push_back(op.event);
+      }
+    }
+  }
+  for (uint32_t event : events) {
+    SignalEvent(event);
   }
 }
 
 void WatchPendingRecvs() {
   for (;;) {
-    std::vector<std::pair<uint32_t, NativeSocket>> armed;
+    struct Armed {
+      uint32_t overlapped;
+      NativeSocket native;
+      uint16_t port;
+    };
+    std::vector<Armed> armed;
     {
       std::unique_lock lock(g_dgram_mutex);
       g_dgram_cv.wait(lock, [&] {
         armed.clear();
         for (const auto& [overlapped, op] : g_pending_recvs) {
           if (!op.signaled) {
-            armed.emplace_back(overlapped, op.native);
+            armed.push_back({overlapped, op.native, op.port});
           }
         }
         return !armed.empty();
@@ -937,25 +1274,35 @@ void WatchPendingRecvs() {
     fd_set set;
     FD_ZERO(&set);
     int max_fd = 0;
-    for (const auto& [overlapped, native] : armed) {
-      FD_SET(native, &set);
-      max_fd = std::max(max_fd, int(native));
+    for (const Armed& a : armed) {
+      FD_SET(a.native, &set);
+      max_fd = std::max(max_fd, int(a.native));
     }
     timeval timeout{0, 5000};
-    const int ready = ::select(max_fd + 1, &set, nullptr, nullptr, &timeout);
+    int ready = ::select(max_fd + 1, &set, nullptr, nullptr, &timeout);
     if (ready < 0) {
+      FD_ZERO(&set);
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    if (ready <= 0) {
+    std::vector<uint16_t> tunneled;
+    for (const Armed& a : armed) {
+      if (TunnelActive() && TunnelPending(a.port)) {
+        tunneled.push_back(a.port);
+      }
+    }
+    if (ready <= 0 && tunneled.empty()) {
       continue;
     }
     std::vector<uint32_t> events;
     {
       std::lock_guard lock(g_dgram_mutex);
-      for (const auto& [overlapped, native] : armed) {
-        auto it = g_pending_recvs.find(overlapped);
-        if (FD_ISSET(native, &set) && it != g_pending_recvs.end() && !it->second.signaled &&
-            it->second.native == native) {
+      for (const Armed& a : armed) {
+        auto it = g_pending_recvs.find(a.overlapped);
+        const bool has_data =
+            (ready > 0 && FD_ISSET(a.native, &set)) ||
+            std::find(tunneled.begin(), tunneled.end(), a.port) != tunneled.end();
+        if (has_data && it != g_pending_recvs.end() && !it->second.signaled &&
+            it->second.native == a.native) {
           it->second.signaled = true;
           events.push_back(it->second.event);
         }
@@ -1014,7 +1361,8 @@ extern "C" REX_FUNC(__imp__NetDll_getsockname) {
   uint8_t* sa = base + name;
   std::memset(sa, 0, 16);
   StoreBE16(sa, AF_INET);
-  StoreBE16(sa + 2, ntohs(local.sin_port));
+  const uint16_t virtual_port = VirtualPort(socket);
+  StoreBE16(sa + 2, virtual_port ? virtual_port : ntohs(local.sin_port));
   StoreBE32(sa + 4, ntohl(local.sin_addr.s_addr));
   StoreBE32(base + namelen, 16);
   ctx.r3.u64 = 0;
@@ -1042,12 +1390,17 @@ extern "C" REX_FUNC(__imp__NetDll_sendto) {
       State().local_ip != kLoopbackIp) {
     ip = peer;
   }
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  addr.sin_addr.s_addr = htonl(ip);
-  const int n = ::sendto(native, reinterpret_cast<const char*>(base + buffer), int(length), 0,
-                         reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+  int n;
+  if (IsTunnelAddress(ip)) {
+    n = TunnelSendData(ip, port, SocketPort(socket, native), base + buffer, length);
+  } else {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(ip);
+    n = ::sendto(native, reinterpret_cast<const char*>(base + buffer), int(length), 0,
+                 reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+  }
   uint32_t error = 0;
   if (n < 0) {
     error = NativeError();
@@ -1101,7 +1454,8 @@ extern "C" REX_FUNC(__imp__NetDll_WSARecvFrom) {
   }
   {
     std::lock_guard lock(g_dgram_mutex);
-    g_pending_recvs[overlapped] = {socket, native, buffer, length, from, fromlen, event};
+    g_pending_recvs[overlapped] = {socket, native, buffer, length, from,
+                                   fromlen, event, false, SocketPort(socket, native)};
   }
   StartRecvWatcher();
   g_dgram_cv.notify_one();
@@ -1193,6 +1547,7 @@ extern "C" REX_FUNC(__imp__NetDll_closesocket) {
       it = it->second.socket == socket ? g_pending_recvs.erase(it) : std::next(it);
     }
   }
+  SetVirtualPort(socket, 0);
   original(ctx, base);
 }
 
@@ -1631,4 +1986,25 @@ uint32_t Nhl3on3LocalIp() {
 std::vector<uint32_t> Nhl3on3GamePeers() {
   std::lock_guard lock(g_game_peers_mutex);
   return g_game_peers;
+}
+
+bool Nhl3on3TunnelActive() {
+  State();
+  return TunnelActive();
+}
+
+void Nhl3on3TunnelSendRelay(const uint8_t* data, size_t size) {
+  auto packet = TunnelPacket(kTunnelRelay, size);
+  packet.insert(packet.end(), data, data + size);
+  TunnelSend(packet);
+}
+
+bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet) {
+  std::lock_guard lock(g_tunnel.mutex);
+  if (g_tunnel.relay_inbox.empty()) {
+    return false;
+  }
+  packet = std::move(g_tunnel.relay_inbox.front());
+  g_tunnel.relay_inbox.pop_front();
+  return true;
 }

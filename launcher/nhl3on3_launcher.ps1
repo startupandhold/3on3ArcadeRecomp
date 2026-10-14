@@ -45,9 +45,12 @@ $Settings = @(
   @{ Tab = 'Online'; Key = 'online'; Label = 'Online play'; Kind = 'bool'; Toml = 'bool'; Default = 'false' }
   @{ Tab = 'Online'; Key = 'online_gamertag'; Label = 'Gamertag'; Kind = 'text'; Toml = 'string'; Default = ''
      Tip = 'Up to 15 characters; empty uses the profile name.' }
-  @{ Tab = 'Online'; Key = 'online_server'; Label = 'Server'; Kind = 'text'; Toml = 'string'; Default = '127.0.0.1' }
+  @{ Tab = 'Online'; Key = 'online_server'; Label = 'Server'; Kind = 'text'; Toml = 'string'; Default = '127.0.0.1'
+     Tip = 'Host name or IP address of the NHL 3 on 3 server.' }
+  @{ Tab = 'Online'; Key = 'online_tunnel'; Label = 'Connect through server'; Kind = 'bool'; Toml = 'bool'; Default = 'true'
+     Tip = "Sends game traffic through the server so no ports need forwarding.`nTurn off only to connect to players directly (LAN or VPN)." }
   @{ Tab = 'Online'; Key = 'online_ip'; Label = 'Advertised IP'; Kind = 'text'; Toml = 'string'; Default = ''
-     Tip = 'Empty detects the LAN address. Set a VPN address (Radmin, ZeroTier) to play over it.' }
+     Tip = "Only used when not connecting through the server.`nEmpty detects the LAN address; set a VPN address (Radmin, ZeroTier) to play over it." }
   @{ Tab = 'Online'; Key = 'team_play'; Label = 'Team play'; Kind = 'choice'; Toml = 'int'; Default = '0'
      Choices = [ordered]@{ '0' = 'Off (1 vs 1)'; '3' = '3 consoles'; '4' = '4 consoles'; '5' = '5 consoles'; '6' = '6 consoles' } }
 )

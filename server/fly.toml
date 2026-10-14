@@ -1,0 +1,53 @@
+# Fly.io config for the NHL 3 on 3 server. Change `app` to the name you
+# create with `fly apps create`, and `primary_region` to the region nearest
+# your players (`fly platform regions`).
+app = "nhl3on3"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Consoles per unranked quick match: 2 = normal 1v1, 3-6 = team play.
+  MATCH_SIZE = "2"
+  LOG_LEVEL = "INFO"
+
+# Lobby and matchmaking state lives in memory, so exactly one machine runs
+# and it never sleeps.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 10901
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  [[services.ports]]
+    port = 10901
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 30380
+  auto_stop_machines = "off"
+  [[services.ports]]
+    port = 30380
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 42127
+  auto_stop_machines = "off"
+  [[services.ports]]
+    port = 42127
+
+[[services]]
+  protocol = "udp"
+  internal_port = 3670
+  auto_stop_machines = "off"
+  [[services.ports]]
+    port = 3670

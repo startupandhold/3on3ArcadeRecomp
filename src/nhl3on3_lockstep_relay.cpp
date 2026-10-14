@@ -59,6 +59,9 @@ REXCVAR_DEFINE_BOOL(lockstep_relay, true, "NHL3on3/Online",
 
 uint32_t Nhl3on3LocalIp();
 std::vector<uint32_t> Nhl3on3GamePeers();
+bool Nhl3on3TunnelActive();
+void Nhl3on3TunnelSendRelay(const uint8_t* data, size_t size);
+bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet);
 
 namespace nhl3on3::lockstep_relay {
 namespace {
@@ -117,6 +120,9 @@ struct Client {
 struct Relay {
   uint32_t dist = 0, slot = 0, count = 0;
   bool host = false;
+  // Packets go through the dedicated server's tunnel, and the server is the
+  // host: every console, slot 0 included, is a client.
+  bool tunnel = false;
   NativeSocket socket = kNoSocket;
 
   uint32_t inputs_sent = 0;   // local inputs produced
@@ -364,6 +370,10 @@ void Header(Writer& w, uint8_t kind) {
 }
 
 void SendTo(const sockaddr_in& addr, const std::vector<uint8_t>& packet) {
+  if (g_relay.tunnel) {
+    Nhl3on3TunnelSendRelay(packet.data(), packet.size());
+    return;
+  }
   ::sendto(g_relay.socket, reinterpret_cast<const char*>(packet.data()), int(packet.size()), 0,
            reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
 }
@@ -526,6 +536,9 @@ void HandleFrames(Reader& rd, uint8_t count) {
 
 // Client: where the host may be; every address its game link talks to.
 std::vector<sockaddr_in> HostAddrs() {
+  if (g_relay.tunnel) {
+    return {sockaddr_in{}};  // the server; SendTo ignores the address
+  }
   std::vector<sockaddr_in> out;
   for (uint32_t ip : Nhl3on3GamePeers()) {
     sockaddr_in addr{};
@@ -630,12 +643,15 @@ void SendInputs(Clock::time_point now) {
   }
   packet[count_at] = uint8_t(n);
   packet[count_at + 1] = uint8_t(n >> 8);
-  const std::vector<uint32_t> peers = Nhl3on3GamePeers();
   for (const sockaddr_in& addr : HostAddrs()) {
     SendTo(addr, packet);
   }
   r.acked_sent = FramesEnd();
   r.last_send = now;
+  if (r.tunnel) {
+    return;
+  }
+  const std::vector<uint32_t> peers = Nhl3on3GamePeers();
   static bool logged = false, logged_none = false;
   if (peers.empty() && !logged_none) {
     logged_none = true;
@@ -651,24 +667,42 @@ void SendInputs(Clock::time_point now) {
   }
 }
 
-void Receive() {
+// Reads the next packet into `buffer`; its length, or -1 if none is waiting.
+int ReceiveOne(uint8_t* buffer, size_t capacity, sockaddr_in& from) {
   Relay& r = g_relay;
-  uint8_t buffer[2048];
+  if (r.tunnel) {
+    std::vector<uint8_t> packet;
+    if (!Nhl3on3TunnelReceiveRelay(packet)) {
+      return -1;
+    }
+    const size_t n = std::min(packet.size(), capacity);
+    std::memcpy(buffer, packet.data(), n);
+    return int(n);
+  }
   for (;;) {
-    sockaddr_in from{};
 #if defined(_WIN32)
     int from_len = sizeof(from);
 #else
     socklen_t from_len = sizeof(from);
 #endif
-    const int n = ::recvfrom(r.socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0,
+    const int n = ::recvfrom(r.socket, reinterpret_cast<char*>(buffer), int(capacity), 0,
                              reinterpret_cast<sockaddr*>(&from), &from_len);
-    if (n < 0) {
 #if defined(_WIN32)
-      if (WSAGetLastError() == WSAECONNRESET) {
-        continue;
-      }
+    if (n < 0 && WSAGetLastError() == WSAECONNRESET) {
+      continue;
+    }
 #endif
+    return n;
+  }
+}
+
+void Receive() {
+  Relay& r = g_relay;
+  uint8_t buffer[2048];
+  for (;;) {
+    sockaddr_in from{};
+    const int n = ReceiveOne(buffer, sizeof(buffer), from);
+    if (n < 0) {
       return;
     }
     if (size_t(n) < kHeaderSize) {
@@ -696,7 +730,7 @@ void Receive() {
 // Exchanges packets; called from every hooked dist call.
 void Pump() {
   Relay& r = g_relay;
-  if (r.socket == kNoSocket) {
+  if (r.socket == kNoSocket && !r.tunnel) {
     return;
   }
   Receive();
@@ -748,8 +782,13 @@ void OnMultiSetup(uint32_t dist, uint32_t slot, uint32_t count) {
   r.dist = dist;
   r.slot = slot;
   r.count = count;
-  r.host = slot == 0;
   r.clients.resize(count);
+  if (Nhl3on3TunnelActive()) {
+    r.tunnel = true;
+    REXLOG_INFO("[relay] dist {:08X}: slot {} of {}, hosted by the server", dist, slot, count);
+    return;
+  }
+  r.host = slot == 0;
   const uint32_t ip = Nhl3on3LocalIp();
   r.socket = OpenSocket(ip);
   if (r.socket == kNoSocket) {

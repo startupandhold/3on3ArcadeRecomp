@@ -9,7 +9,8 @@
 // dist mode expects a server to combine every slot's input, so each console
 // sends its numbered inputs to the host over UDP, and the host broadcasts
 // frame N once it holds input N from every slot. Every console, the host
-// included, plays the same frames.
+// included, plays the same frames. Through the dedicated server's tunnel the
+// server is the host (server/tunnel.py) and every console is a client.
 namespace nhl3on3::lockstep_relay {
 
 // The match's dist object was set up as `slot` of `count` slots.
