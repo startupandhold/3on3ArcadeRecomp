@@ -335,12 +335,177 @@ def patch_select_teams(apt_bytes, const_bytes):
     ]
     assemble(data, chunks, pool)
     return bytes(data), [(func, body + size), (left, cases_end), (timer_func, timer_end),
-                         (0x1214, 0x125E)]
+                         (0x1214, 0x125E)], 0xEBC
+
+
+def patch_starting_lineups(apt_bytes, const_bytes):
+    """onlineStartingLineups (STARTING LINEUPS, with the position lock).
+
+    Stock: the position lock (mcPositionLock, the nhlcontrollers component)
+    shows an icon per local controller with the skater it is locked to; a
+    console never learns other consoles' locks until the match starts.
+
+    Patched, with locks kept by the client (src/nhl3on3_team_lobby.cpp):
+    - every 250 ms a timer reports the local controller's lock, so it reaches
+      the other consoles while the screen is up.
+    - the lock's spare icons (4..6; only getMaxControllers() = 4 are local)
+      show the local side's players on other consoles, each with the skater
+      it locked and its name, "SKATER (name)". An icon holds its skater like
+      a local controller's, so the local player cannot pick a taken one.
+    - updateUserList tells the client which players are on this console.
+
+    The screen's second action block holds updateUserList and two functions
+    that only run for online leagues: LeagueEventHandler (becomes the timer)
+    and handleLeagueRosterCRC (updates one teammate icon). That block's
+    constant pool lacks the lock's names, so the client returns them as
+    strings (GetControllerLogin(200 + k)) for getVariable / getMember /
+    callMethod to use.
+    """
+    data = bytearray(apt_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool_at = 0x4DB4
+    pool = frame_pool(apt, pool_at)
+    users, users_end = 0x6344, 0x63A0     # updateUserList: the per-user traces
+    expect(data, users, "a30134ae56b9044e")  # trace('UserName: ' + m_aPlayers[r4]...
+    expect(data, users_end, "b90450")        # r4++
+    icon_func, icon_body, icon_end = 0x746D, 0x748C, 0x7584
+    expect(data, icon_func, "8e")
+    expect(data, icon_body, "a301c3b9074726")  # trace(':::handleLeagueRosterCRC...' + r7)
+    expect(data, icon_end, "8e")
+    timer_func, timer_body, timer_end = 0x953C, 0x955C, 0x9680
+    expect(data, timer_func, "8e")
+    expect(data, timer_body, "a302b7b90447")   # trace('[GameSetup]::LeagueEventHandler...'
+    expect(data, timer_end, "a301ae")
+
+    # Variables for the timer id and the lock: event names only the replaced
+    # league handler compared against.
+    timer_var, lock_var = "EVENT_OL_LOAD_ROSTER_SUCCESS", "EVENT_OL_LOAD_MEMBERS_SUCCESS"
+    names = ("lineupPanel", "m_mySide", "mcPositionLock", "getPosition", "setPosition",
+             "setConnectedStatus", "setText", "removePadding", "gControllerIDCurrentScreen",
+             "mPositions", "NAME")
+
+    def name(n):
+        return [*lobby_call([("pushShort", 200 + names.index(n))])]
+
+    def call(obj, method, args):
+        """obj.method(*args), dropping the result."""
+        out = []
+        for arg in reversed(args):
+            out += arg
+        return out + [("pushByte", len(args)), *obj, *name(method), ("callMethod",), ("pop",)]
+
+    lock = [("pushRegister", 4)]
+    slot = [("pushRegister", 5)]
+    chunks = [
+        Chunk(users, users_end, [
+            *lobby_call([("pushRegister", 4), ("pushShort", 1100), ("add2",)],
+                        [("pushValueOfVar", "m_aPlayers"), ("pushRegister", 4), ("getMember",),
+                         ("getNamedMember", "core_bIsLocalUser")]),
+            ("pop",),
+            # start the timer once
+            ("pushConst", timer_var), ("getVariable",), ("pushUndefined",), ("equals2",),
+            ("branchIfFalse", users_end),
+            ("pushConst", timer_var), ("pushValueOfVar", "m_thisScreen"),
+            ("pushShort", 250), ("pushConst", "LeagueEventHandler"), ("getVariable",),
+            ("pushByte", 3), ("pushConst", "setInterval"), ("callFunction",),
+            ("setVariable",),
+        ]),
+
+        # The timer. Registers: 1 _root; 2 the lock.
+        Chunk(timer_body, timer_end, [
+            ("pushValueOfVar", "m_bLeavingScreen"), ("branchIfFalse", "tick"),
+            ("pushConst", timer_var), ("getVariable",), ("pushOne",),
+            ("pushConst", "clearInterval"), ("callFunctionPop",),
+            ("pushUndefined",), ("return",),
+            ("label", "tick"),
+            # lock = lineupPanel[m_mySide].mcPositionLock
+            *name("lineupPanel"), ("getVariable",), *name("m_mySide"), ("getVariable",),
+            ("getMember",), *name("mcPositionLock"), ("getMember",),
+            ("storeRegister", 2), ("pop",),
+            ("pushConst", lock_var), ("pushRegister", 2), ("setVariable",),
+            # report lock.getPosition(_root.gControllerIDCurrentScreen)
+            *lobby_call([("pushShort", 130)],
+                        [("pushRegister", 1), *name("gControllerIDCurrentScreen"), ("getMember",),
+                         ("pushOne",), ("pushRegister", 2), *name("getPosition"), ("callMethod",)]),
+            ("pop",),
+            *[ins for j in range(3) for ins in [
+                ("pushByte", j), ("pushOne",), ("pushConst", "handleLeagueRosterCRC"),
+                ("callFunctionPop",)]],
+            ("pushUndefined",), ("return",),
+        ]),
+
+        # Teammate icon j (r7). Registers: 3 position (-1 hidden, -2 unchanged),
+        # 4 the lock, 5 icon (4 + j), 6 shown.
+        Chunk(icon_body, icon_end, [
+            *lobby_call([("pushRegister", 7), ("pushShort", 140), ("add2",)]),
+            ("toNumber",), ("storeRegister", 3), ("pop",),
+            ("pushRegister", 3), ("pushByte", -1), ("less2",), ("branchIfTrue", "icon_end"),
+            ("pushConst", lock_var), ("getVariable",), ("storeRegister", 4), ("pop",),
+            ("pushRegister", 7), ("pushByte", 4), ("add2",), ("storeRegister", 5), ("pop",),
+            ("pushRegister", 3), ("pushZero",), ("less2",), ("not",), ("storeRegister", 6),
+            ("pop",),
+            ("pushRegister", 6), ("branchIfTrue", "shown"),
+            ("pushZero",), ("storeRegister", 3), ("pop",),
+            ("label", "shown"),
+            *call(lock, "setPosition", [slot, [("pushRegister", 3)]]),
+            # setText(icon, mPositions[position].NAME + " (name)")
+            *call(lock, "setText", [slot, [
+                ("pushRegister", 4), *name("mPositions"), ("getMember",), ("pushRegister", 3),
+                ("getMember",), *name("NAME"), ("getMember",),
+                *lobby_call([("pushRegister", 7), ("pushShort", 150), ("add2",)]), ("add2",)]]),
+            *call(lock, "setConnectedStatus", [slot, [("pushRegister", 6)]]),
+            *call(lock, "removePadding", []),
+            ("label", "icon_end"),
+            ("pushUndefined",), ("return",),
+        ]),
+    ]
+    assemble(data, chunks, pool)
+
+    # First action block (its own constant pool): sides by team, not by host.
+    # Stock: m_mySide = host ? HOME : AWAY, and lineup messages from another
+    # console go to m_otherSide. Patched: m_mySide is the lead controller's
+    # side, which Select Sides set from the team pick, and a lineup message
+    # goes to its player's side. Team side 0 plays away (SIDES[AWAY_INDEX] on
+    # Select Sides), and AWAY is 1, so the screen side is 1 - team side.
+    pool1 = frame_pool(apt, 0x1300)
+    my_side, my_side_end = 0x2754, 0x2783   # custom_PostInitScreen
+    expect(data, my_side, "a28faea79d")      # m_mySide = m_bIsHost ? HOME : AWAY
+    expect(data, 0x276B, "a3010aae8f")       # m_otherSide = m_mySide == HOME ? AWAY : HOME
+    expect(data, my_side_end, "5987")        # r3 = 0
+    set_side, set_side_end = 0x370D, 0x372A  # custom_HandleSetMessage: r11 = side
+    expect(data, set_side, "b90a594e59a30106")
+    expect(data, set_side_end, "87")
+    upd_side, upd_side_end = 0x38B1, 0x38CE  # custom_handleUpdateMessage: r6 = side
+    expect(data, upd_side, "b905594e59a30106")
+    expect(data, upd_side_end, "87")
+
+    def side_of_player(fields):
+        """1 - team side of player fields[0] (the user index a message is about)."""
+        return [("pushOne",), ("pushRegister", fields), ("pushZero",), ("getMember",),
+                ("toNumber",), ("pushByte", 120), ("add2",), ("pushOne",),
+                ("pushConst", "OSDK_GameSetupAdaptor"), ("getVariable",),
+                ("pushConst", "GetControllerLogin"), ("callMethod",), ("subtract",)]
+
+    assemble(data, [
+        Chunk(my_side, my_side_end, [
+            ("pushConst", "m_mySide"),
+            ("pushRegister", 1), ("pushConst", "gControllerIDCurrentScreen"), ("getMember",),
+            ("pushOne",), ("pushRegister", 1), ("getNamedMember", "ssm"),
+            ("pushConst", "getControllerSide"), ("callMethod",), ("setVariable",),
+            ("pushConst", "m_otherSide"), ("pushOne",), ("pushValueOfVar", "m_mySide"),
+            ("subtract",), ("setVariable",),
+        ]),
+        Chunk(set_side, set_side_end, side_of_player(10)),
+        Chunk(upd_side, upd_side_end, side_of_player(5)),
+    ], pool1)
+    return bytes(data), [(users - 0x30, users_end + 0x10), (icon_func, icon_end),
+                         (timer_func, timer_end)], pool_at
 
 
 # (archive entry, nested entry of the .apt, nested entry of the .const, patch)
 PATCHES = [
     ("fe/ion/game/screens/online/onlineselectteams.big", "0", "1", patch_select_teams),
+    ("fe/ion/game/screens/online/onlinestartinglineups.big", "0", "1", patch_starting_lineups),
 ]
 
 # --- Archive rebuild ---------------------------------------------------------
@@ -368,7 +533,7 @@ def patched_screens(big, check):
         inner = {name: (o, s) for name, o, s, _ in big_directory(nested)}
         (ao, asz), (co, csz) = inner[apt_name], inner[const_name]
         apt_bytes, const_bytes = bytes(nested[ao:ao + asz]), bytes(nested[co:co + csz])
-        new_apt, ranges = patch(apt_bytes, const_bytes)
+        new_apt, ranges, pool_at = patch(apt_bytes, const_bytes)
         if len(new_apt) != asz:
             raise ValueError(f"{entry}: patch changed the Apt size")
         nested[ao:ao + asz] = new_apt
@@ -377,7 +542,7 @@ def patched_screens(big, check):
             apt = apt_dis.Apt(new_apt, const_bytes)
             for start, end in ranges:
                 out = io.StringIO()
-                apt.disasm(start, end, out=out, pool=frame_pool(apt, 0xEBC))
+                apt.disasm(start, end, out=out, pool=frame_pool(apt, pool_at))
                 print(out.getvalue())
         yield entry, bytes(nested)
 

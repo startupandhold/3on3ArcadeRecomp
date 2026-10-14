@@ -10,23 +10,38 @@
 //   GetControllerLogin(110 + side)            -> names on that side, ", "
 //   GetControllerLogin(120 + i)               -> side of player i, "0" / "1"
 //   GetControllerLogin(1000 + i, name)        name of player i
+// Starting Lineups (position locks):
+//   GetControllerLogin(130, lock)             tick: the local player's lock
+//   GetControllerLogin(140 + j)               -> lock of teammate j (another
+//                                                console's player on the local
+//                                                side), "-1" for none, "-2" if
+//                                                unchanged since the last ask
+//   GetControllerLogin(150 + j)               -> teammate j's label, " (name)"
+//   GetControllerLogin(200 + k)               -> script name k (kScriptNames)
+//   GetControllerLogin(1100 + i, local)       whether player i is on this
+//                                                console
 // Indices are session order, the same on every console (m_aPlayers, and the
 // order the roster step visits members in).
 //
 // Picks travel as session control messages, which the stock screens ignore:
 //   TPS|i=side       a console's own pick, on change and every second
 //   TPT|i=side;...   the host's whole table, every second
-//   TPP|i=lock       a console's own position lock (Starting Lineups), sent
-//                    when the screen stores its user record at match start
+//   TPP|i=lock       a console's own position lock, on change and every
+//                    second on Starting Lineups, and when the screen stores
+//                    its user record at match start
 // The roster step waits for every player's lock (see PositionsReady), since
-// each console only knows its own and they must agree on all of them.
+// they must agree on all of them. Two teammates with the same lock: the first
+// in session order keeps it, the other gets none.
 // Both are read off the wire by the datagram logger (OnControlMessage), so
 // every console sees its own and everyone else's.
 
 #include "nhl3on3_team_lobby.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <iterator>
+#include <utility>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -72,6 +87,18 @@ struct Player {
   std::string name;
   int side = -1;  // -1: no pick
   int lock = -1;  // position lock index from the user record; -1: unknown
+  bool here = false;  // on this console (the local player or a local guest)
+};
+
+// Remote teammate icons on Starting Lineups (position lock slots 4..6).
+constexpr uint32_t kTeammateSlots = 3;
+constexpr auto kTeammateRefresh = std::chrono::seconds(2);
+
+// Names the Starting Lineups timer needs that are not in its constant pool.
+constexpr const char* kScriptNames[] = {
+    "lineupPanel",  "m_mySide",           "mcPositionLock", "getPosition",
+    "setPosition",  "setConnectedStatus", "setText",        "removePadding",
+    "gControllerIDCurrentScreen", "mPositions", "NAME",
 };
 
 struct Lobby {
@@ -83,6 +110,9 @@ struct Lobby {
   bool dirty = false;   // local pick not yet sent
   Clock::time_point last_send{};
   Clock::time_point last_lock_send{};
+  // Teammate icons as last shown: player index and lock (-1 / -1: hidden).
+  std::array<std::pair<int, int>, kTeammateSlots> shown_teammates{};
+  Clock::time_point teammates_refreshed{};
   std::string logged;
 };
 Lobby g_lobby;
@@ -253,8 +283,68 @@ std::string ArgString(const PPCContext& caller, uint8_t* base, uint32_t index) {
   return text;
 }
 
+// Index of teammate j: the j-th player on the local side who is not on this
+// console; -1 if there is none.
+int Teammate(const Lobby& lobby, uint32_t j) {
+  if (lobby.local < 0) {
+    return -1;
+  }
+  const uint32_t side = EffectiveSide(lobby, lobby.local);
+  for (uint32_t i = 0; i < lobby.count && i < lobby.players.size(); ++i) {
+    const Player& p = lobby.players[i];
+    if (int(i) != lobby.local && !p.here && EffectiveSide(lobby, i) == side && j-- == 0) {
+      return int(i);
+    }
+  }
+  return -1;
+}
+
+// The lock player `index` plays with: none if an earlier teammate has it.
+int EffectiveLock(const Lobby& lobby, uint32_t index) {
+  if (index >= lobby.players.size()) {
+    return -1;
+  }
+  const int lock = lobby.players[index].lock;
+  for (uint32_t i = 0; lock > 0 && i < index; ++i) {
+    if (lobby.players[i].lock == lock && EffectiveSide(lobby, i) == EffectiveSide(lobby, index)) {
+      return 0;
+    }
+  }
+  return lock;
+}
+
 // Answers one request; returns the text the script gets back.
 std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
+  if (code == 130) {
+    const int32_t lock = ArgNumber(ctx, base, 1);
+    std::string message;
+    {
+      std::lock_guard lock_guard(g_lobby.mutex);
+      Lobby& lobby = g_lobby;
+      if (lobby.local < 0 || uint32_t(lobby.local) >= kMaxPlayers || lock < 0 || lock >= 16) {
+        return {};
+      }
+      Player* me = At(lobby, lobby.local);
+      const auto now = Clock::now();
+      if (me->lock != lock || now - lobby.last_lock_send >= kResend) {
+        SetLock(lobby, lobby.local, lock);
+        lobby.last_lock_send = now;
+        message = fmt::format("TPP|{}={}", lobby.local, lock);
+      }
+    }
+    if (!message.empty()) {
+      SendToPeers(ctx, base, message);
+    }
+    return {};
+  }
+  if (code >= 1100 && code < 1100 + int32_t(kMaxPlayers)) {
+    const bool here = ArgNumber(ctx, base, 1) != 0;
+    std::lock_guard lock(g_lobby.mutex);
+    if (Player* p = At(g_lobby, code - 1100)) {
+      p->here = here;
+    }
+    return {};
+  }
   if (code == 99) {
     const int32_t arg = ArgNumber(ctx, base, 1);
     {
@@ -317,6 +407,28 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
   if (code >= 120 && code < 120 + int32_t(kMaxPlayers)) {
     return EffectiveSide(lobby, code - 120) ? "1" : "0";
   }
+  if (code >= 140 && code < 140 + int32_t(kTeammateSlots)) {
+    const uint32_t j = code - 140;
+    const auto now = Clock::now();
+    if (j == 0 && now - lobby.teammates_refreshed >= kTeammateRefresh) {
+      lobby.teammates_refreshed = now;
+      lobby.shown_teammates.fill({-2, -2});
+    }
+    const int index = Teammate(lobby, j);
+    const std::pair<int, int> shown{index, index < 0 ? -1 : std::max(EffectiveLock(lobby, index), 0)};
+    if (shown == lobby.shown_teammates[j]) {
+      return "-2";
+    }
+    lobby.shown_teammates[j] = shown;
+    return std::to_string(index < 0 ? -1 : shown.second);
+  }
+  if (code >= 150 && code < 150 + int32_t(kTeammateSlots)) {
+    const int index = Teammate(lobby, code - 150);
+    return index < 0 ? std::string() : " (" + lobby.players[index].name + ")";
+  }
+  if (code >= 200 && code < 200 + int32_t(std::size(kScriptNames))) {
+    return kScriptNames[code - 200];
+  }
   if (code >= 1000 && code < 1000 + int32_t(kMaxPlayers)) {
     const uint32_t index = code - 1000;
     std::string name = ArgString(ctx, base, 1);
@@ -355,7 +467,7 @@ uint32_t LineupOf(uint32_t index) {
 
 int LockOf(uint32_t index) {
   std::lock_guard lock(g_lobby.mutex);
-  return index < g_lobby.players.size() ? g_lobby.players[index].lock : -1;
+  return EffectiveLock(g_lobby, index);
 }
 
 bool PositionsReady(const PPCContext& ctx, uint8_t* base) {

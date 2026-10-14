@@ -580,11 +580,13 @@ extern "C" REX_FUNC(sub_82AD0A80) {
 }
 
 // Roster record lookup (roster, member, -1) -> the member's position lock
-// index, or -1 without a record (every remote member).
+// index, or -1 without a record (every remote member). The shared lock is
+// used for every member, the local one too, so that all consoles settle two
+// teammates' clashing picks the same way.
 extern "C" REX_FUNC(__imp__sub_82512D88);
 extern "C" REX_FUNC(sub_82512D88) {
   __imp__sub_82512D88(ctx, base);
-  if (g_side_assign.active && int32_t(ctx.r3.u32) == -1) {
+  if (g_side_assign.active) {
     const int lock = nhl3on3::team_lobby::LockOf(g_side_assign.next);
     if (lock >= 0) {
       ctx.r3.u64 = uint32_t(lock);
