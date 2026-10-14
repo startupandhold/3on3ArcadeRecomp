@@ -65,7 +65,8 @@ add_custom_command(TARGET nhl3on3 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NHL3ON3_SDK_SHARED} $<TARGET_FILE_DIR:nhl3on3>
     VERBATIM)
 
-# Settings launcher (writes nhl3on3.toml, which the game loads at startup).
+# Settings launcher (writes nhl3on3.toml, which the game loads at startup):
+# a PowerShell script on Windows, an SDL3 + Dear ImGui program elsewhere.
 if(WIN32)
     add_custom_command(TARGET nhl3on3 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -73,4 +74,23 @@ if(WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/launcher/NHL3on3 Launcher.bat"
             $<TARGET_FILE_DIR:nhl3on3>
         VERBATIM)
+else()
+    find_package(SDL3 CONFIG REQUIRED COMPONENTS SDL3-static)
+    set(NHL3ON3_IMGUI "${CMAKE_CURRENT_SOURCE_DIR}/launcher/thirdparty/imgui")
+    add_executable(nhl3on3-launcher
+        launcher/nhl3on3_launcher.cpp
+        launcher/nhl3on3_launcher_window.cpp
+        ${NHL3ON3_IMGUI}/imgui.cpp
+        ${NHL3ON3_IMGUI}/imgui_draw.cpp
+        ${NHL3ON3_IMGUI}/imgui_tables.cpp
+        ${NHL3ON3_IMGUI}/imgui_widgets.cpp
+        ${NHL3ON3_IMGUI}/backends/imgui_impl_sdl3.cpp
+        ${NHL3ON3_IMGUI}/backends/imgui_impl_vulkan.cpp)
+    target_include_directories(nhl3on3-launcher BEFORE PRIVATE
+        ${NHL3ON3_IMGUI} ${NHL3ON3_IMGUI}/backends)
+    target_compile_definitions(nhl3on3-launcher PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+    target_link_libraries(nhl3on3-launcher PRIVATE SDL3::SDL3-static)
+    set_target_properties(nhl3on3-launcher PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:nhl3on3>)
+    add_dependencies(nhl3on3 nhl3on3-launcher)
 endif()

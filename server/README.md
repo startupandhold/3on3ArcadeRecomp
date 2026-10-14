@@ -99,8 +99,9 @@ address is required.
    tab to `nhl3on3-yourname.fly.dev` (or the IPv4 from `fly ips list`), keep
    **Connect through server** checked, and enable **Online play**. To make
    it the default for everyone you hand the game to, change the default of
-   `online_server` in both `src/nhl3on3_net.cpp` and the launcher
-   (`launcher/nhl3on3_launcher.ps1`).
+   `online_server` in `src/nhl3on3_net.cpp` and in both launchers
+   (`launcher/nhl3on3_launcher.ps1` on Windows, `launcher/nhl3on3_launcher.cpp`
+   on Linux).
 
 ## Updating and operating
 
