@@ -35,6 +35,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_guest_log.cpp
     src/nhl3on3_remote_pad.cpp
     src/nhl3on3_dist_trace.cpp
+    src/nhl3on3_lockstep_relay.cpp
     src/nhl3on3_ui.cpp
 )
 

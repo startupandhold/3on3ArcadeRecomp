@@ -20,6 +20,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -238,6 +239,23 @@ bool Online() {
 
 // The most recent remote address handed out by XNetXnAddrToInAddr.
 std::atomic<uint32_t> g_last_peer_ip{0};
+
+// The match ConnApi's game port, and every address that exchanged datagrams on
+// it. Clients only link to the host, so a client's set is just the host.
+std::atomic<uint32_t> g_game_port{3659};
+std::mutex g_game_peers_mutex;
+std::vector<uint32_t> g_game_peers;
+
+void NoteGamePeer(uint32_t ip, uint16_t port) {
+  if (port != g_game_port.load()) {
+    return;
+  }
+  std::lock_guard lock(g_game_peers_mutex);
+  if (std::find(g_game_peers.begin(), g_game_peers.end(), ip) == g_game_peers.end()) {
+    g_game_peers.push_back(ip);
+    REXLOG_INFO("[net] game link peer {}:{}", FormatIp(ip), port);
+  }
+}
 
 void FillXnAddr(XnAddr& xna, uint32_t ip) {
   std::memset(&xna, 0, sizeof(xna));
@@ -768,6 +786,15 @@ void CountDatagram(const char* what, uint32_t socket, uint32_t ip, uint16_t port
     std::lock_guard lock(mutex);
     n = ++counts[(uint64_t(socket) << 1) | (what[0] == 'r')];
   }
+  // OSDK session control messages ("osdkctrl" + u32 length + "name|CMD|args"),
+  // which carry each player's session attributes.
+  const std::string_view view(reinterpret_cast<const char*>(data), size_t(std::max(length, 0)));
+  if (const size_t at = view.find("osdkctrl"); at != std::string_view::npos && at + 12 <= view.size()) {
+    const uint8_t* p = data + at + 8;
+    const size_t text_length = (size_t(p[0]) << 24) | (size_t(p[1]) << 16) | (size_t(p[2]) << 8) | p[3];
+    const std::string_view text = view.substr(at + 12, std::min(text_length, view.size() - at - 12));
+    REXLOG_INFO("[osdk] {} {} {}: {}", what, what[0] == 'r' ? "from" : "to", FormatIp(ip), text);
+  }
   if (n <= 12 || (n & (n - 1)) == 0) {
     std::string hex;
     for (int i = 0; i < std::min(length, 48); ++i) {
@@ -874,6 +901,7 @@ int ReceiveDatagram(uint8_t* base, uint32_t socket, NativeSocket native, uint32_
     }
     const uint32_t ip = ntohl(addr.sin_addr.s_addr);
     CountDatagram("recv", socket, ip, ntohs(addr.sin_port), base + buffer, n);
+    NoteGamePeer(ip, ntohs(addr.sin_port));
     if (from) {
       uint8_t* sa = base + from;
       StoreBE16(sa, AF_INET);
@@ -1023,6 +1051,7 @@ extern "C" REX_FUNC(__imp__NetDll_sendto) {
     t_forced_error = error;
   } else {
     CountDatagram("send", socket, ip, port, base + buffer, n);
+    NoteGamePeer(ip, port);
     LogDatagramStack(socket, ctx, base);
   }
   LogOnChange("sendto", socket,
@@ -1429,6 +1458,13 @@ extern "C" void __imp__sub_82761E08(PPCContext& __restrict ctx, uint8_t* base);
 // dropped from its list and never connected.
 extern "C" REX_FUNC(sub_82761E08) {
   const int32_t team = REXCVAR_GET(team_play);
+  if (Online()) {
+    REXLOG_INFO("[mm] ConnApiCreate(port {}, max clients {})", ctx.r3.u32, ctx.r4.u32);
+  }
+  // The match ConnApi is the one sized for 2 clients; voice has its own.
+  if (ctx.r4.u32 == 2 && ctx.r3.u32 && ctx.r3.u32 < 0x10000) {
+    g_game_port.store(ctx.r3.u32);
+  }
   if (team >= 3 && ctx.r4.u32 == 2) {
     REXLOG_INFO("[mm] team play: ConnApi port {} max clients 2 -> {}", ctx.r3.u32, team);
     ctx.r4.u64 = uint32_t(team);
@@ -1584,3 +1620,12 @@ NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetStartup)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_WSAStartup)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetQosListen)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetQosLookup)
+
+uint32_t Nhl3on3LocalIp() {
+  return State().local_ip;
+}
+
+std::vector<uint32_t> Nhl3on3GamePeers() {
+  std::lock_guard lock(g_game_peers_mutex);
+  return g_game_peers;
+}

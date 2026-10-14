@@ -1,6 +1,7 @@
 // Front-end tweaks: intro movie skip and menu text overrides.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -141,11 +142,22 @@ void AfterConvert(uint32_t sp) {
 
 // sub_82A11638 polls a movie player's state (r3, returned by the player's
 // vtable +88) and fires _MoviePlayingCallback on 2 and _MovieStopCallback on 4.
-// The boot movie is the first one ever played; reporting its first "playing"
-// as "stopped" runs the front end's normal end-of-movie path.
+// The boot movie is the first one ever played; reporting it as "stopped" while
+// it plays runs the front end's normal end-of-movie path. A stop issued within
+// a few dozen ms of playback starting is lost by the native player, whose
+// shutdown then never finishes and the boot flow hangs, so let it play briefly.
 void Nhl3on3MovieStateHook(PPCRegister& r3) {
+  using Clock = std::chrono::steady_clock;
   static std::atomic<bool> handled{false};
+  static Clock::time_point playing_since{};
   if (r3.u32 != 2 || handled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const auto now = Clock::now();
+  if (playing_since == Clock::time_point{}) {
+    playing_since = now;
+  }
+  if (REXCVAR_GET(skip_intro) && now - playing_since < std::chrono::milliseconds(250)) {
     return;
   }
   handled.store(true, std::memory_order_relaxed);
