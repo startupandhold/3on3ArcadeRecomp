@@ -498,8 +498,10 @@ constexpr uint32_t kPadKey = 0x82FB55A8;
 // index only the local member has, so consoles disagree on who plays which
 // skater; it is replaced with the member's rank on its side.
 // Each member's position lock comes from a lobby record lookup that only
-// finds the local member, so the others get none; it is answered from the
-// locks shared on Starting Lineups, which the step first waits for.
+// finds the local member, and is then mapped through a six-skater table
+// (lock k -> pad 7 - k) where gameplay (sub_825190B8) only honours pads 1..3
+// as the raw lock. The pad is written as the lock shared on Starting
+// Lineups instead, which the step first waits for.
 struct SideAssign {
   bool active = false;
   uint32_t next = 0;
@@ -579,21 +581,6 @@ extern "C" REX_FUNC(sub_82AD0A80) {
   __imp__sub_82AD0A80(ctx, base);
 }
 
-// Roster record lookup (roster, member, -1) -> the member's position lock
-// index, or -1 without a record (every remote member). The shared lock is
-// used for every member, the local one too, so that all consoles settle two
-// teammates' clashing picks the same way.
-extern "C" REX_FUNC(__imp__sub_82512D88);
-extern "C" REX_FUNC(sub_82512D88) {
-  __imp__sub_82512D88(ctx, base);
-  if (g_side_assign.active) {
-    const int lock = nhl3on3::team_lobby::LockOf(g_side_assign.next);
-    if (lock >= 0) {
-      ctx.r3.u64 = uint32_t(lock);
-    }
-  }
-}
-
 // Roster lookup (roster, member id, -1) -> index or -1.
 extern "C" REX_FUNC(__imp__sub_82512C20);
 extern "C" REX_FUNC(sub_82512C20) {
@@ -650,10 +637,15 @@ extern "C" REX_FUNC(sub_82B80820) {
   if (assign.active && key && key == Load32(base, kPadKey)) {
     const uint32_t index = assign.next++;
     const uint32_t side = nhl3on3::team_lobby::SideOf(index);
+    const int lock = nhl3on3::team_lobby::LockOf(index);
     assign.member = self;
     assign.lineup = nhl3on3::team_lobby::LineupOf(index);
-    REXLOG_INFO("[dist] team play: member {:08X} (#{}) on side {}, lineup {}, position {}", self,
-                assign.next - 1, side, assign.lineup, int32_t(value));
+    if (lock >= 0) {
+      ctx.r5.u64 = uint32_t(lock);
+    }
+    REXLOG_INFO("[dist] team play: member {:08X} (#{}) on side {}, lineup {}, position {} "
+                "(stock {})",
+                self, assign.next - 1, side, assign.lineup, ctx.r5.s32, int32_t(value));
     PPCContext set = ctx;
     set.r4.u64 = Load32(base, kSideKey);
     set.r5.u64 = side;

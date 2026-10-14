@@ -28,7 +28,9 @@
 //   TPT|i=side;...   the host's whole table, every second
 //   TPP|i=lock       a console's own position lock, on change and every
 //                    second on Starting Lineups, and when the screen stores
-//                    its user record at match start
+//                    its user record at match start. Clients only reach the
+//                    host, so the host's TPP carries every lock it knows
+//                    (i=lock;...) and is resent as soon as a client's arrives.
 // The roster step waits for every player's lock (see PositionsReady), since
 // they must agree on all of them. Two teammates with the same lock: the first
 // in session order keeps it, the other gets none.
@@ -110,6 +112,7 @@ struct Lobby {
   bool dirty = false;   // local pick not yet sent
   Clock::time_point last_send{};
   Clock::time_point last_lock_send{};
+  bool locks_dirty = false;  // host: a lock received from a client, not yet relayed
   // Teammate icons as last shown: player index and lock (-1 / -1: hidden).
   std::array<std::pair<int, int>, kTeammateSlots> shown_teammates{};
   Clock::time_point teammates_refreshed{};
@@ -195,6 +198,20 @@ void ApplyEntries(Lobby& lobby, std::string_view data, void (*set)(Lobby&, uint3
     }
     data = end == std::string_view::npos ? std::string_view() : data.substr(end + 1);
   }
+}
+
+// The TPP to send: the host's has every known lock, a client's only its own.
+std::string LockMessage(Lobby& lobby) {
+  std::string message;
+  for (uint32_t i = 0; i < lobby.players.size(); ++i) {
+    if (lobby.players[i].lock >= 0 && (lobby.local == 0 || int(i) == lobby.local)) {
+      message += fmt::format("{}{}={}", message.empty() ? "TPP|" : ";", i, lobby.players[i].lock);
+    }
+  }
+  if (lobby.local == 0) {
+    lobby.locks_dirty = false;
+  }
+  return message;
 }
 
 // Copies `text` into one of two guest buffers (0: script replies, 1: sends).
@@ -326,10 +343,10 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
       }
       Player* me = At(lobby, lobby.local);
       const auto now = Clock::now();
-      if (me->lock != lock || now - lobby.last_lock_send >= kResend) {
+      if (me->lock != lock || lobby.locks_dirty || now - lobby.last_lock_send >= kResend) {
         SetLock(lobby, lobby.local, lock);
         lobby.last_lock_send = now;
-        message = fmt::format("TPP|{}={}", lobby.local, lock);
+        message = LockMessage(lobby);
       }
     }
     if (!message.empty()) {
@@ -480,10 +497,11 @@ bool PositionsReady(const PPCContext& ctx, uint8_t* base) {
       ready = ready && i < lobby.players.size() && lobby.players[i].lock >= 0;
     }
     const auto now = Clock::now();
-    if (!ready && lobby.local >= 0 && uint32_t(lobby.local) < lobby.players.size() &&
-        lobby.players[lobby.local].lock >= 0 && now - lobby.last_lock_send > kLockResend) {
+    if (lobby.locks_dirty ||
+        (!ready && lobby.local >= 0 && uint32_t(lobby.local) < lobby.players.size() &&
+         lobby.players[lobby.local].lock >= 0 && now - lobby.last_lock_send > kLockResend)) {
       lobby.last_lock_send = now;
-      message = fmt::format("TPP|{}={}", lobby.local, lobby.players[lobby.local].lock);
+      message = LockMessage(lobby);
     }
   }
   if (!message.empty()) {
@@ -497,6 +515,7 @@ void ClearPositions() {
   for (Player& p : g_lobby.players) {
     p.lock = -1;
   }
+  g_lobby.locks_dirty = false;
 }
 
 void Reset() {
@@ -507,6 +526,7 @@ void Reset() {
   lobby.local = -1;
   lobby.shown_side = -1;
   lobby.dirty = false;
+  lobby.locks_dirty = false;
   lobby.teammates_refreshed = {};
   lobby.logged.clear();
 }
@@ -525,7 +545,14 @@ void OnControlMessage(std::string_view text) {
   std::lock_guard lock(g_lobby.mutex);
   Lobby& lobby = g_lobby;
   if (command == "TPP") {
+    std::vector<int> before;
+    for (const Player& p : lobby.players) {
+      before.push_back(p.lock);
+    }
     ApplyEntries(lobby, data, SetLock);
+    for (uint32_t i = 0; lobby.local == 0 && i < before.size(); ++i) {
+      lobby.locks_dirty = lobby.locks_dirty || lobby.players[i].lock != before[i];
+    }
     return;
   }
   if (command == "TPT" && !(lobby.players.size() > 0 && lobby.players[0].name == sender)) {
@@ -569,7 +596,7 @@ extern "C" REX_FUNC(sub_82AC92A0) {
       if (name == lobby.players[lobby.local].name) {
         SetLock(lobby, lobby.local, ParseInt(std::string_view(record).substr(at + 3)));
         lobby.last_lock_send = Clock::now();
-        message = fmt::format("TPP|{}={}", lobby.local, lobby.players[lobby.local].lock);
+        message = LockMessage(lobby);
       }
     }
   }
