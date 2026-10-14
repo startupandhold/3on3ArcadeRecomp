@@ -2,10 +2,10 @@
 """NHL 3 on 3 dedicated server: lobby (TCP), peer tunnel and lockstep relay
 host (UDP). Standard library only; Python 3.9+.
 
-    python nhl3on3_server.py [--match-size N] [--public-ip A.B.C.D]
+    python nhl3on3_server.py [--public-ip A.B.C.D]
 
 Environment (overrides defaults, used by the Docker image): PUBLIC_IP,
-MATCH_SIZE, LOG_LEVEL, and on Fly.io FLY_APP_NAME (set by the platform).
+LOG_LEVEL, and on Fly.io FLY_APP_NAME (set by the platform).
 """
 
 import argparse
@@ -64,16 +64,13 @@ async def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--public-ip", default="")
-    ap.add_argument("--match-size", type=int, default=int(os.environ.get("MATCH_SIZE", "2")),
-                    help="consoles per unranked quick match; 3-6 is team play (clients "
-                         "need the same team_play setting). Ranked stays 1v1")
     ap.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = ap.parse_args()
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
 
     ip = public_ip(args.public_ip)
-    lobby = Lobby(ip, args.match_size)
+    lobby = Lobby(ip)
     tunnel = Tunnel(lobby)
     loop = asyncio.get_running_loop()
 
@@ -82,8 +79,8 @@ async def main():
         servers.append(await asyncio.start_server(lobby.handle, args.bind, port))
     udp_bind = udp_bind_address(args.bind)
     await loop.create_datagram_endpoint(lambda: tunnel, local_addr=(udp_bind, TUNNEL_UDP_PORT))
-    log.info("public address %s; lobby tcp %s; tunnel udp %s:%d; match size %d", ip,
-             ",".join(map(str, LOBBY_TCP_PORTS)), udp_bind, TUNNEL_UDP_PORT, lobby.match_size)
+    log.info("public address %s; lobby tcp %s; tunnel udp %s:%d", ip,
+             ",".join(map(str, LOBBY_TCP_PORTS)), udp_bind, TUNNEL_UDP_PORT)
 
     async def report():
         last = None

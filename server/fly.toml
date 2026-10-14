@@ -1,15 +1,13 @@
 # Fly.io config for the NHL 3 on 3 server. Change `app` to the name you
 # create with `fly apps create`, and `primary_region` to the region nearest
 # your players (`fly platform regions`).
-app = "nhl3on3"
-primary_region = "ord"
+app = "nhl3on3-turtle"
+primary_region = "yyz"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
-  # Consoles per unranked quick match: 2 = normal 1v1, 3-6 = team play.
-  MATCH_SIZE = "2"
   LOG_LEVEL = "INFO"
 
 # Lobby and matchmaking state lives in memory, so exactly one machine runs

@@ -51,8 +51,6 @@ $Settings = @(
      Tip = "Sends game traffic through the server so no ports need forwarding.`nTurn off only to connect to players directly (LAN or VPN)." }
   @{ Tab = 'Online'; Key = 'online_ip'; Label = 'Advertised IP'; Kind = 'text'; Toml = 'string'; Default = ''
      Tip = "Only used when not connecting through the server.`nEmpty detects the LAN address; set a VPN address (Radmin, ZeroTier) to play over it." }
-  @{ Tab = 'Online'; Key = 'team_play'; Label = 'Team play'; Kind = 'choice'; Toml = 'int'; Default = '0'
-     Choices = [ordered]@{ '0' = 'Off (1 vs 1)'; '3' = '3 consoles'; '4' = '4 consoles'; '5' = '5 consoles'; '6' = '6 consoles' } }
 )
 
 # --- nhl3on3.toml ---------------------------------------------------------
@@ -84,7 +82,8 @@ function Format-Value($value, $toml) {
 }
 
 function Write-Config($values) {
-  $managed = @{}
+  # team_play was a launcher setting; the server now sizes team play games itself.
+  $managed = @{ 'team_play' = $true }
   foreach ($s in $Settings) {
     if ($s.Kind -eq 'size') {
       $managed['window_width'] = $true

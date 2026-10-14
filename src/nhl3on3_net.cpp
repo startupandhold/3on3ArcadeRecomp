@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -80,11 +81,12 @@ REXCVAR_DEFINE_INT32(online_local_users, 1, "NHL3on3/Online",
     .range(1, 4)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(team_play, 0, "NHL3on3/Online",
-                     "Experimental team play: consoles per online match (3-6), each with "
-                     "its own player; 0 = the normal two-console game. Team play matches "
-                     "come from the online menu's ONLINE TEAM PLAY entry (the renamed "
-                     "unranked quick match); the lobby server needs the same --match-size")
+REXCVAR_DEFINE_INT32(team_play, 6, "NHL3on3/Online",
+                     "Most consoles in an online team play match (3-6). Team play is the "
+                     "online menu's ONLINE TEAM PLAY entry (the renamed unranked quick "
+                     "match): the server opens a game once two players search, others "
+                     "join it on Select Sides, and it starts when everyone is ready. "
+                     "0 = off (unranked is the stock two-console game)")
     .range(0, 6)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -1005,10 +1007,12 @@ uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
-// Traces (socket, arg, arg) and the error code the game will see on failure.
-#define NHL3ON3_SOCKET_TRACE(name)                                             \
+// Traces (socket, arg, arg) and the error code the game will see on failure,
+// after running `before`.
+#define NHL3ON3_SOCKET_TRACE_WITH(name, before)                                \
   extern "C" REX_FUNC(__imp__NetDll_##name) {                                  \
     NHL3ON3_ORIGINAL(__imp__NetDll_##name);                                    \
+    before;                                                                    \
     static std::atomic<uint64_t> last{0};                                      \
     const uint32_t args[3] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};             \
     original(ctx, base);                                                       \
@@ -1027,9 +1031,36 @@ uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
     LogSocketCall(#name, last, args, result, error);                           \
     ctx.r3.u64 = result;                                                       \
   }
+#define NHL3ON3_SOCKET_TRACE(name) NHL3ON3_SOCKET_TRACE_WITH(name, (void)0)
+
+namespace {
+
+// Whether the last quick match search was ranked, from the gqwk request's
+// SYSFLAGS. Team play side picks only apply to unranked games.
+constexpr uint32_t kRankedSysflag = 1u << 18;
+std::atomic<bool> g_ranked_search{false};
+
+// (caller, socket, buffer, length): notes each lobby gqwk the game sends.
+void NoteLobbySend(const uint8_t* base, uint32_t buffer, uint32_t length) {
+  if (!Online() || !buffer || length < 12 || std::memcmp(base + buffer, "gqwk", 4) != 0) {
+    return;
+  }
+  const std::string_view body(reinterpret_cast<const char*>(base + buffer + 12), length - 12);
+  const size_t at = body.find("SYSFLAGS=");
+  if (at == std::string_view::npos) {
+    return;
+  }
+  const uint32_t flags = uint32_t(std::strtoul(std::string(body.substr(at + 9, 12)).c_str(),
+                                               nullptr, 10));
+  const bool ranked = (flags & kRankedSysflag) != 0;
+  g_ranked_search.store(ranked);
+  REXLOG_INFO("[mm] quick match search: {}", ranked ? "ranked" : "unranked (team play)");
+}
+
+}  // namespace
 
 NHL3ON3_SOCKET_TRACE(recv)
-NHL3ON3_SOCKET_TRACE(send)
+NHL3ON3_SOCKET_TRACE_WITH(send, NoteLobbySend(base, ctx.r5.u32, ctx.r6.u32))
 std::string Nhl3on3GuestBacktrace(const PPCContext& ctx, const uint8_t* base);
 
 //----------------------------------------------------------------------------
@@ -1986,6 +2017,10 @@ uint32_t Nhl3on3LocalIp() {
 std::vector<uint32_t> Nhl3on3GamePeers() {
   std::lock_guard lock(g_game_peers_mutex);
   return g_game_peers;
+}
+
+bool Nhl3on3RankedSearch() {
+  return g_ranked_search.load();
 }
 
 bool Nhl3on3TunnelActive() {

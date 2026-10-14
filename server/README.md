@@ -16,6 +16,18 @@ The game connects through the server by default (the launcher's **Connect throug
 server** option, `online_tunnel = true` in `nhl3on3.toml`). If the server does not
 answer the tunnel, the game falls back to direct connections.
 
+### Matchmaking
+
+There is nothing to configure:
+
+- **Ranked** quick match pairs two players: a 1 vs 1.
+- **Online Team Play** (the renamed unranked quick match) opens a game as soon
+  as two players search, and both land on Select Sides. Anyone else who
+  searches while that game is open joins it and appears on Select Sides too.
+  The host starts the match once everyone is ready. A game can have up to 6
+  consoles and 6 players (guests count, 3 per side). After it starts, new
+  searchers wait for, or open, the next game.
+
 ## Hosting on Fly.io
 
 Costs roughly $4/month: a `shared-cpu-1x` machine (about $2) plus a dedicated
@@ -70,37 +82,23 @@ address is required.
    fly logs            # should show "public address <your v4>; lobby tcp ...; tunnel udp ..."
    ```
 
-   From your PC, run the self-test against the live server. It signs in two
-   fake players, tunnels a packet between them and matches them:
+   From your PC, run the self-test against the live server. It signs in four
+   fake players, tunnels a packet, makes a ranked 1 vs 1, and builds a team
+   play game that a third player joins. Then it runs relay frames and checks
+   that a started game takes no one new:
 
    ```powershell
    python selftest.py nhl3on3-yourname.fly.dev
    ```
 
-   It should end with `PASS`. Run it again with a 3–6 argument to also test
-   the relay once you set `MATCH_SIZE` to that value (see below).
+   It should end with `PASS`. Run it while nobody is playing, because its fake
+   players would land in real players' open games.
 
 6. **Point the game at it.** In the launcher's Online tab, set **Server** to
    `nhl3on3-yourname.fly.dev` (or the IPv4 from `fly ips list`), keep
    **Connect through server** checked, and enable **Online play**. To make
    it the default for everyone you hand the game to, change the `Default` of
    `online_server` in `launcher/nhl3on3_launcher.ps1` to that name.
-
-## Team play
-
-Quick match pairs `MATCH_SIZE` consoles for unranked games (ranked is always
-1 vs 1). For team play, set it in `fly.toml` and redeploy:
-
-```toml
-[env]
-  MATCH_SIZE = "4"
-```
-
-```powershell
-fly deploy --ha=false
-```
-
-Every player needs the same **Team play** console count in the launcher.
 
 ## Updating and operating
 
@@ -120,7 +118,7 @@ Any machine with Python 3.9+ works, for example a home PC or a VPS. On a home PC
 you must forward TCP 10901, 30380, 42127 and UDP 3670 to it:
 
 ```
-python nhl3on3_server.py --public-ip <address players use> [--match-size 4]
+python nhl3on3_server.py --public-ip <address players use>
 ```
 
 With Docker:
@@ -128,7 +126,7 @@ With Docker:
 ```
 docker build -t nhl3on3-server server
 docker run -d --restart unless-stopped -p 10901:10901 -p 30380:30380 -p 42127:42127 \
-  -p 3670:3670/udp -e PUBLIC_IP=<address> -e MATCH_SIZE=2 nhl3on3-server
+  -p 3670:3670/udp -e PUBLIC_IP=<address> nhl3on3-server
 ```
 
 `--public-ip` / `PUBLIC_IP` is the address the lobby tells games to reconnect to;

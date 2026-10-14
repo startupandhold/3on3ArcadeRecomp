@@ -42,6 +42,8 @@
 
 REXCVAR_DECLARE(int32_t, team_play);
 
+bool Nhl3on3RankedSearch();
+
 // Script native helpers: argument (index) -> value, value -> number,
 // argument (index) -> C string ("" if not a string), C string -> returned value.
 extern "C" REX_FUNC(sub_82C03D10);
@@ -270,7 +272,8 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
     {
       std::lock_guard lock(g_lobby.mutex);
       Lobby& lobby = g_lobby;
-      if (REXCVAR_GET(team_play) < 3 || me < 0 || uint32_t(me) >= kMaxPlayers) {
+      if (REXCVAR_GET(team_play) < 3 || Nhl3on3RankedSearch() || me < 0 ||
+          uint32_t(me) >= kMaxPlayers) {
         return {};
       }
       lobby.local = me;

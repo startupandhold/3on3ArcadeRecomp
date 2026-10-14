@@ -74,8 +74,8 @@ void Parse(Renames& r, const std::string& spec) {
     }
     start = end + 1;
   }
-  // With team play on, the unranked quick match is the team play queue (the
-  // lobby server matches it with --match-size consoles; ranked stays 1v1).
+  // With team play on, the unranked quick match is the team play queue (an
+  // open game that others join until everyone is ready; ranked stays 1v1).
   if (REXCVAR_GET(team_play) >= 3) {
     r.text.emplace("UNRANKED VERSUS PLAY", "ONLINE TEAM PLAY");
   }

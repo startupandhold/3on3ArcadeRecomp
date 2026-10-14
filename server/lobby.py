@@ -17,6 +17,11 @@ LKEY = "3fcf27540c92935b0a66fd3b0000283c"
 ROOM_ID = 1
 RANKED_SYSFLAG = 1 << 18
 MAX_FRAME = 64 * 1024
+# Unranked quick match is team play: a game opens once two players search, and
+# later searchers join it (on Select Sides) until the host starts it, up to
+# this many consoles and players (guests included; 3 per side).
+TEAM_MAX_CONSOLES = 6
+TEAM_MAX_PLAYERS = 6
 # The game only starts listening for +who/+mgm once it has handled the gqwk
 # reply, which can take a frame; notifications that arrive in the same read
 # as the reply are missed and the search never ends.
@@ -80,6 +85,11 @@ class Client:
         return f"{self.persona}#{self.id}"
 
     @property
+    def users(self):
+        """Players on this console: its gamertag plus its guests."""
+        return 1 + len([g for g in self.guest_field.strip('"').split(",") if g])
+
+    @property
     def ip(self):
         """The address other players reach this instance on: the game's MAC is
         00:22 followed by its advertised IPv4 address (with the tunnel, the
@@ -105,24 +115,32 @@ class Client:
 class Game:
     next_id = 1
 
-    def __init__(self, request, players, size):
+    def __init__(self, request, players, ranked):
         self.id = Game.next_id
         Game.next_id += 1
         self.request = dict(request)
         self.players = list(players)
-        self.size = size
+        self.ranked = ranked
+        # Started (gsta) or lost its host: no one else may join.
+        self.closed = False
         self.when = datetime.datetime.now()
         for p in self.players:
             p.game = self
 
+    def open_to(self, client):
+        return (not self.ranked and not self.closed and self.players
+                and len(self.players) < TEAM_MAX_CONSOLES
+                and sum(p.users for p in self.players) + client.users <= TEAM_MAX_PLAYERS)
+
 
 class Lobby:
-    def __init__(self, public_ip, match_size=2):
+    def __init__(self, public_ip):
         self.public_ip = public_ip
-        self.match_size = max(2, match_size)
         self.clients = set()
         # Searching clients, one queue per kind (ranked or not).
         self.queues = {True: [], False: []}
+        # Unranked games still taking players.
+        self.open_games = []
 
     # -- queries used by the tunnel/relay --------------------------------
 
@@ -138,6 +156,7 @@ class Lobby:
             "players": len(self.clients),
             "searching": sum(len(q) for q in self.queues.values()),
             "games": len(games),
+            "open_games": len(self.open_games),
         }
 
     # -- connection handling ----------------------------------------------
@@ -186,11 +205,11 @@ class Lobby:
         XNADDR a client needs to reach its peer."""
         req = game.request
         sysflags = req.get("SYSFLAGS", "0")
-        try:
-            ranked = int(sysflags) & RANKED_SYSFLAG
-        except ValueError:
-            ranked = 0
-        team = game.size > 2
+        ranked = game.ranked
+        # A team play game is always full: its size follows its members, as
+        # players join it.
+        size = max(2, len(game.players))
+        team = not ranked
         info = {
             "IDENT": game.id,
             "NAME": req.get("NAME", game.players[0].persona),
@@ -202,8 +221,8 @@ class Lobby:
             "SYSFLAGS": sysflags,
             "COUNT": len(game.players),
             "PRIV": req.get("PRIV", 0),
-            "MINSIZE": game.size if team else req.get("MINSIZE", 2),
-            "MAXSIZE": game.size if team else req.get("MAXSIZE", 2),
+            "MINSIZE": size if team else req.get("MINSIZE", 2),
+            "MAXSIZE": size if team else req.get("MAXSIZE", 2),
             "NUMPART": 1,
             "SEED": game.id * 7919,
             "WHEN": f"{game.when:%Y.%m.%d-%H:%M:%S}",
@@ -226,7 +245,7 @@ class Lobby:
                 f"OPFLAG{i}": p.userflags,
                 f"PRES{i}": 0,
                 f"OPGUEST{i}": p.guest_field,
-                f"PARTSIZE{i}": game.size if team else req.get("MAXSIZE", 2),
+                f"PARTSIZE{i}": size if team else req.get("MAXSIZE", 2),
                 f"PARTPARAMS{i}": "",
             })
         return info
@@ -247,18 +266,31 @@ class Lobby:
         client.guest_field = ""
         if not game:
             return
+        host_left = game.players and game.players[0] is client
         game.players.remove(client)
         log.info("game %d: %s left", game.id, client.name)
         client.send(self.who_frame(client))
+        if host_left or not game.players:
+            self.close(game)
         if game.players:
             self.broadcast(game, b"+mgm")
 
+    def close(self, game):
+        game.closed = True
+        if game in self.open_games:
+            self.open_games.remove(game)
+
     def quick_match(self, client, request):
-        """gqwk MODE=2 waits until enough players search (2 ranked, match_size
-        unranked), then puts them in one game, the first searcher hosting.
-        MODE=3 cancels. The game reports a match once its +who shows the new
-        game id and a +mgm with the game's NAME arrives; the host then starts
-        the game with gsta, which sends +ses."""
+        """gqwk MODE=2 searches, MODE=3 cancels.
+
+        Ranked pairs two searchers. Unranked (team play) opens a game as soon
+        as two players search, the first one hosting; anyone who searches
+        while it is open joins it and lands on Select Sides with the others.
+        The host starts the game (gsta, which sends +ses) once everyone is
+        ready, which closes it to new players.
+
+        The game reports a match once its +who shows the game id and a +mgm
+        with the game's NAME arrives."""
         mode = request.get("MODE")
         if mode == "3":
             log.info("quick match: %s cancelled", client.name)
@@ -273,24 +305,40 @@ class Lobby:
             ranked = bool(int(request.get("SYSFLAGS", "0")) & RANKED_SYSFLAG)
         except ValueError:
             ranked = False
-        size = 2 if ranked else self.match_size
-        kind = "ranked" if ranked else ("team play" if size > 2 else "unranked")
+        kind = "ranked" if ranked else "team play"
+        if not ranked:
+            game = next((g for g in self.open_games if g.open_to(client)), None)
+            if game:
+                game.players.append(client)
+                client.game = game
+                log.info("quick match (%s): %s joins game %d (%d consoles: %s)", kind,
+                         client.name, game.id, len(game.players),
+                         ", ".join(p.name for p in game.players))
+                self.notify_later(game, [client])
+                return
         queue = self.queues[ranked]
-        if len(queue) + 1 < size:
+        if not queue:
             queue.append(client)
-            log.info("quick match (%s): %s waiting (%d/%d)", kind, client.name, len(queue), size)
+            log.info("quick match (%s): %s waiting", kind, client.name)
             return
-        players = queue[:size - 1] + [client]
-        del queue[:size - 1]
-        game = Game(players[0].search, players, size)
+        players = [queue.pop(0), client]
+        game = Game(players[0].search, players, ranked)
+        if not ranked:
+            self.open_games.append(game)
         log.info("quick match (%s): game %d: %s", kind, game.id,
                  ", ".join(f"{p.name} ({p.ip})" for p in players))
+        self.notify_later(game, players)
+
+    def notify_later(self, game, joined):
+        """Tells `joined` they are in `game` (+who) and everyone the new
+        membership (+mgm), once their search reply has been handled."""
 
         def notify():
             if not game.players:
                 return
-            for p in game.players:
-                p.send(self.who_frame(p))
+            for p in joined:
+                if p.game is game:
+                    p.send(self.who_frame(p))
             self.broadcast(game, b"+mgm")
 
         asyncio.get_running_loop().call_later(MATCH_NOTIFY_DELAY, notify)
@@ -334,6 +382,10 @@ class Lobby:
             if not client.game:
                 return [lobby_frame(cmd, request)]
             client.send(lobby_frame(cmd, request))
+            if client.game.players[0] is client and not client.game.closed:
+                self.close(client.game)
+                log.info("game %d: started with %d consoles", client.game.id,
+                         len(client.game.players))
             self.broadcast(client.game, b"+ses")
             return []
         if cmd == b"gset":
