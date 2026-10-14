@@ -28,6 +28,9 @@ bool PositionsReady(const PPCContext& ctx, uint8_t* base);
 // Forgets the position locks once a match's roster is set up.
 void ClearPositions();
 
+// Forgets everything (players, sides, locks) when a new search starts.
+void Reset();
+
 // An OSDK session control message ("name|CMD|data") sent or received.
 void OnControlMessage(std::string_view text);
 

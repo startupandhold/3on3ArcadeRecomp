@@ -1059,6 +1059,7 @@ void NoteLobbySend(const uint8_t* base, uint32_t buffer, uint32_t length) {
   const bool ranked = (flags & kRankedSysflag) != 0;
   g_ranked_search.store(ranked);
   g_game_consoles.store(0);
+  nhl3on3::team_lobby::Reset();
   REXLOG_INFO("[mm] quick match search: {}", ranked ? "ranked" : "unranked (team play)");
 }
 
@@ -1938,8 +1939,21 @@ TEAM_PLAY_CONFIG_READER(sub_82BDC8D8)  // GameSetupConcrete constructor
 extern "C" void __imp__sub_82767968(PPCContext& __restrict ctx, uint8_t* base);
 
 // XSession wrapper 'sess' request: (session, is host, session info text).
+// It refuses (-1) while the wrapper still holds a session handle (+100). A
+// session the game gave up on (state 17, e.g. after a failed host migration
+// when the host quit) or reset to idle (0) is never deleted, so its handle
+// stays and every later game this console hosts or joins fails to start.
+// The kernel keeps no session state, so a stale handle is just dropped.
 extern "C" REX_FUNC(sub_82767968) {
   const uint32_t session = ctx.r3.u32, host = ctx.r4.u32, info = ctx.r5.u32;
+  if (Online() && session && LoadBE32(base + session + 100)) {
+    const uint32_t state = LoadBE32(base + session + 112);
+    if (state == 0 || state == 17) {
+      REXLOG_INFO("[mm] sess request: dropping stale session handle {:08X} (state {})",
+                  LoadBE32(base + session + 100), state);
+      StoreBE32(base + session + 100, 0);
+    }
+  }
   const std::string before = Online() ? SessionState(base, session) : "";
   __imp__sub_82767968(ctx, base);
   if (Online()) {

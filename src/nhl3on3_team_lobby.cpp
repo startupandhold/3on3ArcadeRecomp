@@ -499,6 +499,18 @@ void ClearPositions() {
   }
 }
 
+void Reset() {
+  std::lock_guard lock(g_lobby.mutex);
+  Lobby& lobby = g_lobby;
+  lobby.players.clear();
+  lobby.count = 0;
+  lobby.local = -1;
+  lobby.shown_side = -1;
+  lobby.dirty = false;
+  lobby.teammates_refreshed = {};
+  lobby.logged.clear();
+}
+
 void OnControlMessage(std::string_view text) {
   const size_t a = text.find('|');
   const size_t b = a == std::string_view::npos ? a : text.find('|', a + 1);
