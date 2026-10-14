@@ -1008,8 +1008,8 @@ uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
 }  // namespace
 
 // Traces (socket, arg, arg) and the error code the game will see on failure,
-// after running `before`.
-#define NHL3ON3_SOCKET_TRACE_WITH(name, before)                                \
+// after running `before`; `after` sees `args` and `result`.
+#define NHL3ON3_SOCKET_TRACE_WITH(name, before, after)                         \
   extern "C" REX_FUNC(__imp__NetDll_##name) {                                  \
     NHL3ON3_ORIGINAL(__imp__NetDll_##name);                                    \
     before;                                                                    \
@@ -1017,6 +1017,7 @@ uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
     const uint32_t args[3] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};             \
     original(ctx, base);                                                       \
     const uint32_t result = ctx.r3.u32;                                        \
+    after;                                                                     \
     uint32_t error = 0;                                                        \
     if (result == 0xFFFFFFFF) {                                                \
       error = CaptureSocketError(ctx, base);                                   \
@@ -1031,7 +1032,7 @@ uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
     LogSocketCall(#name, last, args, result, error);                           \
     ctx.r3.u64 = result;                                                       \
   }
-#define NHL3ON3_SOCKET_TRACE(name) NHL3ON3_SOCKET_TRACE_WITH(name, (void)0)
+#define NHL3ON3_SOCKET_TRACE(name) NHL3ON3_SOCKET_TRACE_WITH(name, (void)0, (void)0)
 
 namespace {
 
@@ -1039,6 +1040,9 @@ namespace {
 // SYSFLAGS. Team play side picks only apply to unranked games.
 constexpr uint32_t kRankedSysflag = 1u << 18;
 std::atomic<bool> g_ranked_search{false};
+// Consoles in the current lobby game, from the COUNT of the server's +mgm
+// (membership) and +ses (game started) updates.
+std::atomic<int> g_game_consoles{0};
 
 // (caller, socket, buffer, length): notes each lobby gqwk the game sends.
 void NoteLobbySend(const uint8_t* base, uint32_t buffer, uint32_t length) {
@@ -1054,13 +1058,42 @@ void NoteLobbySend(const uint8_t* base, uint32_t buffer, uint32_t length) {
                                                nullptr, 10));
   const bool ranked = (flags & kRankedSysflag) != 0;
   g_ranked_search.store(ranked);
+  g_game_consoles.store(0);
   REXLOG_INFO("[mm] quick match search: {}", ranked ? "ranked" : "unranked (team play)");
+}
+
+// (buffer, received bytes): the game reads each lobby packet as a 12-byte
+// header (cmd, status, BE size including the header) and then its body; a
+// +mgm (membership) or +ses (game started) body updates the console count.
+void NoteLobbyRecv(const uint8_t* base, uint32_t buffer, uint32_t received) {
+  static thread_local uint32_t pending_body = 0;
+  if (!Online() || !buffer || received == 0xFFFFFFFF || received == 0) {
+    return;
+  }
+  const uint8_t* data = base + buffer;
+  if (pending_body && received == pending_body) {
+    pending_body = 0;
+    const std::string body = "\n" + std::string(reinterpret_cast<const char*>(data), received);
+    if (const size_t at = body.find("\nCOUNT="); at != std::string::npos) {
+      const int consoles = std::atoi(body.c_str() + at + 7);
+      if (g_game_consoles.exchange(consoles) != consoles) {
+        REXLOG_INFO("[mm] lobby game has {} consoles", consoles);
+      }
+    }
+    return;
+  }
+  pending_body = 0;
+  if (received == 12 &&
+      (std::memcmp(data, "+mgm", 4) == 0 || std::memcmp(data, "+ses", 4) == 0)) {
+    const uint32_t size = LoadBE32(data + 8);
+    pending_body = size > 12 ? size - 12 : 0;
+  }
 }
 
 }  // namespace
 
-NHL3ON3_SOCKET_TRACE(recv)
-NHL3ON3_SOCKET_TRACE_WITH(send, NoteLobbySend(base, ctx.r5.u32, ctx.r6.u32))
+NHL3ON3_SOCKET_TRACE_WITH(recv, (void)0, NoteLobbyRecv(base, args[1], result))
+NHL3ON3_SOCKET_TRACE_WITH(send, NoteLobbySend(base, ctx.r5.u32, ctx.r6.u32), (void)0)
 std::string Nhl3on3GuestBacktrace(const PPCContext& ctx, const uint8_t* base);
 
 //----------------------------------------------------------------------------
@@ -1716,14 +1749,16 @@ extern "C" void __imp__sub_82753958(PPCContext& __restrict ctx, uint8_t* base);
 
 // DirtySDK send-address remap(out, in) -> sockaddr to use. It rewrites peer
 // addresses to 127.0.0.1, which on one PC hides which instance a packet is
-// for; with more than one peer, each keeps its own loopback address instead.
+// for, and through the tunnel hides that it is for a peer at all; peers keep
+// their own loopback or virtual address instead.
 extern "C" REX_FUNC(sub_82753958) {
   const uint32_t in = ctx.r4.u32;
   const uint32_t requested = in ? LoadBE32(base + in + 4) : 0;
   __imp__sub_82753958(ctx, base);
   const uint32_t out = ctx.r3.u32;
-  if (Online() && out && out != in && IsLoopback(State().local_ip) &&
-      IsLoopback(requested) && requested != kLoopbackIp &&
+  const bool loopback_peer =
+      IsLoopback(State().local_ip) && IsLoopback(requested) && requested != kLoopbackIp;
+  if (Online() && out && out != in && (loopback_peer || IsTunnelAddress(requested)) &&
       LoadBE32(base + out + 4) == kLoopbackIp) {
     StoreBE32(base + out + 4, requested);
   }
@@ -2021,6 +2056,10 @@ std::vector<uint32_t> Nhl3on3GamePeers() {
 
 bool Nhl3on3RankedSearch() {
   return g_ranked_search.load();
+}
+
+int Nhl3on3GameConsoles() {
+  return g_game_consoles.load();
 }
 
 bool Nhl3on3TunnelActive() {

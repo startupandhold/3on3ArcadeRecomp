@@ -11,6 +11,7 @@
 // Slot types: 0/2/3 carry data, 1 means "unchanged" (no data).
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -32,6 +33,9 @@
 namespace relay = nhl3on3::lockstep_relay;
 
 REXCVAR_DECLARE(int32_t, team_play);
+
+bool Nhl3on3RankedSearch();
+int Nhl3on3GameConsoles();
 
 REXCVAR_DEFINE_INT32(dist_trace, 0, "NHL3on3/Debug",
                      "Log every Nth lockstep input frame sent and received (0 = off)")
@@ -111,16 +115,31 @@ bool ShouldLog(uint32_t frame) {
 // Match start: (module slot, peer dist, mode). Builds the game's one
 // NETWORK::DistModule around the first peer's dist (mode 3 selects the 12-slot
 // multi module); later peers find the slot taken and are ignored.
+// The game always picks the 2-console mode 6; a team play match with 3 or
+// more consoles in the session (session+224) needs mode 3 instead.
 extern "C" REX_FUNC(sub_82519D08) {
   const uint32_t slot = ctx.r3.u32, dist = ctx.r4.u32;
   const uint32_t game_mode = ctx.r5.u32;
-  if (const int32_t forced = REXCVAR_GET(dist_mode); forced > 0) {
+  const uint32_t session = Load32(base, 0x8317A710);
+  const int32_t consoles =
+      std::max<int32_t>(session ? int8_t(base[session + 224]) : 0, Nhl3on3GameConsoles());
+  int32_t forced = REXCVAR_GET(dist_mode);
+  if (forced <= 0 && REXCVAR_GET(team_play) >= 3 && !Nhl3on3RankedSearch() && consoles >= 3) {
+    forced = 3;
+  }
+  if (forced > 0) {
     ctx.r5.u32 = uint32_t(forced);
     Store32(base, 0x82FB600C, uint32_t(forced));
   }
   const uint32_t mode = ctx.r5.u32;
   const uint32_t existing = slot ? Load32(base, slot) : 0;
   __imp__sub_82519D08(ctx, base);
+  if (!existing) {
+    REXLOG_INFO("[dist] team play: {} consoles (session {}, lobby {}), ranked {}, lockstep "
+                "mode {} -> {}",
+                consoles, session ? int8_t(base[session + 224]) : -1, Nhl3on3GameConsoles(),
+                Nhl3on3RankedSearch(), int32_t(game_mode), int32_t(mode));
+  }
   if (REXCVAR_GET(dist_trace) > 0 || REXCVAR_GET(dist_mode) > 0) {
     const uint32_t users = Load32(base, 0x8317D498);
     REXLOG_INFO("[dist] module for dist {:08X} mode {} (game chose {}, settings {:02X} {:02X} "
@@ -529,6 +548,35 @@ extern "C" REX_FUNC(sub_8251D0D0) {
                      fmt::format("{:08X}: sent {} -> {}, done {}", self, sent_before,
                                  base[self + 4], ctx.r3.u32 & 0xFF));
   }
+}
+
+// Member attribute change notice (member, key, value), virtual 52 of the
+// member: posts the key on the "ctrl" channel of the service the root object
+// (*0x83216B34) returns from its virtual 148. Arcade never creates that
+// service, so the mode 3 roster step's 'L'/'P' attribute sets would read
+// through null; the notice is dropped instead.
+extern "C" REX_FUNC(__imp__sub_82AD0A80);
+extern "C" REX_FUNC(sub_82AD0A80) {
+  const uint32_t root = Load32(base, 0x83216B34);
+  uint32_t service = 0;
+  if (root) {
+    if (PPCFunc* get = rex::runtime::ResolveIndirectFunction(
+            Load32(base, Load32(base, root) + 148))) {
+      PPCContext call = ctx;
+      call.r3.u64 = root;
+      get(call, base);
+      service = call.r3.u32;
+    }
+  }
+  if (!service) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      REXLOG_INFO("[dist] member attribute '{}' notice dropped: no ctrl service",
+                  ctx.r4.u32 ? reinterpret_cast<const char*>(base + ctx.r4.u32) : "");
+    }
+    return;
+  }
+  __imp__sub_82AD0A80(ctx, base);
 }
 
 // Roster record lookup (roster, member, -1) -> the member's position lock
