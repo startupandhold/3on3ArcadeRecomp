@@ -37,6 +37,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_dist_trace.cpp
     src/nhl3on3_lockstep_relay.cpp
     src/nhl3on3_ui.cpp
+    src/nhl3on3_team_lobby.cpp
 )
 
 if(WIN32)
@@ -62,3 +63,13 @@ endif()
 add_custom_command(TARGET nhl3on3 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NHL3ON3_SDK_SHARED} $<TARGET_FILE_DIR:nhl3on3>
     VERBATIM)
+
+# Settings launcher (writes nhl3on3.toml, which the game loads at startup).
+if(WIN32)
+    add_custom_command(TARGET nhl3on3 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/launcher/nhl3on3_launcher.ps1"
+            "${CMAKE_CURRENT_SOURCE_DIR}/launcher/NHL3on3 Launcher.bat"
+            $<TARGET_FILE_DIR:nhl3on3>
+        VERBATIM)
+endif()

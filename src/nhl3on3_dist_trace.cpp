@@ -11,6 +11,7 @@
 // Slot types: 0/2/3 carry data, 1 means "unchanged" (no data).
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -26,6 +27,7 @@
 #include <rex/ppc/func.h>
 
 #include "nhl3on3_lockstep_relay.h"
+#include "nhl3on3_team_lobby.h"
 
 namespace relay = nhl3on3::lockstep_relay;
 
@@ -465,17 +467,30 @@ namespace {
 // attribute keys the roster step uses: side, lineup slot, pad.
 constexpr uint32_t kMatchMode = 0x82FB6008;
 constexpr uint32_t kSideKey = 0x82FB559C;
+constexpr uint32_t kLineupKey = 0x82FB55A4;
 constexpr uint32_t kPadKey = 0x82FB55A8;
 
 // Mode 3 expects each member's side to come from lobby team selection, which
 // team play skips; the roster step then waits on it until it times out.
-// Members are visited in session order on every console, so sides alternate
-// along it (host 0, next 1, ...), set just before the step writes each pad.
+// Members are visited in session order on every console, so each gets the
+// side picked for that session index on Select Sides (nhl3on3_team_lobby),
+// set just before the step writes its pad.
+// The step's lineup slot (side 0 even, side 1 odd) is derived from a lobby
+// index only the local member has, so consoles disagree on who plays which
+// skater; it is replaced with the member's rank on its side.
+// Each member's position lock comes from a lobby record lookup that only
+// finds the local member, so the others get none; it is answered from the
+// locks shared on Starting Lineups, which the step first waits for.
 struct SideAssign {
   bool active = false;
   uint32_t next = 0;
+  uint32_t member = 0, lineup = 0;  // the member whose pad was just written
 };
 SideAssign g_side_assign;
+
+constexpr auto kLockWait = std::chrono::seconds(3);
+std::chrono::steady_clock::time_point g_lock_wait_start{};
+bool g_lock_waiting = false;
 
 }  // namespace
 
@@ -487,12 +502,45 @@ extern "C" REX_FUNC(sub_8251D0D0) {
   g_side_assign = {};
   g_side_assign.active =
       !sent_before && REXCVAR_GET(team_play) >= 3 && Load32(base, kMatchMode + 4) == 3;
+  if (g_side_assign.active) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!g_lock_waiting) {
+      g_lock_waiting = true;
+      g_lock_wait_start = now;
+    }
+    if (!nhl3on3::team_lobby::PositionsReady(ctx, base)) {
+      if (now - g_lock_wait_start < kLockWait) {
+        g_side_assign.active = false;
+        ctx.r3.u64 = 0;
+        return;
+      }
+      LogOnChangeKeyed("roster step", self ^ 1,
+                       "team play: position locks missing, unknown ones are none");
+    }
+  }
   __imp__sub_8251D0D0(ctx, base);
+  if (g_side_assign.active) {
+    g_lock_waiting = false;
+    nhl3on3::team_lobby::ClearPositions();
+  }
   g_side_assign.active = false;
   if (REXCVAR_GET(dist_trace) > 0) {
     LogOnChangeKeyed("roster step", self,
                      fmt::format("{:08X}: sent {} -> {}, done {}", self, sent_before,
                                  base[self + 4], ctx.r3.u32 & 0xFF));
+  }
+}
+
+// Roster record lookup (roster, member, -1) -> the member's position lock
+// index, or -1 without a record (every remote member).
+extern "C" REX_FUNC(__imp__sub_82512D88);
+extern "C" REX_FUNC(sub_82512D88) {
+  __imp__sub_82512D88(ctx, base);
+  if (g_side_assign.active && int32_t(ctx.r3.u32) == -1) {
+    const int lock = nhl3on3::team_lobby::LockOf(g_side_assign.next);
+    if (lock >= 0) {
+      ctx.r3.u64 = uint32_t(lock);
+    }
   }
 }
 
@@ -548,14 +596,20 @@ extern "C" REX_FUNC(sub_82B80738) {
 extern "C" REX_FUNC(__imp__sub_82B80820);
 extern "C" REX_FUNC(sub_82B80820) {
   const uint32_t self = ctx.r3.u32, key = ctx.r4.u32, value = ctx.r5.u32;
-  if (g_side_assign.active && key && key == Load32(base, kPadKey)) {
-    const uint32_t side = g_side_assign.next++ % 2;
-    REXLOG_INFO("[dist] team play: member {:08X} (#{}) on side {}", self,
-                g_side_assign.next - 1, side);
+  SideAssign& assign = g_side_assign;
+  if (assign.active && key && key == Load32(base, kPadKey)) {
+    const uint32_t index = assign.next++;
+    const uint32_t side = nhl3on3::team_lobby::SideOf(index);
+    assign.member = self;
+    assign.lineup = nhl3on3::team_lobby::LineupOf(index);
+    REXLOG_INFO("[dist] team play: member {:08X} (#{}) on side {}, lineup {}, position {}", self,
+                assign.next - 1, side, assign.lineup, int32_t(value));
     PPCContext set = ctx;
     set.r4.u64 = Load32(base, kSideKey);
     set.r5.u64 = side;
     __imp__sub_82B80820(set, base);
+  } else if (assign.active && key && key == Load32(base, kLineupKey) && self == assign.member) {
+    ctx.r5.u64 = assign.lineup;
   }
   if (REXCVAR_GET(dist_trace) > 0 && self && Load32(base, self) == kSessionMemberVtable) {
     LogOnChangeKeyed("member set", (uint64_t(self) << 32) ^ key,

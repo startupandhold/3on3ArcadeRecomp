@@ -14,6 +14,7 @@
 #include "nhl3on3_lockstep_relay.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -43,6 +44,14 @@ REXCVAR_DECLARE(int32_t, team_play);
 // The match module's stream receive callback (stream, ?, ?, data, length):
 // takes "gamedata" + u8 type + payload and posts it to the game.
 extern "C" REX_FUNC(sub_82515070);
+
+REXCVAR_DEFINE_INT32(lockstep_lead, 0, "NHL3on3/Online",
+                     "Client inputs sent ahead of the frames played in a relayed match "
+                     "(each is one input period of delay); 0 = from the measured round trip");
+
+REXCVAR_DEFINE_BOOL(relay_timing, false, "NHL3on3/Online",
+                    "Log relayed match timing every 600 frames: how long the local "
+                    "input takes to be built into a frame and then played");
 
 REXCVAR_DEFINE_BOOL(lockstep_relay, true, "NHL3on3/Online",
                     "Carry a 3+ console match's lockstep input through the host "
@@ -74,7 +83,8 @@ constexpr size_t kHeaderSize = 8;
 constexpr size_t kMaxPacket = 1400;
 constexpr uint32_t kMaxInput = 252;  // the game's per-slot receive buffer
 constexpr uint32_t kMaxSlots = 12;
-constexpr uint32_t kWindow = 8;  // local inputs sent ahead of the frames played
+constexpr uint32_t kWindow = 8;  // most local inputs sent ahead of the frames played
+constexpr uint32_t kMinLead = 2;
 constexpr auto kResend = std::chrono::milliseconds(20);
 constexpr uint32_t kDefaultRateMs = 16;  // if the dist has no input rate set
 
@@ -121,8 +131,16 @@ struct Relay {
   std::deque<Frame> frames;
   uint32_t frames_base = 0;
 
-  // Client: local inputs [inputs_acked, inputs_sent) not yet taken by the host.
+  // Client: local inputs [inputs_acked, inputs_sent) not yet taken by the host,
+  // and when each was queued.
   std::deque<Input> unacked;
+  std::deque<Clock::time_point> unacked_times;
+  // Client: smoothed time for the host to take an input, and the lead (inputs
+  // ahead of the frames played) that covers it. A client's input for frame N
+  // is sent once it plays frame N - lead, about when the host built that
+  // frame, so the host has it in time if lead input periods exceed the trip.
+  double rtt_ms = 0;
+  uint32_t lead = kWindow;
   uint32_t inputs_acked = 0;
   uint32_t acked_sent = ~0u;
   Clock::time_point last_send{};
@@ -139,6 +157,85 @@ struct Relay {
 
 std::mutex g_mutex;
 Relay g_relay;
+
+// relay_timing: per-frame times, indexed by frame number mod kTimingSlots,
+// and sums over the current reporting period.
+constexpr uint32_t kTimingSlots = 64;
+constexpr uint32_t kTimingPeriod = 600;
+
+struct TimingStats {
+  double build_sum = 0, build_max = 0;  // input produced -> frame ready
+  double wait_sum = 0, wait_max = 0;    // frame ready -> played
+  double poll_sum = 0, poll_max = 0;    // between empty frame queries
+  uint32_t frames = 0, polls = 0, backlog_sum = 0;
+};
+
+struct Timing {
+  Clock::time_point sent[kTimingSlots]{};   // local input for frame N produced
+  Clock::time_point built[kTimingSlots]{};  // frame N built (host) or received (client)
+  Clock::time_point last_poll{};            // previous frame query that found none
+  TimingStats stats;
+};
+
+Timing g_timing;
+
+double Ms(Clock::duration d) {
+  return std::chrono::duration<double, std::milli>(d).count();
+}
+
+void TimeFrameReady(uint32_t frame) {
+  if (REXCVAR_GET(relay_timing)) {
+    g_timing.built[frame % kTimingSlots] = Clock::now();
+  }
+}
+
+// frame: 1-based number of the frame just played; backlog: frames still ready.
+void TimeFramePlayed(uint32_t frame, uint32_t backlog) {
+  if (!REXCVAR_GET(relay_timing)) {
+    return;
+  }
+  Timing& t = g_timing;
+  TimingStats& s = t.stats;
+  const auto now = Clock::now();
+  const auto sent = t.sent[frame % kTimingSlots], built = t.built[frame % kTimingSlots];
+  t.sent[frame % kTimingSlots] = t.built[frame % kTimingSlots] = {};
+  if (sent == Clock::time_point{} || built == Clock::time_point{}) {
+    return;
+  }
+  const double build = Ms(built - sent), wait = Ms(now - built);
+  s.build_sum += build;
+  s.build_max = std::max(s.build_max, build);
+  s.wait_sum += wait;
+  s.wait_max = std::max(s.wait_max, wait);
+  s.backlog_sum += backlog;
+  if (++s.frames < kTimingPeriod) {
+    return;
+  }
+  const Relay& r = g_relay;
+  REXLOG_INFO(
+      "[relay] timing to frame {}: input to frame ready avg {:.1f} max {:.1f} ms, ready to "
+      "played avg {:.1f} max {:.1f} ms, total avg {:.1f} ms; frames left after each play "
+      "avg {:.2f}; empty frame queries every {:.1f} ms (max {:.1f}); sent {} played {}",
+      frame, s.build_sum / s.frames, s.build_max, s.wait_sum / s.frames, s.wait_max,
+      (s.build_sum + s.wait_sum) / s.frames, double(s.backlog_sum) / s.frames,
+      s.polls ? s.poll_sum / s.polls : 0.0, s.poll_max, r.inputs_sent, r.frames_played);
+  s = TimingStats{};
+}
+
+void TimeEmptyQuery() {
+  if (!REXCVAR_GET(relay_timing)) {
+    return;
+  }
+  Timing& t = g_timing;
+  const auto now = Clock::now();
+  if (t.last_poll != Clock::time_point{}) {
+    const double gap = Ms(now - t.last_poll);
+    t.stats.poll_sum += gap;
+    t.stats.poll_max = std::max(t.stats.poll_max, gap);
+    ++t.stats.polls;
+  }
+  t.last_poll = now;
+}
 
 std::string FormatIp(uint32_t ip) {
   return fmt::format("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
@@ -325,6 +422,7 @@ void BuildFrames() {
     }
     r.frames.push_back(std::move(frame));
     const uint32_t built = FramesEnd();
+    TimeFrameReady(built);
     if (built == 1 || built % 600 == 0) {
       REXLOG_INFO("[relay] host built frame {} (played {})", built, r.frames_played);
     }
@@ -374,6 +472,21 @@ void HandleInputs(Reader& rd, uint8_t slot, const sockaddr_in& from) {
   }
 }
 
+// Client: the lead from lockstep_lead, or the round trip plus one period.
+void UpdateLead() {
+  Relay& r = g_relay;
+  uint32_t lead = uint32_t(std::max(REXCVAR_GET(lockstep_lead), 0));
+  if (!lead && r.rate_ms && r.rtt_ms > 0) {
+    lead = uint32_t(std::ceil(r.rtt_ms / r.rate_ms)) + 1;
+  }
+  lead = lead ? std::clamp(lead, kMinLead, kWindow) : kWindow;
+  if (lead != r.lead) {
+    REXLOG_INFO("[relay] client lead {} inputs (round trip {:.0f} ms, input rate {} ms)", lead,
+                r.rtt_ms, r.rate_ms);
+    r.lead = lead;
+  }
+}
+
 void HandleFrames(Reader& rd, uint8_t count) {
   Relay& r = g_relay;
   if (count != r.count) {
@@ -382,10 +495,16 @@ void HandleFrames(Reader& rd, uint8_t count) {
   const uint32_t inputs_received = rd.U32();
   const uint32_t first = rd.U32();
   const uint16_t n = rd.U16();
+  const auto now = Clock::now();
   while (r.inputs_acked < inputs_received && !r.unacked.empty()) {
+    const double sample =
+        std::chrono::duration<double, std::milli>(now - r.unacked_times.front()).count();
+    r.rtt_ms = r.rtt_ms > 0 ? r.rtt_ms * 0.9 + sample * 0.1 : sample;
     r.unacked.pop_front();
+    r.unacked_times.pop_front();
     ++r.inputs_acked;
   }
+  UpdateLead();
   for (uint32_t i = 0; i < n; ++i) {
     Frame frame(r.count);
     for (Input& in : frame) {
@@ -397,6 +516,7 @@ void HandleFrames(Reader& rd, uint8_t count) {
     if (first + i == FramesEnd()) {
       r.frames.push_back(std::move(frame));
       const uint32_t received = FramesEnd();
+      TimeFrameReady(received);
       if (received == 1 || received % 600 == 0) {
         REXLOG_INFO("[relay] client received frame {} (played {})", received, r.frames_played);
       }
@@ -624,6 +744,7 @@ void OnMultiSetup(uint32_t dist, uint32_t slot, uint32_t count) {
     CloseSocket(r.socket);
   }
   r = Relay{};
+  g_timing = Timing{};
   r.dist = dist;
   r.slot = slot;
   r.count = count;
@@ -661,6 +782,9 @@ int32_t SendInput(const uint8_t* base, uint32_t dist, uint8_t type, uint32_t dat
   }
   ++r.inputs_sent;
   const auto now = Clock::now();
+  if (REXCVAR_GET(relay_timing)) {
+    g_timing.sent[r.inputs_sent % kTimingSlots] = now;
+  }
   const auto rate = std::chrono::milliseconds(r.rate_ms);
   // Keep the cadence across small scheduling delays, but don't burst to catch
   // up after a long stall.
@@ -673,6 +797,7 @@ int32_t SendInput(const uint8_t* base, uint32_t dist, uint8_t type, uint32_t dat
     r.clients[r.slot].pending.push_back(std::move(in));
   } else {
     r.unacked.push_back(std::move(in));
+    r.unacked_times.push_back(now);
     r.last_send = {};
   }
   Pump();
@@ -688,6 +813,7 @@ int32_t QueryFrame(uint8_t* base, uint32_t dist, uint32_t types, uint32_t datas,
   }
   Pump();
   if (r.frames_played >= FramesEnd()) {
+    TimeEmptyQuery();
     return 0;
   }
   const Frame& frame = r.frames[r.frames_played - r.frames_base];
@@ -706,6 +832,7 @@ int32_t QueryFrame(uint8_t* base, uint32_t dist, uint32_t types, uint32_t datas,
     }
   }
   ++r.frames_played;
+  TimeFramePlayed(r.frames_played, FramesEnd() - r.frames_played);
   if (!r.host) {
     while (r.frames_base < r.frames_played && !r.frames.empty()) {
       r.frames.pop_front();
@@ -731,8 +858,8 @@ int32_t SendWait(uint32_t dist, uint32_t rate_ms, uint32_t& frames_ready) {
     REXLOG_INFO("[relay] input rate {} ms", rate_ms);
     r.rate_ms = rate_ms;
   }
-  if (r.inputs_sent - r.frames_played >= kWindow) {
-    return 10;
+  if (r.inputs_sent - r.frames_played >= (r.host ? kWindow : r.lead)) {
+    return r.host ? 10 : int32_t(std::max<uint32_t>(r.rate_ms / 4, 1));
   }
   const auto now = Clock::now();
   if (now >= r.next_input) {

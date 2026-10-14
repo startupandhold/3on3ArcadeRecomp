@@ -6,4 +6,7 @@ namespace nhl3on3 {
 // cvars. Must run before the guest first queries the video mode.
 void ConfigureDisplay();
 
+// latency_probe: a controller state read just happened.
+void NotePadRead();
+
 }  // namespace nhl3on3

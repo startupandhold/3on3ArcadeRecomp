@@ -88,9 +88,17 @@ def lobby_fields(body):
 LKEY = "3fcf27540c92935b0a66fd3b0000283c"
 ROOM_ID = 1
 RANKED_SYSFLAG = 1 << 18
-# Consoles per quick match (--match-size). The game asks for 2; more is the
-# experimental team play mode, with every console in one game.
+# Consoles per unranked quick match (--match-size). The game asks for 2; more
+# is the experimental team play mode ("ONLINE TEAM PLAY" in the game's menu,
+# its unranked entry), with every console in one game. Ranked stays 1v1.
 match_size = 2
+
+
+def is_ranked(request):
+    try:
+        return bool(int(request.get("SYSFLAGS", "0")) & RANKED_SYSFLAG)
+    except ValueError:
+        return False
 
 
 class Client:
@@ -131,18 +139,20 @@ class Client:
 class Game:
     next_id = 1
 
-    def __init__(self, request, players):
+    def __init__(self, request, players, size=2):
         self.id = Game.next_id
         Game.next_id += 1
         self.request = request
         self.players = players
+        self.size = size
         self.when = datetime.datetime.now()
         for p in players:
             p.game = self
 
 
 clients = {}
-quick_queue = []
+# Searching clients, one queue per kind (ranked or not).
+quick_queues = {True: [], False: []}
 # (due time, action) pairs run by the main loop.
 timers = []
 # The game only starts listening for +who/+mgm once it has handled the gqwk
@@ -188,8 +198,8 @@ def game_info(game):
         "SYSFLAGS": sysflags,
         "COUNT": len(game.players),
         "PRIV": req.get("PRIV", 0),
-        "MINSIZE": match_size if match_size > 2 else req.get("MINSIZE", 2),
-        "MAXSIZE": match_size if match_size > 2 else req.get("MAXSIZE", 2),
+        "MINSIZE": game.size if game.size > 2 else req.get("MINSIZE", 2),
+        "MAXSIZE": game.size if game.size > 2 else req.get("MAXSIZE", 2),
         "NUMPART": 1,
         "SEED": game.id * 7919,
         "WHEN": f"{game.when:%Y.%m.%d-%H:%M:%S}",
@@ -212,7 +222,7 @@ def game_info(game):
             f"OPFLAG{i}": p.userflags,
             f"PRES{i}": 0,
             f"OPGUEST{i}": p.guest_field,
-            f"PARTSIZE{i}": match_size if match_size > 2 else req.get("MAXSIZE", 2),
+            f"PARTSIZE{i}": game.size if game.size > 2 else req.get("MAXSIZE", 2),
             f"PARTPARAMS{i}": "",
         })
     return info
@@ -232,9 +242,14 @@ def broadcast(game, cmd):
         send(p, lobby_frame(cmd, info))
 
 
+def leave_queue(client):
+    for queue in quick_queues.values():
+        if client in queue:
+            queue.remove(client)
+
+
 def leave_game(client):
-    if client in quick_queue:
-        quick_queue.remove(client)
+    leave_queue(client)
     game, client.game = client.game, None
     client.guest_field = ""
     if not game:
@@ -247,16 +262,16 @@ def leave_game(client):
 
 
 def quick_match(client, request):
-    """gqwk MODE=2 waits until match_size players search; they are then put in
-    one game, the first searcher hosting. MODE=3 cancels.
+    """gqwk MODE=2 waits until enough players search (2 ranked, match_size
+    unranked); they are then put in one game, the first searcher hosting.
+    MODE=3 cancels.
 
     The game's LobbyMatchupGameModule reports a match only after both its own
     +who shows a new game id (G) and a +mgm with the game's NAME arrives; the
     host then starts the game with gsta, which sends +ses."""
     mode = request.get("MODE")
     if mode == "3":
-        if client in quick_queue:
-            quick_queue.remove(client)
+        leave_queue(client)
         log(f"quick match: {client.persona}#{client.id} cancelled")
         leave_game(client)
         return
@@ -265,15 +280,19 @@ def quick_match(client, request):
     leave_game(client)
     client.userflags = "0"
     client.search = request
-    if len(quick_queue) + 1 < match_size:
-        quick_queue.append(client)
-        log(f"quick match: {client.persona}#{client.id} waiting "
-            f"({len(quick_queue)}/{match_size} searching)")
+    ranked = is_ranked(request)
+    size = 2 if ranked else match_size
+    kind = "ranked" if ranked else ("team play" if size > 2 else "unranked")
+    queue = quick_queues[ranked]
+    if len(queue) + 1 < size:
+        queue.append(client)
+        log(f"quick match ({kind}): {client.persona}#{client.id} waiting "
+            f"({len(queue)}/{size} searching)")
         return
-    players = quick_queue[:match_size - 1] + [client]
-    del quick_queue[:match_size - 1]
-    game = Game(players[0].search, players)
-    log(f"quick match: game {game.id} host {players[0].persona}#{players[0].id} with "
+    players = queue[:size - 1] + [client]
+    del queue[:size - 1]
+    game = Game(players[0].search, players, size)
+    log(f"quick match ({kind}): game {game.id} host {players[0].persona}#{players[0].id} with "
         + ", ".join(f"{p.persona}#{p.id} ({p.ip})" for p in players))
 
     def notify():
@@ -449,7 +468,9 @@ def main():
     ap.add_argument("--respond", action="store_true",
                     help="answer the lobby directory request (@dir) instead of only logging")
     ap.add_argument("--match-size", type=int, default=2,
-                    help="consoles per quick match; above 2 is experimental team play")
+                    help="consoles per unranked quick match (the game's ONLINE TEAM PLAY "
+                         "entry with --team_play); above 2 is experimental team play. "
+                         "Ranked quick matches stay 1v1")
     args = ap.parse_args()
     global match_size
     match_size = max(2, args.match_size)

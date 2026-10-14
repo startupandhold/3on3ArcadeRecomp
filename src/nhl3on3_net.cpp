@@ -47,6 +47,7 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xmemory.h>
 
+#include "nhl3on3_team_lobby.h"
 #include "runtime_export.h"
 
 REXCVAR_DEFINE_BOOL(online, false, "NHL3on3/Online",
@@ -80,8 +81,9 @@ REXCVAR_DEFINE_INT32(online_local_users, 1, "NHL3on3/Online",
 
 REXCVAR_DEFINE_INT32(team_play, 0, "NHL3on3/Online",
                      "Experimental team play: consoles per online match (3-6), each with "
-                     "its own player; 0 = the normal two-console game. The lobby server "
-                     "needs the same --match-size")
+                     "its own player; 0 = the normal two-console game. Team play matches "
+                     "come from the online menu's ONLINE TEAM PLAY entry (the renamed "
+                     "unranked quick match); the lobby server needs the same --match-size")
     .range(0, 6)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -794,6 +796,7 @@ void CountDatagram(const char* what, uint32_t socket, uint32_t ip, uint16_t port
     const size_t text_length = (size_t(p[0]) << 24) | (size_t(p[1]) << 16) | (size_t(p[2]) << 8) | p[3];
     const std::string_view text = view.substr(at + 12, std::min(text_length, view.size() - at - 12));
     REXLOG_INFO("[osdk] {} {} {}: {}", what, what[0] == 'r' ? "from" : "to", FormatIp(ip), text);
+    nhl3on3::team_lobby::OnControlMessage(text);
   }
   if (n <= 12 || (n & (n - 1)) == 0) {
     std::string hex;

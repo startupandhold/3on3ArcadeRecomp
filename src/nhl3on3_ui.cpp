@@ -19,6 +19,8 @@
 REXCVAR_DEFINE_BOOL(skip_intro, true, "NHL3on3/General",
                     "Skip the EA Sports Freestyle intro movie at boot");
 
+REXCVAR_DECLARE(int32_t, team_play);
+
 REXCVAR_DEFINE_STRING(menu_renames, "XBOX LIVE=ONLINE MULTIPLAYER", "NHL3on3/General",
                       "Front-end text replacements, 'OLD=NEW' pairs separated by ';'. "
                       "Matches whole localized strings exactly (they are upper case)");
@@ -71,6 +73,11 @@ void Parse(Renames& r, const std::string& spec) {
       r.text[pair.substr(0, eq)] = pair.substr(eq + 1);
     }
     start = end + 1;
+  }
+  // With team play on, the unranked quick match is the team play queue (the
+  // lobby server matches it with --match-size consoles; ranked stays 1v1).
+  if (REXCVAR_GET(team_play) >= 3) {
+    r.text.emplace("UNRANKED VERSUS PLAY", "ONLINE TEAM PLAY");
   }
 }
 

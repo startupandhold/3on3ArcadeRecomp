@@ -27,9 +27,15 @@ class Nhl3on3App : public rex::ReXApp {
         PPCImageConfig));
   }
 
+  // Settings come from nhl3on3.toml beside the executable (written by the
+  // launcher) unless a config path was given.
+  //
   // Without --game_data_root, look for game/ (installed layout) or
   // game/extracted/ (dev checkout) beside the executable or in any parent.
   void OnConfigurePaths(rex::PathConfig& paths) override {
+    if (paths.config_path.empty()) {
+      paths.config_path = rex::filesystem::GetExecutableFolder() / "nhl3on3.toml";
+    }
     if (!paths.game_data_root.empty()) {
       return;
     }

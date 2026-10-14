@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Builds the team play front-end mod: patches ActionScript in the game's Apt
+screens and writes the result back into data0.big / data0.bh.
+
+Usage: ui_mod.py GAME_DIR [--restore] [--check]
+
+GAME_DIR is the extracted game (with data0.big). The first run copies the
+originals to data0.big.orig / data0.bh.orig; every run rebuilds from those, so
+it is safe to re-run. --restore puts the originals back. --check only patches
+in memory and prints the disassembly of every patched function.
+
+Patched screens are appended to data0.big uncompressed and both directories
+(the .big header and the .bh index) point at the new copy.
+
+Patches are written in place over code they make dead, so the Apt files keep
+their size and layout; see PATCHES below.
+"""
+import argparse
+import io
+import os
+import shutil
+import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import apt_dis  # noqa: E402
+import ea_big  # noqa: E402
+
+# --- Apt assembler -----------------------------------------------------------
+
+SIMPLE = {name: op for op, name in apt_dis.SIMPLE.items()}
+CONST_OPS = {"pushConst": (0xA2, 0xA3), "pushValueOfVar": (0xAE, None),
+             "getNamedMember": (0xAF, None), "callNamedFuncPop": (0xB0, None),
+             "callNamedMethodPop": (0xB2, None)}
+# 0xB1 / 0xB3 call a function / method and store the result with setVariable
+# under the name pushed before the arguments; to keep a result on the stack,
+# push the name and use callFunction / callMethod.
+BRANCHES = {"jump": 0x99, "branchIfTrue": 0x9D, "branchIfFalse": 0xB8}
+UNREACHED_FILL = 0x12  # 'not': any simple opcode keeps the stream parseable
+
+
+class Chunk:
+    """Code laid out at a fixed address range [start, end) of an Apt file.
+
+    Instructions are (name, *args); branch targets are label names or
+    absolute addresses. If the code ends before `end`, a jump to `then`
+    (default `end`) is appended and the rest is filled with unreached bytes.
+    """
+
+    def __init__(self, start, end, code, then=None):
+        self.start, self.end, self.code = start, end, code
+        self.then = end if then is None else then
+
+
+def pool_index(pool, name):
+    key = repr(name)
+    if key not in pool:
+        raise KeyError(f"{name!r} is not in the constant pool")
+    return pool.index(key)
+
+
+def instr_size(at, ins, pool):
+    name = ins[0]
+    if name in SIMPLE:
+        return 1
+    if name in CONST_OPS:
+        i = pool_index(pool, ins[1])
+        narrow, wide = CONST_OPS[name]
+        if i < 256:
+            return 2
+        if wide is None:
+            raise ValueError(f"{name} needs a pool index below 256 ({ins[1]!r} is {i})")
+        return 3
+    if name in ("pushRegister", "pushByte"):
+        return 2
+    if name == "pushShort":
+        return 3
+    if name in BRANCHES or name == "storeRegister":
+        return ((at + 1 + 3) & ~3) + 4 - at
+    raise ValueError(f"unknown instruction {name}")
+
+
+def encode(at, ins, pool, labels):
+    name = ins[0]
+    if name in SIMPLE:
+        return bytes([SIMPLE[name]])
+    if name in CONST_OPS:
+        i = pool_index(pool, ins[1])
+        narrow, wide = CONST_OPS[name]
+        return bytes([narrow, i]) if i < 256 else bytes([wide]) + struct.pack(">H", i)
+    if name == "pushRegister":
+        return bytes([0xB9, ins[1]])
+    if name == "pushByte":
+        return bytes([0xB5]) + struct.pack(">b", ins[1])
+    if name == "pushShort":
+        return bytes([0xB6]) + struct.pack(">h", ins[1])
+    size = instr_size(at, ins, pool)
+    pad = bytes(size - 5)
+    if name == "storeRegister":
+        return bytes([0x87]) + pad + struct.pack(">I", ins[1])
+    target = labels[ins[1]] if isinstance(ins[1], str) else ins[1]
+    return bytes([BRANCHES[name]]) + pad + struct.pack(">i", target - (at + size))
+
+
+def assemble(data, chunks, pool):
+    """Lays out and writes `chunks` into the bytearray `data`."""
+    labels = {}
+    layouts = []
+    for chunk in chunks:
+        at = chunk.start
+        placed = []
+        for ins in chunk.code:
+            if ins[0] == "label":
+                labels[ins[1]] = at
+                continue
+            placed.append((at, ins))
+            at += instr_size(at, ins, pool)
+        if at != chunk.end and not (placed and placed[-1][1][0] == "jump"):
+            ins = ("jump", chunk.then)
+            placed.append((at, ins))
+            at += instr_size(at, ins, pool)
+        if at > chunk.end:
+            raise ValueError(f"chunk at {chunk.start:#x} needs {at - chunk.start} bytes, "
+                             f"has {chunk.end - chunk.start}")
+        layouts.append((chunk, placed))
+    for chunk, placed in layouts:
+        out = bytearray()
+        for at, ins in placed:
+            out += encode(at, ins, pool, labels)
+        out += bytes([UNREACHED_FILL]) * (chunk.end - chunk.start - len(out))
+        data[chunk.start:chunk.end] = out
+
+
+def frame_pool(apt, action):
+    """Constant pool set by the constantPool at the start of an action block."""
+    d = apt.d
+    if d[action] != 0x88:
+        raise ValueError(f"no constantPool at {action:#x}")
+    off = (action + 4) & ~3
+    n, p = apt.u32(off), apt.u32(off + 4)
+    return [apt.const(apt.u32(p + 4 * k)) for k in range(n)]
+
+
+def expect(data, at, hexbytes):
+    want = bytes.fromhex(hexbytes)
+    if bytes(data[at:at + len(want)]) != want:
+        raise ValueError(f"unexpected bytes at {at:#x}: {bytes(data[at:at + len(want)]).hex()} "
+                         f"(want {want.hex()}); wrong game version?")
+
+
+# --- Patches -----------------------------------------------------------------
+
+def lobby_call(code, arg=None):
+    """OSDK_GameSetupAdaptor.GetControllerLogin(code[, arg]): a request to the
+    client's team play lobby (src/nhl3on3_team_lobby.cpp), leaving its reply
+    on the stack. `code` and `arg` are instruction lists that push a value."""
+    return lobby_send(code, arg)[:-1] + [("pushConst", "GetControllerLogin"), ("callMethod",)]
+
+
+def lobby_send(code, arg=None):
+    """lobby_call without the reply."""
+    args = [] if arg is None else arg
+    return args + code + [("pushByte", 2 if arg else 1), ("pushValueOfVar", "OSDK_GameSetupAdaptor"),
+                          ("callNamedMethodPop", "GetControllerLogin")]
+
+
+def patch_select_teams(apt_bytes, const_bytes):
+    """onlineSelectTeams (the 'SELECT SIDES' screen).
+
+    Stock: each console's side is fixed (host home, the other console away);
+    its spare controllers can join it as guests. Left / right on a console's
+    own controller did nothing. With more than two consoles one name
+    overwrites another in the away panel.
+
+    Patched, with sides kept by the client (src/nhl3on3_team_lobby.cpp):
+    - left / right on the console's own controller picks side 0 / 1 (when
+      not ready); guest controllers behave as before.
+    - custom_UpdateUserAttributes puts player i in panel AWAY_INDEX ^ side(i)
+      and that panel shows every player on the side, joined with ', '. Side 0
+      (the host's by default) plays as the away (blue, left) team, whose
+      panel is AWAY_INDEX; HOME_INDEX is only swapped by online league code.
+    - every 250 ms a timer tells the client the player names and the local
+      index, and redraws both panels' names, so other consoles' picks show.
+
+    Space comes from code that is dead in this game: the function's opening
+    trace, its interactive league block, the online league side check
+    (checkLocalUserSide only acts when m_bOnlineLeague), and the online league
+    function updateOnlineLeagueGame, which becomes the timer.
+    """
+    data = bytearray(apt_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool = frame_pool(apt, 0xEBC)
+    func, body, size = 0x1B5B, 0x1B78, 576
+    expect(data, func, "8e")
+    expect(data, body, "a2d7aea3b9034e")           # trace(... 'custom_UpdateUserAttributes [' ...)
+    expect(data, 0x1BED, "aea3b9034eafdd")         # m_aPlayers[i].core_bIsGuest
+    expect(data, 0x1BFC, "aea3b9034eafd2")         # m_aPlayers[i].core_bIsHost
+    expect(data, 0x1C12, "87000000000517")         # storeRegister 5; pop
+    expect(data, 0x1C19, "735aae11b9054eb2de")     # m_arrPanels[r5].showGamerTag(true)
+    expect(data, 0x1C22, "aea3b9034eafb85aae11b9054eb2df")  # ...setGamerTag(core_username)
+    expect(data, 0x1C31, "aea3b9034eafe0")         # m_aPlayers[i].core_iNumGuests
+    expect(data, 0x1C86, "b903ae21499d")           # i == HOST_INDEX ? HOME_SIDE : AWAY_SIDE
+    # defaultLocalEventHandler, UI_LEFT and UI_RIGHT cases: if controller is
+    # not the lead and ... then updateController(LEFT / RIGHT, ...); return true
+    left, right, cases_end = 0x33C0, 0x3410, 0x3460
+    expect(data, left, "b903b901afa949124c12")
+    expect(data, right, "b903b901afa949124c12")
+    expect(data, cases_end, "b9035aae13")         # OPTION_TOP case: m_mcControllers.getControllerSide
+    timer_func, timer_body, timer_end = 0x45B9, 0x45D8, 0x477E
+    expect(data, timer_func, "8e")
+    expect(data, timer_body, "a301f95ab002")      # _gsTrace('**** ...updateOnlineLeagueGame')
+    expect(data, timer_end, "8e")
+
+    # Name of the variable holding the timer's interval id: a pool string no
+    # code uses as a name. It must be a plain identifier: getVariable and
+    # setVariable read a name with ':' in it as a target path.
+    timer_var = "TXT_ARCADE_CHANGE_CONTROLLER_SETTINGS"
+    me = [("pushConst", "m_iMyUserIndex"), ("getVariable",)]
+    stop_timer = [("pushConst", timer_var), ("getVariable",), ("pushOne",),
+                  ("pushConst", "clearInterval"), ("callFunctionPop",)]
+    pre_exit = 0x1234  # custom_PreOnExitScreen: _gsTrace('...custom_PreExitScreen ' + playerInfo0)
+    expect(data, pre_exit, "a2")
+    expect(data, pre_exit + 10, "ae")
+
+    i, panel = 3, 5  # custom_UpdateUserAttributes registers
+    chunks = [
+        Chunk(body, body + 8, [("jump", "entry")]),
+        Chunk(body + 8, 0x1BED, [
+            ("label", "entry"),
+            # register player i's name
+            *lobby_send([("pushRegister", i), ("pushShort", 1000), ("add2",)],
+                        [("pushValueOfVar", "m_aPlayers"), ("pushRegister", i), ("getMember",),
+                         ("getNamedMember", "core_username")]),
+            # start the timer once
+            ("pushConst", timer_var), ("getVariable",), ("pushUndefined",), ("equals2",),
+            ("branchIfFalse", 0x1BED),
+            # setInterval(updateOnlineLeagueGame, 250, m_thisScreen): this
+            # engine's setInterval reads a third argument even when not given
+            ("pushConst", timer_var), ("pushValueOfVar", "m_thisScreen"),
+            ("pushShort", 250), ("pushConst", "updateOnlineLeagueGame"), ("getVariable",),
+            ("pushByte", 3), ("pushConst", "setInterval"), ("callFunction",),
+            ("setVariable",),
+            ("jump", 0x1BED),
+            # panel shows the names on its side
+            ("label", "names"),
+            *lobby_call([("pushRegister", panel), ("pushValueOfVar", "AWAY_INDEX"), ("bitXor",),
+                         ("pushByte", 110), ("add2",)]),
+            ("pushOne",), ("pushValueOfVar", "m_arrPanels"), ("pushRegister", panel),
+            ("getMember",), ("callNamedMethodPop", "setGamerTag"),
+            ("jump", 0x1C31),
+            # panel = AWAY_INDEX ^ side(i)
+            ("label", "side"),
+            *lobby_call([("pushRegister", i), ("pushByte", 120), ("add2",)]),
+            ("jump", "side_end"),
+        ]),
+        Chunk(0x1BFC, 0x1C19, [
+            ("jump", "side"),
+            ("label", "side_end"),
+            ("toNumber",), ("pushValueOfVar", "AWAY_INDEX"), ("bitXor",),
+            ("storeRegister", panel), ("pop",),
+        ]),
+        Chunk(0x1C22, 0x1C31, [("jump", "names")]),
+        # the local controller's puck: SIDES[panel], not by host / client
+        Chunk(0x1C86, 0x1C9A, [
+            ("pushConst", "SIDES"), ("getVariable",), ("pushRegister", panel), ("getMember",),
+        ]),
+
+        # Input. Stack on entry to "pick": direction, lobby code. Registers:
+        # 0 (switch temp, free here), 1 _global, 3 controllerId, 5 own side.
+        Chunk(left, right, [
+            ("pushValueOfVar", "LEFT"), ("pushByte", 100),
+            ("label", "pick"),
+            ("storeRegister", 6), ("pop",), ("storeRegister", 0), ("pop",),
+            ("pushZero",), ("pushValueOfVar", "m_thisScreen"), ("pushConst", "isLocalUserReady"),
+            ("callMethod",), ("branchIfTrue", "handled"),
+            ("pushRegister", 3), ("pushRegister", 1),
+            ("getNamedMember", "gControllerIDCurrentScreen"), ("equals2",),
+            ("branchIfFalse", "guest"),
+            *lobby_send([("pushRegister", 6)], me),
+            ("pushTrue",), ("return",),
+        ]),
+        Chunk(right, cases_end, [
+            ("pushValueOfVar", "RIGHT"), ("pushByte", 101), ("jump", "pick"),
+            ("label", "guest"),
+            ("pushConst", "m_ControllersPerSide"), ("getVariable",), ("pushOne",), ("greater",),
+            ("branchIfFalse", "handled"),
+            ("pushValueOfVar", "m_bJerseyMode"), ("branchIfTrue", "handled"),
+            ("pushRegister", 0), ("pushRegister", 3), ("pushRegister", 5), ("pushByte", 3),
+            ("pushConst", "updateController"), ("callFunctionPop",),
+            ("label", "handled"),
+            ("pushTrue",), ("return",),
+        ]),
+
+        # Stop the timer when leaving the screen (fills the trace exactly)
+        Chunk(pre_exit, pre_exit + 10, stop_timer + [("pushZero",), ("pop",)]),
+
+        # The timer (registers 2..4 are free; 1 is _global).
+        Chunk(timer_body, timer_end, [
+            ("pushValueOfVar", "m_bLeavingScreen"), ("branchIfFalse", "tick"),
+            *stop_timer,
+            ("pushUndefined",), ("return",),
+            ("label", "tick"),
+            *lobby_send([("pushByte", 99)],
+                        me + [("pushByte", 16), ("multiply",), ("pushValueOfVar", "m_aPlayers"),
+                              ("getNamedMember", "length"), ("add2",)]),
+            ("pushZero",), ("storeRegister", 2), ("pop",),
+            ("label", "player"),
+            ("pushRegister", 2), ("pushValueOfVar", "m_aPlayers"), ("getNamedMember", "length"),
+            ("less2",), ("branchIfFalse", "panels"),
+            *lobby_send([("pushRegister", 2), ("pushShort", 1000), ("add2",)],
+                        [("pushValueOfVar", "m_aPlayers"), ("pushRegister", 2), ("getMember",),
+                         ("getNamedMember", "core_username")]),
+            ("pushRegister", 2), ("increment",), ("storeRegister", 2), ("pop",),
+            ("jump", "player"),
+            ("label", "panels"),
+            *[ins for side in (0, 1) for ins in [
+                *lobby_call([("pushByte", 110 + side)]),
+                ("pushOne",), ("pushValueOfVar", "m_arrPanels"),
+                ("pushValueOfVar", "AWAY_INDEX"), ("pushByte", side), ("bitXor",), ("getMember",),
+                ("callNamedMethodPop", "setGamerTag"),
+            ]],
+            # move the local puck when the local side changed
+            *lobby_call([("pushByte", 102)]), ("toNumber",), ("storeRegister", 3), ("pop",),
+            ("pushRegister", 3), ("pushZero",), ("less2",), ("branchIfTrue", "end"),
+            ("pushTrue",), ("pushTrue",),
+            ("pushConst", "SIDES"), ("getVariable",),
+            ("pushValueOfVar", "AWAY_INDEX"), ("pushRegister", 3), ("bitXor",), ("getMember",),
+            ("pushRegister", 1), ("getNamedMember", "EA_ZONE"),
+            ("getNamedMember", "gControllerIDCurrentScreen"),
+            ("pushByte", 4), ("pushValueOfVar", "m_mcControllers"),
+            ("callNamedMethodPop", "setControllerSide"),
+            ("label", "end"),
+            ("pushUndefined",), ("return",),
+        ]),
+    ]
+    assemble(data, chunks, pool)
+    return bytes(data), [(func, body + size), (left, cases_end), (timer_func, timer_end),
+                         (0x1214, 0x125E)]
+
+
+# (archive entry, nested entry of the .apt, nested entry of the .const, patch)
+PATCHES = [
+    ("fe/ion/game/screens/online/onlineselectteams.big", "0", "1", patch_select_teams),
+]
+
+# --- Archive rebuild ---------------------------------------------------------
+
+
+def big_directory(data):
+    """[(name, offset, size, directory position of the offset field)]"""
+    count = struct.unpack(">I", data[8:12])[0]
+    p = 16
+    out = []
+    for _ in range(count):
+        off, size = struct.unpack(">II", data[p:p + 8])
+        end = data.index(b"\0", p + 8)
+        out.append((data[p + 8:end].decode("latin1"), off, size, p))
+        p = end + 1
+    return out
+
+
+def patched_screens(big, check):
+    """Yields (archive entry name, new uncompressed bytes)."""
+    directory = {name: (off, size) for name, off, size, _ in big_directory(big)}
+    for entry, apt_name, const_name, patch in PATCHES:
+        off, size = directory[entry]
+        nested = bytearray(ea_big.unpack(big[off:off + size]))
+        inner = {name: (o, s) for name, o, s, _ in big_directory(nested)}
+        (ao, asz), (co, csz) = inner[apt_name], inner[const_name]
+        apt_bytes, const_bytes = bytes(nested[ao:ao + asz]), bytes(nested[co:co + csz])
+        new_apt, ranges = patch(apt_bytes, const_bytes)
+        if len(new_apt) != asz:
+            raise ValueError(f"{entry}: patch changed the Apt size")
+        nested[ao:ao + asz] = new_apt
+        print(f"patched {entry}")
+        if check:
+            apt = apt_dis.Apt(new_apt, const_bytes)
+            for start, end in ranges:
+                out = io.StringIO()
+                apt.disasm(start, end, out=out, pool=frame_pool(apt, 0xEBC))
+                print(out.getvalue())
+        yield entry, bytes(nested)
+
+
+def rebuild(game_dir, check):
+    big_path, bh_path = os.path.join(game_dir, "data0.big"), os.path.join(game_dir, "data0.bh")
+    for path in (big_path, bh_path):
+        if not os.path.exists(path + ".orig"):
+            shutil.copy2(path, path + ".orig")
+            print(f"saved {path}.orig")
+    big = bytearray(open(big_path + ".orig", "rb").read())
+    bh = bytearray(open(bh_path + ".orig", "rb").read())
+    directory = big_directory(big)
+    index = {off: k for k, (_, off, _, _) in enumerate(directory)}
+    positions = {name: (off, pos) for name, off, _, pos in directory}
+    for entry, blob in patched_screens(big, check):
+        old_off, pos = positions[entry]
+        new_off = (len(big) + 63) & ~63
+        big += bytes(new_off - len(big)) + blob
+        struct.pack_into(">II", big, pos, new_off, len(blob))
+        k = index[old_off]
+        bh_entry = 16 + 16 * k
+        if struct.unpack(">I", bh[bh_entry:bh_entry + 4])[0] != old_off:
+            raise ValueError(f"{entry}: .bh entry {k} does not match the .big directory")
+        struct.pack_into(">III", bh, bh_entry, new_off, len(blob), 0)
+    struct.pack_into("<I", big, 4, len(big))
+    if check:
+        return
+    open(big_path, "wb").write(big)
+    open(bh_path, "wb").write(bh)
+    print(f"wrote {big_path} and {bh_path}")
+
+
+def restore(game_dir):
+    for name in ("data0.big", "data0.bh"):
+        path = os.path.join(game_dir, name)
+        if os.path.exists(path + ".orig"):
+            shutil.copy2(path + ".orig", path)
+            print(f"restored {path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("game_dir")
+    ap.add_argument("--restore", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args()
+    if args.restore:
+        restore(args.game_dir)
+    else:
+        rebuild(args.game_dir, args.check)
+
+
+if __name__ == "__main__":
+    main()

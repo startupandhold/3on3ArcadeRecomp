@@ -12,6 +12,7 @@
 #include <rex/cvar.h>
 #include <rex/ppc/func.h>
 
+#include "nhl3on3_display.h"
 #include "nhl3on3_remote_pad.h"
 #include "runtime_export.h"
 
@@ -79,6 +80,7 @@ extern "C" REX_FUNC(__imp__XamInputGetCapabilities) {
 // (user_index, flags, X_INPUT_STATE*)
 extern "C" REX_FUNC(__imp__XamInputGetState) {
   static const auto original = nhl3on3::ResolveRuntimeExport("__imp__XamInputGetState");
+  nhl3on3::NotePadRead();
   std::lock_guard lock(g_input_mutex);
   if (!IsAnyUser(ctx.r3.u32, ctx.r4.u32) && remote_pad::GetState(base, ctx.r3.u32, ctx.r5.u32)) {
     ctx.r3.u64 = 0;
