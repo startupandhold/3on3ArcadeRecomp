@@ -68,6 +68,7 @@ class Client:
         self.id = Client.next_id
         Client.next_id += 1
         self.persona = "Player"
+        self.signed_in = False  # persona chosen at auth, unique among signed-in players
         self.peer_ip = peer_ip
         self.mac_ip = None
         self.maddr = ""
@@ -366,6 +367,17 @@ class Lobby:
 
     # -- requests ---------------------------------------------------------
 
+    def unique_persona(self, name, client):
+        """`name`, or `name` with the lowest number from 2 up that makes it
+        unique among the other signed-in players (case-insensitive), cut to
+        stay within 15 characters."""
+        taken = {c.persona.lower() for c in self.clients if c is not client and c.signed_in}
+        candidate, n = name, 1
+        while candidate.lower() in taken:
+            n += 1
+            candidate = name[:15 - len(str(n))] + str(n)
+        return candidate
+
     def reply(self, cmd, request, client):
         """Returns the frames to send for a request. Unknown commands are echoed
         back as success."""
@@ -407,8 +419,12 @@ class Lobby:
         if cmd == b"gget":
             return [lobby_frame(cmd, self.game_info(client.game) if client.game else {})]
         if cmd == b"auth":
-            client.persona = name
+            client.persona = self.unique_persona(name, client)
+            client.signed_in = True
+            if client.persona != name:
+                log.info("%s: gamertag %s is in use, renamed", client.name, name)
             log.info("%s signed in from %s", client.name, client.ip)
+            name = client.persona
             return [lobby_frame(b"auth", {
                 "NAME": name, "PERSONAS": name, "GTAG": name,
                 "XUID": sanitize(request.get("XUID", "$0")),
@@ -418,7 +434,11 @@ class Lobby:
                 "SINCE": "2008.11.1 12:00:00", "LAST": "2008.11.1 12:00:00",
             })]
         if cmd == b"pers":
-            client.persona = name
+            if client.signed_in:
+                name = client.persona
+            else:
+                client.persona = name = self.unique_persona(name, client)
+                client.signed_in = True
             return [lobby_frame(b"pers", {
                 "PERS": name, "NAME": name, "LKEY": LKEY, "EX-ticker": "", "LOC": "enUS",
                 "A": client.ip, "LA": client.ip, "IDLE": 600000,

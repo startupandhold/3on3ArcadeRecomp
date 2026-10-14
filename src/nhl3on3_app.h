@@ -13,6 +13,8 @@
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 #include <rex/system/gpu_plugin.h>
+#include <rex/ui/keybinds.h>
+#include <rex/ui/window.h>
 
 #include "nhl3on3_display.h"
 #include <rex/system/xmemory.h>
@@ -101,6 +103,21 @@ class Nhl3on3App : public rex::ReXApp {
   }
 
  private:
+  // F11 or Alt+Enter toggles fullscreen; other keys go to the SDK's overlay
+  // binds (F3, F4, Backtick, ...) as in rex::ReXApp::OnKeyDown.
+  void OnKeyDown(rex::ui::KeyEvent& e) override {
+    const auto key = e.virtual_key();
+    if (key == rex::ui::VirtualKey::kF11 ||
+        (key == rex::ui::VirtualKey::kReturn && e.is_alt_pressed())) {
+      if (!e.prev_state() && window()) {
+        rex::cvar::SetFlagByName("fullscreen", window()->IsFullscreen() ? "false" : "true");
+      }
+      e.set_handled(true);
+      return;
+    }
+    rex::ui::ProcessKeyEvent(e);
+  }
+
   // Changes a cvar's default without overriding a value from the command line
   // or config file.
   static void SetDefaultFlag(std::string_view name, std::string_view value) {

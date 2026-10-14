@@ -2,7 +2,7 @@
 """Exercises a running server the way game instances would: tunnel
 registration and forwarding, ranked and team play quick matches (a team play
 game opens with two players, a third joins it, and starting it closes it),
-and lockstep relay frames.
+lockstep relay frames, and renaming a gamertag that is already signed in.
 
     python selftest.py [host]
 """
@@ -139,6 +139,12 @@ def main():
     d.search()
     assert d.last_mgm(1.5) is None, "joined a started game"
     print("started game is closed to new players")
+
+    # A gamertag already signed in (in any case) gets a number appended.
+    e = Player("alpha")
+    names = [f.get("NAME") for cmd, f in e.frames(1) if cmd in (b"auth", b"pers")]
+    assert names == ["alpha2", "alpha2"], names
+    print("duplicate gamertag renamed")
     print("PASS")
 
 
