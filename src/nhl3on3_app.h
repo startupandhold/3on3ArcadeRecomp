@@ -17,6 +17,7 @@
 #include <rex/ui/window.h>
 
 #include "nhl3on3_display.h"
+#include "nhl3on3_ui_patch.h"
 #include <rex/system/xmemory.h>
 
 class Nhl3on3App : public rex::ReXApp {
@@ -57,6 +58,8 @@ class Nhl3on3App : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    nhl3on3::ApplyUiPatches(game_data_root());
+
     // Full XBLA license instead of the trial (same as Xenia's license_mask=1).
     SetDefaultFlag("license_mask", "1");
 

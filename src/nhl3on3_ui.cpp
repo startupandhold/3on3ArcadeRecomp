@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -11,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/logging/api.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
@@ -79,9 +81,12 @@ void Parse(Renames& r, const std::string& spec) {
   if (REXCVAR_GET(team_play) >= 3) {
     r.text.emplace("UNRANKED VERSUS PLAY", "ONLINE TEAM PLAY");
   }
+  // The main menu's quit item exits the game directly (QuitArcadeGame below).
+  r.text.emplace("RETURN TO GAME LIBRARY", "QUIT GAME");
 }
 
-// Returns the guest address of the replacement for `text`, or 0.
+// Returns the guest address of the replacement for `text`, or 0. Trailing
+// line breaks (some menu items end in one) are matched loosely and kept.
 uint32_t FindReplacement(rex::memory::Memory* memory, const std::string& text) {
   Renames& r = GetRenames();
   std::lock_guard lock(r.mutex);
@@ -89,16 +94,19 @@ uint32_t FindReplacement(rex::memory::Memory* memory, const std::string& text) {
   if (spec != r.source) {
     Parse(r, spec);
   }
-  const auto it = r.text.find(text);
+  const size_t end = text.find_last_not_of("\r\n");
+  const size_t trimmed = end == std::string::npos ? 0 : end + 1;
+  const auto it = r.text.find(text.substr(0, trimmed));
   if (it == r.text.end()) {
     return 0;
   }
-  auto& address = r.guest[it->second];
+  const std::string replacement = it->second + text.substr(trimmed);
+  auto& address = r.guest[replacement];
   if (!address) {
-    const uint32_t size = uint32_t(it->second.size() + 1);
+    const uint32_t size = uint32_t(replacement.size() + 1);
     address = memory->SystemHeapAlloc(size);
     if (address) {
-      std::memcpy(memory->TranslateVirtual(address), it->second.c_str(), size);
+      std::memcpy(memory->TranslateVirtual(address), replacement.c_str(), size);
     }
   }
   return address;
@@ -172,6 +180,18 @@ void Nhl3on3MovieStateHook(PPCRegister& r3) {
     REXLOG_INFO("Intro movie skipped");
     r3.u64 = 4;
   }
+}
+
+// ION_Arcade.QuitArcadeGame script native (the main menu's quit item; see
+// patch_pimp_full_nhl in tools/ui_mod.py). Stock, it returns to the dashboard
+// through XamLoaderLaunchTitle, which only stops the title and leaves the
+// window open; exit the process the way closing the window does.
+extern "C" REX_FUNC(sub_829CBE38) {
+  (void)ctx;
+  (void)base;
+  REXLOG_INFO("Quit game selected; exiting.");
+  rex::FlushLogging();
+  std::_Exit(0);
 }
 
 void Nhl3on3LocalizeLookupHook(PPCRegister& r1) {

@@ -2,12 +2,16 @@
 """Builds the team play front-end mod: patches ActionScript in the game's Apt
 screens and writes the result back into data0.big / data0.bh.
 
-Usage: ui_mod.py GAME_DIR [--restore] [--check]
+Usage: ui_mod.py GAME_DIR [--restore] [--check] [--emit-cpp [PATH]]
 
 GAME_DIR is the extracted game (with data0.big). The first run copies the
 originals to data0.big.orig / data0.bh.orig; every run rebuilds from those, so
 it is safe to re-run. --restore puts the originals back. --check only patches
 in memory and prints the disassembly of every patched function.
+
+--emit-cpp writes the patches to src/nhl3on3_ui_patches.inc, from which the
+game patches data0.big itself on startup (src/nhl3on3_ui_patch.cpp), so
+players never run this script. Re-run it after changing a patch.
 
 Patched screens are appended to data0.big uncompressed and both directories
 (the .big header and the .bh index) point at the new copy.
@@ -21,6 +25,7 @@ import os
 import shutil
 import struct
 import sys
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import apt_dis  # noqa: E402
@@ -502,13 +507,41 @@ def patch_starting_lineups(apt_bytes, const_bytes):
                          (timer_func, timer_end)], pool_at
 
 
+def patch_pimp_full_nhl(apt_bytes, const_bytes):
+    """pimpFullNHL (GET THE NHL 09 EXPERIENCE), the advert the main menu's
+    quit item (RETURN TO GAME LIBRARY) opens; A asks "return to game
+    library?" and YES calls ION_Arcade.QuitArcadeGame.
+
+    Patched: initGUI_2, which runs on frame 2 while initGUI_1 still has the
+    screen hidden, calls ION_Arcade.QuitArcadeGame() itself, so the game
+    exits without showing the advert or the prompt.
+    """
+    data = bytearray(apt_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool_at, body, body_end = 0x5B8, 0x60C, 0x624
+    expect(data, body, "745ab901af02b203b502a204b502b901a205525aae06b207")
+    pool = frame_pool(apt, pool_at)
+    # Register 1 is _global (the function preloads only it).
+    assemble(data, [Chunk(body, body_end, [
+        ("pushZero",), ("pushRegister", 1), ("getNamedMember", "ION_Arcade"),
+        ("callNamedMethodPop", "QuitArcadeGame"),
+    ])], pool)
+    return bytes(data), [(0x5ED, body_end)], pool_at
+
+
 # (archive entry, nested entry of the .apt, nested entry of the .const, patch)
 PATCHES = [
+    ("fe/ion/game/screens/misc/pimpfullnhl.big", "0", "1", patch_pimp_full_nhl),
     ("fe/ion/game/screens/online/onlineselectteams.big", "0", "1", patch_select_teams),
     ("fe/ion/game/screens/online/onlinestartinglineups.big", "0", "1", patch_starting_lineups),
 ]
 
 # --- Archive rebuild ---------------------------------------------------------
+
+# Written by the game beside data0.big once it has applied its patches.
+MARKER = "data0.nhl3on3"
+DEFAULT_EMIT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src",
+                            "nhl3on3_ui_patches.inc")
 
 
 def big_directory(data):
@@ -525,11 +558,13 @@ def big_directory(data):
 
 
 def patched_screens(big, check):
-    """Yields (archive entry name, new uncompressed bytes)."""
+    """Yields (archive entry name, new uncompressed bytes, original
+    uncompressed bytes)."""
     directory = {name: (off, size) for name, off, size, _ in big_directory(big)}
     for entry, apt_name, const_name, patch in PATCHES:
         off, size = directory[entry]
-        nested = bytearray(ea_big.unpack(big[off:off + size]))
+        original = ea_big.unpack(big[off:off + size])
+        nested = bytearray(original)
         inner = {name: (o, s) for name, o, s, _ in big_directory(nested)}
         (ao, asz), (co, csz) = inner[apt_name], inner[const_name]
         apt_bytes, const_bytes = bytes(nested[ao:ao + asz]), bytes(nested[co:co + csz])
@@ -544,7 +579,7 @@ def patched_screens(big, check):
                 out = io.StringIO()
                 apt.disasm(start, end, out=out, pool=frame_pool(apt, pool_at))
                 print(out.getvalue())
-        yield entry, bytes(nested)
+        yield entry, bytes(nested), original
 
 
 def rebuild(game_dir, check):
@@ -558,7 +593,7 @@ def rebuild(game_dir, check):
     directory = big_directory(big)
     index = {off: k for k, (_, off, _, _) in enumerate(directory)}
     positions = {name: (off, pos) for name, off, _, pos in directory}
-    for entry, blob in patched_screens(big, check):
+    for entry, blob, _ in patched_screens(big, check):
         old_off, pos = positions[entry]
         new_off = (len(big) + 63) & ~63
         big += bytes(new_off - len(big)) + blob
@@ -573,7 +608,53 @@ def rebuild(game_dir, check):
         return
     open(big_path, "wb").write(big)
     open(bh_path, "wb").write(bh)
+    marker = os.path.join(game_dir, MARKER)
+    if os.path.exists(marker):
+        os.remove(marker)  # the game re-applies its own copy of the patches
     print(f"wrote {big_path} and {bh_path}")
+
+
+def emit_cpp(game_dir, out_path):
+    """Writes the patches as byte runs for the game to apply at startup
+    (src/nhl3on3_ui_patch.cpp): only the bytes the patches write, with the
+    size and CRC-32 of each original uncompressed screen to check against."""
+    big_path = os.path.join(game_dir, "data0.big")
+    if os.path.exists(big_path + ".orig"):
+        big_path += ".orig"
+    big = open(big_path, "rb").read()
+    lines = ["// Generated by `tools/ui_mod.py GAME_DIR --emit-cpp`; do not edit.",
+             "// Included by src/nhl3on3_ui_patch.cpp.", ""]
+    screens = []
+    version = 0
+    for k, (entry, new, original) in enumerate(patched_screens(big, False)):
+        if len(new) != len(original):
+            raise ValueError(f"{entry}: patch changed the screen size")
+        runs, i = [], 0
+        while i < len(new):
+            if new[i] == original[i]:
+                i += 1
+                continue
+            start = i
+            while i < len(new) and new[i:i + 8] != original[i:i + 8]:
+                i += 1
+            runs.append((start, new[start:i]))
+        for r, (start, data) in enumerate(runs):
+            body = ", ".join(f"0x{b:02X}" for b in data)
+            lines.append(f"constexpr uint8_t kScreen{k}Run{r}[] = {{{body}}};")
+            version = zlib.crc32(struct.pack("<I", start) + data, version)
+        lines.append(f"constexpr Run kScreen{k}Runs[] = {{")
+        lines += [f"    {{{start:#x}, sizeof(kScreen{k}Run{r}), kScreen{k}Run{r}}},"
+                  for r, (start, _) in enumerate(runs)]
+        lines += ["};", ""]
+        crc = zlib.crc32(original)
+        version = zlib.crc32(entry.encode() + struct.pack("<I", crc), version)
+        screens.append(f'    {{"{entry}", {len(original)}, 0x{crc:08X}, kScreen{k}Runs, '
+                       f'std::size(kScreen{k}Runs)}},')
+    lines += ["constexpr Screen kScreens[] = {", *screens, "};", "",
+              f"constexpr uint32_t kPatchVersion = 0x{version:08X};", ""]
+    with open(out_path, "w", newline="\n") as f:
+        f.write("\n".join(lines))
+    print(f"wrote {out_path} ({len(screens)} screens, version {version:08X})")
 
 
 def restore(game_dir):
@@ -589,8 +670,11 @@ def main():
     ap.add_argument("game_dir")
     ap.add_argument("--restore", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--emit-cpp", nargs="?", const=DEFAULT_EMIT, metavar="PATH")
     args = ap.parse_args()
-    if args.restore:
+    if args.emit_cpp:
+        emit_cpp(args.game_dir, args.emit_cpp)
+    elif args.restore:
         restore(args.game_dir)
     else:
         rebuild(args.game_dir, args.check)
