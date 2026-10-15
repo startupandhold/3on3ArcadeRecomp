@@ -35,7 +35,10 @@
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -1629,10 +1632,106 @@ extern "C" REX_FUNC(__imp__NetDll_closesocket) {
   original(ctx, base);
 }
 
-NHL3ON3_SOCKET_TRACE(select)
 NHL3ON3_SOCKET_TRACE(getsockopt)
 NHL3ON3_SOCKET_TRACE(setsockopt)
+
+#ifdef _WIN32
+NHL3ON3_SOCKET_TRACE(select)
 NHL3ON3_SOCKET_TRACE(ioctlsocket)
+#else
+// Winsock fd_sets are a count plus a handle array and ignore nfds; passing
+// them through to POSIX select checks the wrong descriptors (nfds is 1), so a
+// connecting socket never reports writable. Poll the native handles instead.
+extern "C" REX_FUNC(__imp__NetDll_select) {
+  constexpr uint32_t kMaxSet = 64;
+  const uint32_t sets[3] = {ctx.r5.u32, ctx.r6.u32, ctx.r7.u32};
+  const uint32_t timeout = ctx.r8.u32;
+  std::vector<pollfd> fds;
+  std::vector<std::pair<uint32_t, uint32_t>> entries;  // (set index, guest socket)
+  for (uint32_t s = 0; s < 3; ++s) {
+    if (!sets[s]) continue;
+    const uint32_t count = std::min(LoadBE32(base + sets[s]), kMaxSet);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t socket = LoadBE32(base + sets[s] + 4 + i * 4);
+      NativeSocket native;
+      if (!NativeHandle(socket, native)) {
+        t_forced_error = 10038;  // WSAENOTSOCK
+        ctx.r3.u64 = 0xFFFFFFFF;
+        return;
+      }
+      const short events = s == 0 ? POLLIN : s == 1 ? POLLOUT : POLLPRI;
+      fds.push_back({native, events, 0});
+      entries.emplace_back(s, socket);
+    }
+  }
+  int wait_ms = -1;
+  if (timeout) {
+    const uint64_t ms = uint64_t(LoadBE32(base + timeout)) * 1000 +
+                        (LoadBE32(base + timeout + 4) + 999) / 1000;
+    wait_ms = int(std::min<uint64_t>(ms, INT32_MAX));
+  }
+  int ready = ::poll(fds.data(), fds.size(), wait_ms);
+  if (ready < 0) {
+    t_forced_error = errno == EINTR ? 10004 : 10022;  // WSAEINTR / WSAEINVAL
+    ctx.r3.u64 = 0xFFFFFFFF;
+    return;
+  }
+  // A failed connect surfaces as an error: Winsock reports it in exceptfds,
+  // but also flag it writable when no exceptfds was given so the caller
+  // still wakes up and reads SO_ERROR.
+  uint32_t counts[3] = {0, 0, 0};
+  uint32_t total = 0;
+  for (size_t i = 0; i < fds.size(); ++i) {
+    const auto [s, socket] = entries[i];
+    const short got = fds[i].revents;
+    const bool failed = got & (POLLERR | POLLHUP);
+    bool hit = got & fds[i].events;
+    if (s == 0 && (got & POLLHUP)) hit = true;
+    if (s == 1 && failed && !sets[2]) hit = true;
+    if (s == 2 && failed) hit = true;
+    if (!hit) continue;
+    StoreBE32(base + sets[s] + 4 + counts[s] * 4, socket);
+    ++counts[s];
+    ++total;
+  }
+  for (uint32_t s = 0; s < 3; ++s) {
+    if (sets[s]) StoreBE32(base + sets[s], counts[s]);
+  }
+  ctx.r3.u64 = total;
+}
+
+// FIONBIO's Winsock code means nothing to the POSIX ioctl, so non-blocking
+// mode never took effect and recv could stall the game thread.
+extern "C" REX_FUNC(__imp__NetDll_ioctlsocket) {
+  NHL3ON3_ORIGINAL(__imp__NetDll_ioctlsocket);
+  constexpr uint32_t kFionbio = 0x8004667E;
+  constexpr uint32_t kFionread = 0x4004667F;
+  const uint32_t socket = ctx.r4.u32, cmd = ctx.r5.u32, argp = ctx.r6.u32;
+  NativeSocket native;
+  if ((cmd != kFionbio && cmd != kFionread) || !argp || !NativeHandle(socket, native)) {
+    original(ctx, base);
+    return;
+  }
+  if (cmd == kFionbio) {
+    const int flags = ::fcntl(native, F_GETFL, 0);
+    const bool on = LoadBE32(base + argp) != 0;
+    if (flags < 0 || ::fcntl(native, F_SETFL, on ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) < 0) {
+      t_forced_error = 10022;
+      ctx.r3.u64 = 0xFFFFFFFF;
+      return;
+    }
+  } else {
+    int pending = 0;
+    if (::ioctl(native, FIONREAD, &pending) < 0) {
+      t_forced_error = 10022;
+      ctx.r3.u64 = 0xFFFFFFFF;
+      return;
+    }
+    StoreBE32(base + argp, uint32_t(std::max(pending, 0)));
+  }
+  ctx.r3.u64 = 0;
+}
+#endif
 
 extern "C" REX_FUNC(__imp__NetDll_shutdown) {
   NHL3ON3_ORIGINAL(__imp__NetDll_shutdown);
