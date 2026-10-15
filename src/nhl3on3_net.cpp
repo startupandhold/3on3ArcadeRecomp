@@ -1197,11 +1197,13 @@ bool NativeHandle(uint32_t socket, NativeSocket& out) {
 
 // The runtime's stream recv/send can fail without setting a socket error, so
 // the guest reads whatever the thread last left behind (e.g. 2 from a missing
-// game file) and DirtySDK drops the lobby connection. A non-Winsock code is
+// game file, or 0x8007065B from an unimplemented XSession call when a player
+// leaves) and DirtySDK drops the lobby connection. A non-Winsock code is
 // replaced by the socket's real pending error, or WSAEWOULDBLOCK if none.
 uint32_t ResolveStaleSocketError(uint32_t socket, uint32_t error) {
   constexpr uint32_t kSdkWouldBlock = 31;
-  if (error >= 10000 || error == kSdkWouldBlock || error == 996 || error == 997) {
+  const bool winsock = error >= 10000 && error < 12000;
+  if (winsock || error == kSdkWouldBlock || error == 996 || error == 997) {
     return error;
   }
   NativeSocket native;
@@ -1748,10 +1750,11 @@ extern "C" REX_FUNC(sub_827623F0) {
 
 extern "C" void __imp__sub_82753958(PPCContext& __restrict ctx, uint8_t* base);
 
-// DirtySDK send-address remap(out, in) -> sockaddr to use. It rewrites a
-// peer's address to the online server's (NetConnStatus 'host'; 127.0.0.1 with
-// a local server), which sends peer traffic to the server instead of the
-// peer, so peers keep their own address (real, virtual or loopback).
+// DirtySDK send-address remap(out, in) -> sockaddr to use. It turns the
+// lobby's 127.0.0.1 into the online server's address, but also rewrites a
+// peer's address to the server's (127.0.0.1 with a local server), which sends
+// peer traffic to the server instead of the peer, so peers keep their own
+// address (real, virtual or another instance's loopback).
 extern "C" REX_FUNC(sub_82753958) {
   const uint32_t in = ctx.r4.u32;
   const uint32_t requested = in ? LoadBE32(base + in + 4) : 0;
@@ -1760,11 +1763,13 @@ extern "C" REX_FUNC(sub_82753958) {
   if (!Online() || !out || out == in || !requested) {
     return;
   }
-  const uint32_t server = State().server_ip, remapped = LoadBE32(base + out + 4);
-  const bool to_server = remapped == server || remapped == kLoopbackIp;
-  if (to_server && requested != remapped && requested != server &&
-      requested != State().local_ip) {
-    std::memcpy(base + out + 2, base + in + 2, 6);  // port and address
+  const uint32_t server = State().server_ip, local = State().local_ip;
+  const uint32_t remapped = LoadBE32(base + out + 4);
+  const bool peer = IsLoopback(requested)
+                        ? IsLoopback(local) && requested != kLoopbackIp
+                        : requested != server && requested != local;
+  if (peer && requested != remapped && (remapped == server || remapped == kLoopbackIp)) {
+    StoreBE32(base + out + 4, requested);
   }
 }
 
@@ -2055,6 +2060,10 @@ extern "C" REX_FUNC(__imp__XamUserReadProfileSettings) {
   original(ctx, base);
 }
 NHL3ON3_TRACE_PASSTHROUGH(XamUserCreateStatsEnumerator)
+NHL3ON3_TRACE_PASSTHROUGH(XamShowDeviceSelectorUI)
+NHL3ON3_TRACE_PASSTHROUGH(XamContentGetDeviceState)
+NHL3ON3_TRACE_PASSTHROUGH(XamContentCreateEx)
+NHL3ON3_TRACE_PASSTHROUGH(XamContentClose)
 NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetTitleID)
 NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetMachineID)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetStartup)

@@ -12,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 #include <rex/system/gpu_plugin.h>
@@ -36,11 +37,17 @@ class Nhl3on3App : public rex::ReXApp {
   // Settings come from nhl3on3.toml beside the executable (written by the
   // launcher) unless a config path was given.
   //
+  // Saves (the in-game options among them) go to user/ beside the executable
+  // unless --user_data_root says otherwise, so they stay with the game.
+  //
   // Without --game_data_root, look for game/ (installed layout) or
   // game/extracted/ (dev checkout) beside the executable or in any parent.
   void OnConfigurePaths(rex::PathConfig& paths) override {
     if (paths.config_path.empty()) {
       paths.config_path = rex::filesystem::GetExecutableFolder() / "nhl3on3.toml";
+    }
+    if (paths.user_data_root.empty()) {
+      paths.user_data_root = rex::filesystem::GetExecutableFolder() / "user";
     }
     if (!paths.game_data_root.empty()) {
       return;
@@ -76,6 +83,7 @@ class Nhl3on3App : public rex::ReXApp {
       }
     }
     nhl3on3::ApplyUiPatches(paths.game_data_root);
+    REXLOG_INFO("[game] saves in {}", paths.user_data_root.string());
     return paths;
   }
 
