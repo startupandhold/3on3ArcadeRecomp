@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <random>
 #include <string>
 #include <string_view>
@@ -842,7 +843,17 @@ extern "C" REX_FUNC(__imp__XMsgInProcessCall) {
   constexpr uint32_t kXLiveBaseApp = 0xFC;
   constexpr uint32_t kGetServiceInfo = 0x00058007;
   if (!Online() || ctx.r3.u32 != kXLiveBaseApp || ctx.r4.u32 != kGetServiceInfo) {
-    return original(ctx, base);
+    static std::mutex seen_mutex;
+    static std::set<uint64_t> seen;
+    const uint64_t key = (uint64_t(ctx.r3.u32) << 32) | ctx.r4.u32;
+    const uint32_t app = ctx.r3.u32, message = ctx.r4.u32;
+    original(ctx, base);
+    std::lock_guard lock(seen_mutex);
+    if (seen.insert(key).second) {
+      REXLOG_INFO("[save] XMsgInProcessCall(app {:X}, message {:X}) = {:X} (first call)", app,
+                  message, ctx.r3.u32);
+    }
+    return;
   }
   const uint32_t service_id = ctx.r5.u32, info = ctx.r6.u32;
   const uint16_t port = uint16_t(REXCVAR_GET(online_service_port));
@@ -2060,10 +2071,24 @@ extern "C" REX_FUNC(__imp__XamUserReadProfileSettings) {
   original(ctx, base);
 }
 NHL3ON3_TRACE_PASSTHROUGH(XamUserCreateStatsEnumerator)
-NHL3ON3_TRACE_PASSTHROUGH(XamShowDeviceSelectorUI)
-NHL3ON3_TRACE_PASSTHROUGH(XamContentGetDeviceState)
-NHL3ON3_TRACE_PASSTHROUGH(XamContentCreateEx)
-NHL3ON3_TRACE_PASSTHROUGH(XamContentClose)
+
+// Save data calls, logged every time, online or not.
+#define NHL3ON3_SAVE_TRACE(name)                                                         \
+  extern "C" REX_FUNC(__imp__##name) {                                                   \
+    NHL3ON3_ORIGINAL(__imp__##name);                                                     \
+    const uint32_t a[4] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};              \
+    original(ctx, base);                                                                 \
+    REXLOG_INFO("[save] " #name "({:X}, {:X}, {:X}, {:X}) = {:X}", a[0], a[1], a[2], a[3], \
+                ctx.r3.u32);                                                             \
+  }
+NHL3ON3_SAVE_TRACE(XamShowDeviceSelectorUI)
+NHL3ON3_SAVE_TRACE(XamContentGetDeviceState)
+NHL3ON3_SAVE_TRACE(XamContentGetDeviceData)
+NHL3ON3_SAVE_TRACE(XamContentCreateEnumerator)
+NHL3ON3_SAVE_TRACE(XamContentCreateEx)
+NHL3ON3_SAVE_TRACE(XamContentClose)
+NHL3ON3_SAVE_TRACE(XamContentDelete)
+NHL3ON3_SAVE_TRACE(XMsgStartIORequest)
 NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetTitleID)
 NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetMachineID)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetStartup)

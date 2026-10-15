@@ -17,6 +17,10 @@ LKEY = "3fcf27540c92935b0a66fd3b0000283c"
 ROOM_ID = 1
 RANKED_SYSFLAG = 1 << 18
 MAX_FRAME = 64 * 1024
+# The lobby is silent for a whole match, so neither side may give up on an
+# idle connection sooner than a match can last.
+IDLE_MS = 24 * 60 * 60 * 1000
+READ_TIMEOUT = 6 * 60 * 60
 # Unranked quick match is team play: a game opens once two players search, and
 # later searchers join it (on Select Sides) until the host starts it, up to
 # this many consoles and players (guests included; 3 per side).
@@ -170,7 +174,7 @@ class Lobby:
         buffer = b""
         try:
             while True:
-                data = await asyncio.wait_for(reader.read(65536), timeout=900)
+                data = await asyncio.wait_for(reader.read(65536), timeout=READ_TIMEOUT)
                 if not data:
                     break
                 buffer += data
@@ -441,7 +445,10 @@ class Lobby:
                 client.signed_in = True
             return [lobby_frame(b"pers", {
                 "PERS": name, "NAME": name, "LKEY": LKEY, "EX-ticker": "", "LOC": "enUS",
-                "A": client.ip, "LA": client.ip, "IDLE": 600000,
+                "A": client.ip, "LA": client.ip,
+                # Milliseconds without lobby traffic before the game drops
+                # the connection itself.
+                "IDLE": IDLE_MS,
             }), self.room_frame(), self.who_frame(client)]
         if cmd == b"~png":
             return [lobby_frame(b"~png", request)]
