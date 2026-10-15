@@ -3,7 +3,7 @@
 A native Windows and Linux port of **3 on 3 NHL Arcade** (Xbox Live Arcade,
 2009), statically recompiled from the Xbox 360 executable with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs without an emulator, at higher
-resolutions and frame rates, with ultrawide support and online play.
+resolutions and frame rates, with ultrawide (WIP) support and online play.
 
 **No game content is included.** You need your own copy of the game: the
 release only contains the recompiled engine, and you add the game files to it.
