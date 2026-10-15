@@ -38,6 +38,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_lockstep_relay.cpp
     src/nhl3on3_ui.cpp
     src/nhl3on3_ui_patch.cpp
+    src/nhl3on3_stfs.cpp
     src/nhl3on3_team_lobby.cpp
 )
 

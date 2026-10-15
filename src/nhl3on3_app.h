@@ -6,6 +6,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <optional>
 #include <string_view>
 
 #include <rex/cvar.h>
@@ -17,6 +19,7 @@
 #include <rex/ui/window.h>
 
 #include "nhl3on3_display.h"
+#include "nhl3on3_stfs.h"
 #include "nhl3on3_ui_patch.h"
 #include <rex/system/xmemory.h>
 
@@ -57,9 +60,26 @@ class Nhl3on3App : public rex::ReXApp {
     }
   }
 
-  void OnPreSetup(rex::RuntimeConfig& config) override {
-    nhl3on3::ApplyUiPatches(game_data_root());
+  // A game/ folder holding the Xbox 360 package instead of the extracted
+  // files is unpacked here, on first launch (logging is up by now), and the
+  // front-end mod is applied. OnPreSetup runs earlier, before this.
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)>) override {
+    rex::PathConfig paths = defaults;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(paths.game_data_root / "default.xex", ec)) {
+      const auto game_dir = paths.game_data_root.empty()
+                                ? rex::filesystem::GetExecutableFolder() / "game"
+                                : paths.game_data_root;
+      if (nhl3on3::ExtractGamePackage(game_dir)) {
+        paths.game_data_root = game_dir;
+      }
+    }
+    nhl3on3::ApplyUiPatches(paths.game_data_root);
+    return paths;
+  }
 
+  void OnPreSetup(rex::RuntimeConfig& config) override {
     // Full XBLA license instead of the trial (same as Xenia's license_mask=1).
     SetDefaultFlag("license_mask", "1");
 
