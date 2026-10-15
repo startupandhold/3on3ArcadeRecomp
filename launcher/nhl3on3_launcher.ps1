@@ -11,6 +11,12 @@ $Exe = Join-Path $Dir 'nhl3on3.exe'
 $ConfigPath = Join-Path $Dir 'nhl3on3.toml'
 $ArgsPath = Join-Path $Dir 'nhl3on3_launcher_args.txt'
 
+# Files unpacked from a downloaded zip carry the "downloaded from the internet"
+# mark, which makes Windows ask before every start of the unsigned game.
+Get-ChildItem -LiteralPath $Dir -File |
+  Where-Object { $_.Extension -in '.exe', '.dll' } |
+  Unblock-File -ErrorAction SilentlyContinue
+
 # Kind: bool | choice (fixed list) | edit (list or typed value) | text | size
 # Toml: how the value is written (bool, int, string).
 # Choices: value = label pairs, in display order.

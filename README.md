@@ -66,7 +66,10 @@ After the first run you can also start `nhl3on3.exe` / `nhl3on3` directly; it
 uses the saved settings.
 
 On Windows, SmartScreen may warn about an unrecognized app the first time.
-Choose **More info**, then **Run anyway**.
+Choose **More info**, then **Run anyway**. The game isn't code-signed, so
+Windows may also show an "Open File - Security Warning" when you start
+`nhl3on3.exe` directly; the launcher clears that for you, or right-click the
+exe, choose **Properties**, and tick **Unblock**.
 
 ## Getting the game files
 

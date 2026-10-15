@@ -34,4 +34,7 @@ Folder contents:
   game\                        put the game here
 
 Windows SmartScreen may warn about an unrecognized app the first time; choose
-"More info" and then "Run anyway".
+"More info" and then "Run anyway". The game isn't code-signed: if Windows asks
+"Are you sure you want to run this software?" when you start nhl3on3.exe
+directly, start it through the launcher once (it clears this), or right-click
+nhl3on3.exe, choose Properties and tick "Unblock".
