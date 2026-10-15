@@ -20,6 +20,7 @@
 #include <rex/ui/window.h>
 
 #include "nhl3on3_display.h"
+#include "nhl3on3_settings.h"
 #include "nhl3on3_stfs.h"
 #include "nhl3on3_ui_patch.h"
 #include <rex/system/xmemory.h>
@@ -43,6 +44,7 @@ class Nhl3on3App : public rex::ReXApp {
     if (paths.config_path.empty()) {
       paths.config_path = rex::filesystem::GetExecutableFolder() / "nhl3on3.toml";
     }
+    nhl3on3::SetConfigPath(paths.config_path);
     if (!paths.game_data_root.empty()) {
       return;
     }
@@ -141,6 +143,21 @@ class Nhl3on3App : public rex::ReXApp {
       return;
     }
     rex::ui::ProcessKeyEvent(e);
+  }
+
+  // The mouse is unused in game, so its cursor is hidden while fullscreen.
+  // Entering or leaving fullscreen resizes the window.
+  void OnWindowResized(uint32_t, uint32_t) override { UpdateCursor(); }
+  void OnWindowFocusChanged(bool) override { UpdateCursor(); }
+
+  void UpdateCursor() {
+    if (auto* w = window()) {
+      using Visibility = rex::ui::Window::CursorVisibility;
+      const auto wanted = w->IsFullscreen() ? Visibility::kHidden : Visibility::kVisible;
+      if (w->GetCursorVisibility() != wanted) {
+        w->SetCursorVisibility(wanted);
+      }
+    }
   }
 
   // Changes a cvar's default without overriding a value from the command line

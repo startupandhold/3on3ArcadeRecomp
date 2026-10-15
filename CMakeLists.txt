@@ -40,6 +40,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_ui_patch.cpp
     src/nhl3on3_stfs.cpp
     src/nhl3on3_save_trace.cpp
+    src/nhl3on3_settings.cpp
     src/nhl3on3_team_lobby.cpp
 )
 
