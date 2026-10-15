@@ -1748,20 +1748,23 @@ extern "C" REX_FUNC(sub_827623F0) {
 
 extern "C" void __imp__sub_82753958(PPCContext& __restrict ctx, uint8_t* base);
 
-// DirtySDK send-address remap(out, in) -> sockaddr to use. It rewrites peer
-// addresses to 127.0.0.1, which on one PC hides which instance a packet is
-// for, and through the tunnel hides that it is for a peer at all; peers keep
-// their own loopback or virtual address instead.
+// DirtySDK send-address remap(out, in) -> sockaddr to use. It rewrites a
+// peer's address to the online server's (NetConnStatus 'host'; 127.0.0.1 with
+// a local server), which sends peer traffic to the server instead of the
+// peer, so peers keep their own address (real, virtual or loopback).
 extern "C" REX_FUNC(sub_82753958) {
   const uint32_t in = ctx.r4.u32;
   const uint32_t requested = in ? LoadBE32(base + in + 4) : 0;
   __imp__sub_82753958(ctx, base);
   const uint32_t out = ctx.r3.u32;
-  const bool loopback_peer =
-      IsLoopback(State().local_ip) && IsLoopback(requested) && requested != kLoopbackIp;
-  if (Online() && out && out != in && (loopback_peer || IsTunnelAddress(requested)) &&
-      LoadBE32(base + out + 4) == kLoopbackIp) {
-    StoreBE32(base + out + 4, requested);
+  if (!Online() || !out || out == in || !requested) {
+    return;
+  }
+  const uint32_t server = State().server_ip, remapped = LoadBE32(base + out + 4);
+  const bool to_server = remapped == server || remapped == kLoopbackIp;
+  if (to_server && requested != remapped && requested != server &&
+      requested != State().local_ip) {
+    std::memcpy(base + out + 2, base + in + 2, 6);  // port and address
   }
 }
 
