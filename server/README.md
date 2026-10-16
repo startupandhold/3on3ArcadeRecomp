@@ -8,7 +8,7 @@ play needs:
 - **Tunnel** (UDP 3670): each game registers and gets a virtual address
   (`10.66.x.y`). All traffic between players goes through the server, so
   nobody has to forward ports, and players behind any home router can play.
-- **Lockstep relay host**: in team play (3–6 consoles) the server combines
+- **Lockstep relay host**: in team play (3–8 consoles) the server combines
   every console's input into frames. No player acts as host, so none has a
   latency advantage.
 
@@ -24,9 +24,9 @@ There is nothing to configure:
 - **Online Team Play** (the renamed unranked quick match) opens a game as soon
   as two players search, and both land on Select Sides. Anyone else who
   searches while that game is open joins it and appears on Select Sides too.
-  The host starts the match once everyone is ready. A game can have up to 6
-  consoles and 6 players (guests count, 3 per side). After it starts, new
-  searchers wait for, or open, the next game.
+  The host starts the match once everyone is ready. A game can have up to 8
+  consoles and 8 players (guests count; 3 skaters and a goalie per side).
+  After it starts, new searchers wait for, or open, the next game.
 
 ## Hosting on Fly.io
 

@@ -23,9 +23,10 @@ IDLE_MS = 24 * 60 * 60 * 1000
 READ_TIMEOUT = 6 * 60 * 60
 # Unranked quick match is team play: a game opens once two players search, and
 # later searchers join it (on Select Sides) until the host starts it, up to
-# this many consoles and players (guests included; 3 per side).
-TEAM_MAX_CONSOLES = 6
-TEAM_MAX_PLAYERS = 6
+# this many consoles and players (guests included; 3 skaters and a goalie
+# per side).
+TEAM_MAX_CONSOLES = 8
+TEAM_MAX_PLAYERS = 8
 # The game only starts listening for +who/+mgm once it has handled the gqwk
 # reply, which can take a frame; notifications that arrive in the same read
 # as the reply are missed and the search never ends.

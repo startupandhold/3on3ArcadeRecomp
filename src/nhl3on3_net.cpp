@@ -85,13 +85,13 @@ REXCVAR_DEFINE_INT32(online_local_users, 1, "NHL3on3/Online",
     .range(1, 4)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(team_play, 6, "NHL3on3/Online",
-                     "Most consoles in an online team play match (3-6). Team play is the "
+REXCVAR_DEFINE_INT32(team_play, 8, "NHL3on3/Online",
+                     "Most consoles in an online team play match (3-8). Team play is the "
                      "online menu's ONLINE TEAM PLAY entry (the renamed unranked quick "
                      "match): the server opens a game once two players search, others "
                      "join it on Select Sides, and it starts when everyone is ready. "
                      "0 = off (unranked is the stock two-console game)")
-    .range(0, 6)
+    .range(0, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(online_tunnel, true, "NHL3on3/Online",

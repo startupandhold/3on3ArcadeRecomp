@@ -58,6 +58,11 @@
 #include <rex/system/xmemory.h>
 
 REXCVAR_DECLARE(int32_t, team_play);
+REXCVAR_DECLARE(int32_t, goalie_test);
+
+REXCVAR_DEFINE_BOOL(play_goalie, false, "NHL3on3/Online",
+                    "Ask to play goalie in online team play (the first player on a side to "
+                    "ask gets it; otherwise a side's fourth player is its goalie)");
 
 bool Nhl3on3RankedSearch();
 
@@ -76,7 +81,10 @@ using Clock = std::chrono::steady_clock;
 constexpr uint32_t kOnlineGlobal = 0x83211FCC;  // +84: the game setup adaptor
 constexpr uint32_t kSendToPeersSlot = 28;       // adaptor virtual (adaptor, text)
 constexpr uint32_t kMaxPlayers = 12;
-constexpr uint32_t kMaxPerSide = 3;
+constexpr uint32_t kMaxPerSide = 4;  // three skaters and a goalie
+// Lock value a player sends to ask for goalie; the position lock screen only
+// has none (0), C, LW and RW.
+constexpr int kGoalieLock = 15;
 constexpr auto kResend = std::chrono::seconds(1);
 constexpr auto kLockResend = std::chrono::milliseconds(250);
 
@@ -322,6 +330,9 @@ int EffectiveLock(const Lobby& lobby, uint32_t index) {
     return -1;
   }
   const int lock = lobby.players[index].lock;
+  if (lock == kGoalieLock) {
+    return 0;
+  }
   for (uint32_t i = 0; lock > 0 && i < index; ++i) {
     if (lobby.players[i].lock == lock && EffectiveSide(lobby, i) == EffectiveSide(lobby, index)) {
       return 0;
@@ -330,10 +341,38 @@ int EffectiveLock(const Lobby& lobby, uint32_t index) {
   return lock;
 }
 
+// The goalie of `side`, in session order so every console agrees: the first
+// player there who asked for it, else the fourth player (a side's skaters
+// are full at three); goalie_test makes it the side's first player. -1: none.
+int GoalieOf(const Lobby& lobby, uint32_t side) {
+  int first = -1, last = -1;
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < lobby.count; ++i) {
+    if (EffectiveSide(lobby, i) != side) {
+      continue;
+    }
+    if (i < lobby.players.size() && lobby.players[i].lock == kGoalieLock) {
+      return int(i);
+    }
+    first = first < 0 ? int(i) : first;
+    last = int(i);
+    ++count;
+  }
+  if (REXCVAR_GET(goalie_test) == int32_t(side)) {
+    return first;
+  }
+  return count >= kMaxPerSide ? last : -1;
+}
+
+// The lock the local player reports: the screen's, or goalie if asked for.
+int LocalLock(int screen_lock) {
+  return REXCVAR_GET(play_goalie) ? kGoalieLock : screen_lock;
+}
+
 // Answers one request; returns the text the script gets back.
 std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
   if (code == 130) {
-    const int32_t lock = ArgNumber(ctx, base, 1);
+    const int32_t lock = LocalLock(ArgNumber(ctx, base, 1));
     std::string message;
     {
       std::lock_guard lock_guard(g_lobby.mutex);
@@ -487,6 +526,11 @@ int LockOf(uint32_t index) {
   return EffectiveLock(g_lobby, index);
 }
 
+bool IsGoalie(uint32_t index) {
+  std::lock_guard lock(g_lobby.mutex);
+  return GoalieOf(g_lobby, EffectiveSide(g_lobby, index)) == int(index);
+}
+
 bool PositionsReady(const PPCContext& ctx, uint8_t* base) {
   std::string message;
   bool ready = true;
@@ -594,7 +638,7 @@ extern "C" REX_FUNC(sub_82AC92A0) {
         user != std::string::npos && at != std::string::npos) {
       const std::string name = record.substr(user + 14, record.find('|', user) - user - 14);
       if (name == lobby.players[lobby.local].name) {
-        SetLock(lobby, lobby.local, ParseInt(std::string_view(record).substr(at + 3)));
+        SetLock(lobby, lobby.local, LocalLock(ParseInt(std::string_view(record).substr(at + 3))));
         lobby.last_lock_send = Clock::now();
         message = LockMessage(lobby);
       }

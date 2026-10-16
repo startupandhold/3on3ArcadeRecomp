@@ -79,6 +79,7 @@ class Nhl3on3App : public rex::ReXApp {
       }
     }
     nhl3on3::ApplyUiPatches(paths.game_data_root);
+    nhl3on3::InstallTextFont(paths.game_data_root);
     REXLOG_INFO("[game] saves in {}", paths.user_data_root.string());
     return paths;
   }

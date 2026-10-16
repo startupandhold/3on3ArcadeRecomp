@@ -13,8 +13,8 @@ primary_region = "yyz"
 # Lobby and matchmaking state lives in memory, so exactly one machine runs
 # and it never sleeps.
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = "shared-cpu-2x"
+  memory = "512mb"
 
 [[services]]
   protocol = "tcp"

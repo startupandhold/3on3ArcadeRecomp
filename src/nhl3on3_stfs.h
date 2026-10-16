@@ -11,4 +11,9 @@ namespace nhl3on3 {
 // Port of tools/_stfs_reader.py.
 bool ExtractGamePackage(const std::filesystem::path& game_dir);
 
+// The front end draws runtime text (names, popups, the copyright line) with
+// fe/ion/fonts/arial.ttf, which the XBLA package does not contain. Copies the
+// system's Arial (or a metric-compatible substitute on Linux) there if missing.
+void InstallTextFont(const std::filesystem::path& game_dir);
+
 }  // namespace nhl3on3

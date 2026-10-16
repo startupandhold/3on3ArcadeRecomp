@@ -21,6 +21,10 @@ uint32_t LineupOf(uint32_t index);
 // record, shared between consoles; -1 if not known yet.
 int LockOf(uint32_t index);
 
+// Whether the player at `index` is their side's goalie: the first there to
+// ask for it (play_goalie), else a side's fourth player.
+bool IsGoalie(uint32_t index);
+
 // True once every player's position lock is known; until then, resends the
 // local one now and then (needs the game thread's context).
 bool PositionsReady(const PPCContext& ctx, uint8_t* base);

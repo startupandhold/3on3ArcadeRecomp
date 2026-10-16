@@ -14,6 +14,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -49,6 +51,25 @@ REXCVAR_DEFINE_INT32(dist_mode, 0, "NHL3on3/Debug",
                      "Force the match's lockstep mode when the dist module is built "
                      "(3 = 12-slot multi-console module, 6 = normal 1v1; 0 = game's choice)")
     .range(0, 16);
+
+REXCVAR_DEFINE_INT32(goalie_test, -1, "NHL3on3/Debug",
+                     "Experiment: the first player on this side (0 = blue, 1 = red) plays "
+                     "goalie. Every console in the match must use the same value; -1 = off")
+    .range(-1, 1);
+
+REXCVAR_DEFINE_BOOL(goalie_camera, false, "NHL3on3/Debug",
+                    "Use the Be-A-Pro goalie cameras (Goalie Low/High) when this console "
+                    "controls a goalie; false keeps the normal game camera");
+
+REXCVAR_DEFINE_STRING(goalie_cam_tune, "64=23", "NHL3on3/Debug",
+                      "Overrides for the camera behind a human goalie, as byte offset=value "
+                      "pairs separated by ',' (64 = centre ice to the boards behind the "
+                      "camera, stock 30); empty = stock");
+
+REXCVAR_DEFINE_STRING(goalie_cam_pose, "", "NHL3on3/Debug",
+                      "Added to the goalie camera's final pose as six numbers separated by "
+                      "',' (position x, y, z, then three angles in degrees, in the order "
+                      "the '[camera] goalie pose' log line shows)");
 
 extern "C" {
 REX_FUNC(__imp__sub_827582E8);
@@ -488,6 +509,12 @@ constexpr uint32_t kMatchMode = 0x82FB6008;
 constexpr uint32_t kSideKey = 0x82FB559C;
 constexpr uint32_t kLineupKey = 0x82FB55A4;
 constexpr uint32_t kPadKey = 0x82FB55A8;
+// 'P' value the team play roster step gives a side's goalie. The entry step
+// (sub_825190B8) maps P through sub_82512D88 to a position (1 C, 2 LW, 3 RW,
+// else none), so the value is swapped for none there and the entry built
+// next gets the goalie position.
+constexpr uint32_t kGoaliePad = 7;
+thread_local bool g_next_entry_goalie = false;
 
 // Mode 3 expects each member's side to come from lobby team selection, which
 // team play skips; the roster step then waits on it until it times out.
@@ -643,6 +670,9 @@ extern "C" REX_FUNC(sub_82B80820) {
     if (lock >= 0) {
       ctx.r5.u64 = uint32_t(lock);
     }
+    if (nhl3on3::team_lobby::IsGoalie(index)) {
+      ctx.r5.u64 = kGoaliePad;
+    }
     REXLOG_INFO("[dist] team play: member {:08X} (#{}) on side {}, lineup {}, position {} "
                 "(stock {})",
                 self, assign.next - 1, side, assign.lineup, ctx.r5.s32, int32_t(value));
@@ -660,6 +690,171 @@ extern "C" REX_FUNC(sub_82B80820) {
                                  Nhl3on3GuestBacktrace(ctx, base)));
   }
   __imp__sub_82B80820(ctx, base);
+}
+
+// Player entry builder (table, side, r5, r6, position, name, flag): appends a
+// 60-byte entry (position at +48) to the 12-slot user table at 0x82FB6014,
+// whose count is at +48. Positions follow the game's name table at
+// 0x82066C74: G 0, LD 1, RD 2, LW 3, C 4, RW 5; arcade locks give C 4,
+// "LW" 1 and "RW" 2, and -1 is no lock. Each console adds its own players
+// first, so entry order differs between consoles; the side does not.
+extern "C" REX_FUNC(__imp__sub_82513E98);
+extern "C" REX_FUNC(sub_82513E98) {
+  const uint32_t table = ctx.r3.u32;
+  const uint32_t index = Load32(base, table + 48);
+  const int32_t stock = ctx.r7.s32;
+  if (g_next_entry_goalie) {
+    g_next_entry_goalie = false;
+    ctx.r7.u64 = 0;
+  }
+  REXLOG_INFO("[roster] entry #{}: side {}, r5 {}, r6 {}, position {}{}, name {:08X}, flag {}",
+              index, ctx.r4.s32, ctx.r5.s32, ctx.r6.s32, ctx.r7.s32,
+              ctx.r7.s32 != stock ? fmt::format(" (goalie, stock {})", stock) : "",
+              ctx.r8.u32, ctx.r9.u32 & 0xFF);
+  __imp__sub_82513E98(ctx, base);
+}
+
+// Member 'P' attribute (roster, member, default) -> value; see kGoaliePad.
+extern "C" REX_FUNC(__imp__sub_82512D88);
+extern "C" REX_FUNC(sub_82512D88) {
+  constexpr uint32_t kEntryStepStart = 0x825190B8, kEntryStepEnd = 0x825191C0;
+  const uint32_t lr = uint32_t(ctx.lr);
+  __imp__sub_82512D88(ctx, base);
+  if (ctx.r3.u32 == kGoaliePad) {
+    ctx.r3.u64 = 0;
+    if (lr >= kEntryStepStart && lr < kEntryStepEnd) {
+      g_next_entry_goalie = true;
+    }
+  }
+}
+
+// Be-A-Pro cameras. The camera mode setters (sub_8250F0B0, sub_8250F328,
+// sub_8250F8A8) switch to Be-A-Pro mode when sub_823FAED8(5) or sub_8250E110()
+// is true, which a human goalie makes so, and then pick camera 8, 9 or 10
+// (sub_8250F018 chooses between them). Those are placed for a full-size rink
+// and end up outside the arcade rink's boards; answering false to the setters
+// keeps them on the camera chosen in the options.
+namespace {
+constexpr uint32_t kCameraSettersStart = 0x8250F0B0, kCameraSettersEnd = 0x8250FB60;
+
+bool KeepNormalCamera(const PPCContext& ctx) {
+  const uint32_t lr = uint32_t(ctx.lr);
+  return !REXCVAR_GET(goalie_camera) && lr >= kCameraSettersStart && lr < kCameraSettersEnd;
+}
+}  // namespace
+
+extern "C" REX_FUNC(__imp__sub_823FAED8);
+extern "C" REX_FUNC(sub_823FAED8) {
+  if (KeepNormalCamera(ctx)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_823FAED8(ctx, base);
+}
+
+extern "C" REX_FUNC(__imp__sub_8250E110);
+extern "C" REX_FUNC(sub_8250E110) {
+  if (KeepNormalCamera(ctx)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_8250E110(ctx, base);
+}
+
+// Camera behind a human goalie (sub_824F8B48, picked over sub_82509DE8's AI
+// goalie camera by sub_8250D900). It reads one of four 120-byte float tables
+// at 0x82FB3E28 (stride 0x78, chosen by sub_8250DFA0 and the high/low flag).
+// +64 is the distance from centre ice to the end boards it places the camera
+// against: 30, a full-size rink, which is outside the arcade rink's boards.
+constexpr uint32_t kHumanGoalieCamTables[] = {0x82FB3E28, 0x82FB3EA0, 0x82FB3F18, 0x82FB3F90};
+
+extern "C" REX_FUNC(__imp__sub_824F8B48);
+extern "C" REX_FUNC(sub_824F8B48) {
+  static std::string applied;
+  const std::string tune = REXCVAR_GET(goalie_cam_tune);
+  if (tune != applied) {
+    applied = tune;
+    std::string_view rest = tune;
+    while (!rest.empty()) {
+      const size_t comma = rest.find(',');
+      const std::string_view pair = rest.substr(0, comma);
+      rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+      const size_t eq = pair.find('=');
+      if (eq == std::string_view::npos) {
+        continue;
+      }
+      const uint32_t offset = uint32_t(std::strtoul(std::string(pair.substr(0, eq)).c_str(), nullptr, 0));
+      const float value = std::strtof(std::string(pair.substr(eq + 1)).c_str(), nullptr);
+      if (offset >= 120 || offset % 4) {
+        continue;
+      }
+      uint32_t bits;
+      std::memcpy(&bits, &value, 4);
+      for (const uint32_t table : kHumanGoalieCamTables) {
+        Store32(base, table + offset, bits);
+      }
+      REXLOG_INFO("[camera] goalie camera +{} = {}", offset, value);
+    }
+  }
+  __imp__sub_824F8B48(ctx, base);
+}
+
+// Render camera pose getter (camera, &a, &b, &c, &d, &e, &f): copies six
+// floats from camera +40..+60, a position (+40..+48) and three angles in
+// degrees, for the render setup (sub_82B76100). While the goalie camera
+// (type 9 or 10) is on, goalie_cam_pose is added to them and they are logged.
+extern "C" REX_FUNC(__imp__sub_82B78528);
+extern "C" REX_FUNC(sub_82B78528) {
+  __imp__sub_82B78528(ctx, base);
+  const uint32_t type = Load32(base, 0x83178600 + 36);
+  if (type != 9 && type != 10) {
+    return;
+  }
+  const uint32_t out[6] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                           ctx.r7.u32, ctx.r8.u32, ctx.r9.u32};
+  auto get = [&](int i) {
+    const uint32_t bits = Load32(base, out[i]);
+    float v;
+    std::memcpy(&v, &bits, 4);
+    return v;
+  };
+  static std::string parsed_text;
+  static float offsets[6] = {};
+  const std::string text = REXCVAR_GET(goalie_cam_pose);
+  if (text != parsed_text) {
+    parsed_text = text;
+    std::string_view rest = text;
+    for (float& o : offsets) {
+      const size_t comma = rest.find(',');
+      o = rest.empty() ? 0.0f : std::strtof(std::string(rest.substr(0, comma)).c_str(), nullptr);
+      rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+    }
+  }
+  for (int i = 0; i < 6; ++i) {
+    if (offsets[i] != 0.0f) {
+      const float v = get(i) + offsets[i];
+      uint32_t bits;
+      std::memcpy(&bits, &v, 4);
+      Store32(base, out[i], bits);
+    }
+  }
+  static std::chrono::steady_clock::time_point last{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last >= std::chrono::seconds(2)) {
+    last = now;
+    REXLOG_INFO("[camera] goalie pose (camera {:08X}): position {:.2f} {:.2f} {:.2f}, "
+                "angles {:.1f} {:.1f} {:.1f}",
+                ctx.r3.u32, get(0), get(1), get(2), get(3), get(4), get(5));
+  }
+}
+
+extern "C" REX_FUNC(__imp__sub_8250F018);
+extern "C" REX_FUNC(sub_8250F018) {
+  if (KeepNormalCamera(ctx)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_8250F018(ctx, base);
 }
 
 NET_SETUP_STATUS_WRITER(sub_825127A8)

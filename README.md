@@ -113,7 +113,9 @@ default, and **Connect through server** relays game traffic through it, so no
 port forwarding is needed. If a gamertag is already in use, the server adds
 a number to the second one (`turtle` becomes `turtle2`).
 
-Up to three players per team; every player needs the same release version.
+Up to three skaters and a goalie per team; every player needs the same
+release version. A team's fourth player plays goalie, or set `--play_goalie=true`
+(Extra arguments) to ask for it.
 To run your own server, see [server/README.md](server/README.md).
 
 ## Troubleshooting

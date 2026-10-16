@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -208,6 +209,39 @@ bool ExtractGamePackage(const fs::path& game_dir) {
     return true;
   }
   return false;
+}
+
+void InstallTextFont(const fs::path& game_dir) {
+  std::error_code ec;
+  const fs::path target = game_dir / "fe" / "ion" / "fonts" / "arial.ttf";
+  if (game_dir.empty() || !fs::is_directory(game_dir / "fe", ec) ||
+      fs::is_regular_file(target, ec)) {
+    return;
+  }
+  std::vector<fs::path> sources;
+#ifdef _WIN32
+  if (const char* windir = std::getenv("WINDIR")) {
+    sources.push_back(fs::path(windir) / "Fonts" / "arial.ttf");
+  }
+  sources.push_back("C:\\Windows\\Fonts\\arial.ttf");
+#else
+  for (const char* path : {"/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+                           "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                           "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+                           "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+                           "/usr/share/fonts/TTF/LiberationSans-Regular.ttf"}) {
+    sources.push_back(path);
+  }
+#endif
+  for (const fs::path& source : sources) {
+    if (!fs::is_regular_file(source, ec)) continue;
+    fs::create_directories(target.parent_path(), ec);
+    if (fs::copy_file(source, target, fs::copy_options::skip_existing, ec)) {
+      REXLOG_INFO("[game] copied {} to {}", source.string(), target.string());
+      return;
+    }
+  }
+  REXLOG_WARN("[game] no system Arial found; names and popups may be missing text");
 }
 
 }  // namespace nhl3on3
