@@ -169,6 +169,41 @@ def lobby_send(code, arg=None):
                           ("callNamedMethodPop", "GetControllerLogin")]
 
 
+# Names a patch needs that its constant pool lacks; the client returns name k
+# for GetControllerLogin(200 + k). Must match kScriptNames in
+# src/nhl3on3_team_lobby.cpp.
+SCRIPT_NAMES = ("lineupPanel", "m_mySide", "mcPositionLock", "getPosition", "setPosition",
+                "setConnectedStatus", "setText", "removePadding", "gControllerIDCurrentScreen",
+                "mPositions", "NAME", "mainFrame", "SelectSides", "StartingLineups")
+
+
+def script_name(n):
+    """Pushes the string `n` (from SCRIPT_NAMES)."""
+    return lobby_call([("pushShort", 200 + SCRIPT_NAMES.index(n))])
+
+
+def lobby_ready(title):
+    """Shows the lobby's title status line: mainFrame.setTitle(status,
+    ltxt(title)) when the status changed (the client names the method "-"
+    otherwise, which does nothing)."""
+    return [*script_name(title), ("pushOne",), ("pushConst", "ltxt"), ("callFunction",),
+            *lobby_call([("pushShort", 171)]),
+            ("pushByte", 2), *script_name("mainFrame"), ("getVariable",),
+            *lobby_call([("pushShort", 170)]), ("callMethod",), ("pop",)]
+
+
+def disable_calls(data, sites, pool, replacement):
+    """Chunks that point the name operand of each call at `sites` (address,
+    expected bytes) to `replacement`, a name nothing defines, so the call does
+    nothing. The instruction keeps its size."""
+    chunks = []
+    for at, want in sites:
+        expect(data, at, want)
+        op = {0xB2: "callNamedMethodPop", 0xA2: "pushConst", 0xA3: "pushConst"}[data[at]]
+        chunks.append(Chunk(at, at + len(bytes.fromhex(want)), [(op, replacement)]))
+    return chunks
+
+
 def patch_select_teams(apt_bytes, const_bytes):
     """onlineSelectTeams (the 'SELECT SIDES' screen).
 
@@ -186,6 +221,11 @@ def patch_select_teams(apt_bytes, const_bytes):
       panel is AWAY_INDEX; HOME_INDEX is only swapped by online league code.
     - every 250 ms a timer tells the client the player names and the local
       index, and redraws both panels' names, so other consoles' picks show.
+    - Ready: stock code marks a panel ready by host / client (the host's
+      ready on HOME_INDEX, any client's on AWAY_INDEX). Those calls are
+      disabled; the timer reports every player's ready flag and marks a
+      side's panel ready once everyone on it is, and in team play the title's
+      top line lists who is ready and who is still waited for.
 
     Space comes from code that is dead in this game: the function's opening
     trace, its interactive league block, the online league side check
@@ -315,6 +355,9 @@ def patch_select_teams(apt_bytes, const_bytes):
             *lobby_send([("pushRegister", 2), ("pushShort", 1000), ("add2",)],
                         [("pushValueOfVar", "m_aPlayers"), ("pushRegister", 2), ("getMember",),
                          ("getNamedMember", "core_username")]),
+            *lobby_send([("pushRegister", 2), ("pushShort", 1200), ("add2",)],
+                        [("pushRegister", 2), ("pushOne",), ("pushConst", "isUserReady"),
+                         ("callFunction",)]),
             ("pushRegister", 2), ("increment",), ("storeRegister", 2), ("pop",),
             ("jump", "player"),
             ("label", "panels"),
@@ -323,7 +366,13 @@ def patch_select_teams(apt_bytes, const_bytes):
                 ("pushOne",), ("pushValueOfVar", "m_arrPanels"),
                 ("pushValueOfVar", "AWAY_INDEX"), ("pushByte", side), ("bitXor",), ("getMember",),
                 ("callNamedMethodPop", "setGamerTag"),
+                # panel.setReady(everyone on the side ready), when that changed
+                *lobby_call([("pushShort", 164 + side)]), ("toNumber",),
+                ("pushOne",), ("pushValueOfVar", "m_arrPanels"),
+                ("pushValueOfVar", "AWAY_INDEX"), ("pushByte", side), ("bitXor",), ("getMember",),
+                *lobby_call([("pushShort", 160 + side)]), ("callMethod",), ("pop",),
             ]],
+            *lobby_ready("SelectSides"),
             # move the local puck when the local side changed
             *lobby_call([("pushByte", 102)]), ("toNumber",), ("storeRegister", 3), ("pop",),
             ("pushRegister", 3), ("pushZero",), ("less2",), ("branchIfTrue", "end"),
@@ -338,9 +387,16 @@ def patch_select_teams(apt_bytes, const_bytes):
             ("pushUndefined",), ("return",),
         ]),
     ]
+    # Stock panel ready marks: custom_HandleReadyMessage (2),
+    # custom_UpdateUserAttributes, clearReadyFlags (2), parseSetData (2), and
+    # the host's own unready / ready.
+    set_ready = "b2bd"  # callNamedMethodPop 'setReady'
+    ready_sites = [(at, set_ready) for at in (0x1935, 0x194A, 0x1C47, 0x291F, 0x2928, 0x2D95,
+                                              0x2DBA, 0x350B, 0x3C0E)]
+    chunks += disable_calls(data, ready_sites, pool, " HOST_INDEX ")
     assemble(data, chunks, pool)
     return bytes(data), [(func, body + size), (left, cases_end), (timer_func, timer_end),
-                         (0x1214, 0x125E)], 0xEBC
+                         (0x1214, 0x125E)] + [(at, at + 2) for at, _ in ready_sites], 0xEBC
 
 
 def patch_starting_lineups(apt_bytes, const_bytes):
@@ -358,6 +414,12 @@ def patch_starting_lineups(apt_bytes, const_bytes):
       it locked and its name, "SKATER (name)". An icon holds its skater like
       a local controller's, so the local player cannot pick a taken one.
     - updateUserList tells the client which players are on this console.
+    - Ready: stock code shows a side's READY when any one player there
+      readies, and on the host a client's ready always goes to the other
+      side. Those calls are disabled; the timer shows a side's READY once
+      everyone on it is ready (from the ready messages the client reads off
+      the wire), and in team play the title's top line lists who is ready
+      and who is still waited for.
 
     The screen's second action block holds updateUserList and two functions
     that only run for online leagues: LeagueEventHandler (becomes the timer)
@@ -385,12 +447,7 @@ def patch_starting_lineups(apt_bytes, const_bytes):
     # Variables for the timer id and the lock: event names only the replaced
     # league handler compared against.
     timer_var, lock_var = "EVENT_OL_LOAD_ROSTER_SUCCESS", "EVENT_OL_LOAD_MEMBERS_SUCCESS"
-    names = ("lineupPanel", "m_mySide", "mcPositionLock", "getPosition", "setPosition",
-             "setConnectedStatus", "setText", "removePadding", "gControllerIDCurrentScreen",
-             "mPositions", "NAME")
-
-    def name(n):
-        return [*lobby_call([("pushShort", 200 + names.index(n))])]
+    name = script_name
 
     def call(obj, method, args):
         """obj.method(*args), dropping the result."""
@@ -436,6 +493,12 @@ def patch_starting_lineups(apt_bytes, const_bytes):
             *[ins for j in range(3) for ins in [
                 ("pushByte", j), ("pushOne",), ("pushConst", "handleLeagueRosterCRC"),
                 ("callFunctionPop",)]],
+            # animateReady / animateNotReady(screen side) when a team side's
+            # "everyone ready" changed; screen side = 1 - team side
+            *[ins for side in (0, 1) for ins in [
+                ("pushByte", 1 - side), ("pushOne",), *lobby_call([("pushShort", 162 + side)]),
+                ("callFunction",), ("pop",)]],
+            *lobby_ready("StartingLineups"),
             ("pushUndefined",), ("return",),
         ]),
 
@@ -491,7 +554,15 @@ def patch_starting_lineups(apt_bytes, const_bytes):
                 ("pushConst", "OSDK_GameSetupAdaptor"), ("getVariable",),
                 ("pushConst", "GetControllerLogin"), ("callMethod",), ("subtract",)]
 
+    # Stock READY marks, per side for any one player: the host's own unready /
+    # ready (m_mySide), a client's ready on the host (m_otherSide, wrong for a
+    # teammate) and the host's update on clients.
+    animate_ready, animate_not_ready = "a301b9", "a301af"
+    ready_sites = [(0x3521, animate_not_ready), (0x3605, animate_ready),
+                   (0x361E, animate_not_ready), (0x3995, animate_ready),
+                   (0x39AE, animate_not_ready), (0x3CE9, animate_ready)]
     assemble(data, [
+        *disable_calls(data, ready_sites, pool1, "<no last screen id>"),
         Chunk(my_side, my_side_end, [
             ("pushConst", "m_mySide"),
             ("pushRegister", 1), ("pushConst", "gControllerIDCurrentScreen"), ("getMember",),

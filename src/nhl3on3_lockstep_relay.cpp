@@ -47,7 +47,7 @@ extern "C" REX_FUNC(sub_82515070);
 
 REXCVAR_DEFINE_INT32(lockstep_lead, 0, "NHL3on3/Online",
                      "Client inputs sent ahead of the frames played in a relayed match "
-                     "(each is one input period of delay); 0 = from the measured round trip");
+                     "(each is one input period of delay); 0 = from the measured turnaround");
 
 REXCVAR_DEFINE_BOOL(relay_timing, false, "NHL3on3/Online",
                     "Log relayed match timing every 600 frames: how long the local "
@@ -61,7 +61,8 @@ uint32_t Nhl3on3LocalIp();
 std::vector<uint32_t> Nhl3on3GamePeers();
 bool Nhl3on3TunnelActive();
 void Nhl3on3TunnelSendRelay(const uint8_t* data, size_t size);
-bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet);
+bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet,
+                               std::chrono::steady_clock::time_point& arrived);
 
 namespace nhl3on3::lockstep_relay {
 namespace {
@@ -87,7 +88,13 @@ constexpr size_t kMaxPacket = 1400;
 constexpr uint32_t kMaxInput = 252;  // the game's per-slot receive buffer
 constexpr uint32_t kMaxSlots = 12;
 constexpr uint32_t kWindow = 8;  // most local inputs sent ahead of the frames played
-constexpr uint32_t kMinLead = 2;
+constexpr uint32_t kMinLead = 1;
+constexpr double kMinMarginMs = 4.0;
+// After the first kSettleFrames, the lead drops only once it could have been
+// lower for this long; each input it drops stalls every console one period.
+constexpr uint32_t kSettleFrames = 120;
+constexpr uint32_t kPlayedSlots = 64;  // > kWindow
+constexpr auto kLowerAfter = std::chrono::seconds(3);
 constexpr auto kResend = std::chrono::milliseconds(20);
 constexpr uint32_t kDefaultRateMs = 16;  // if the dist has no input rate set
 
@@ -138,15 +145,20 @@ struct Relay {
   uint32_t frames_base = 0;
 
   // Client: local inputs [inputs_acked, inputs_sent) not yet taken by the host,
-  // and when each was queued.
+  // and when each could first be sent (frame N - lead played).
   std::deque<Input> unacked;
   std::deque<Clock::time_point> unacked_times;
-  // Client: smoothed time for the host to take an input, and the lead (inputs
-  // ahead of the frames played) that covers it. A client's input for frame N
-  // is sent once it plays frame N - lead, about when the host built that
-  // frame, so the host has it in time if lead input periods exceed the trip.
-  double rtt_ms = 0;
+  // Client: when each recent frame was played, by frame number mod kPlayedSlots.
+  Clock::time_point played_at[kPlayedSlots]{};
+  // Client: the input for frame N may be sent once frame N - lead is played,
+  // and frame N must be back by the time it is due, lead input periods later.
+  // turnaround_ms is the smoothed time from that send window opening to the
+  // frame arriving (the trip through the server plus waiting for the other
+  // consoles), turnaround_dev_ms its mean deviation.
+  double turnaround_ms = 0;
+  double turnaround_dev_ms = 0;
   uint32_t lead = kWindow;
+  Clock::time_point lower_since{};
   uint32_t inputs_acked = 0;
   uint32_t acked_sent = ~0u;
   Clock::time_point last_send{};
@@ -482,22 +494,36 @@ void HandleInputs(Reader& rd, uint8_t slot, const sockaddr_in& from) {
   }
 }
 
-// Client: the lead from lockstep_lead, or the round trip plus one period.
-void UpdateLead() {
+// Client: the lead from lockstep_lead, or enough input periods to cover the
+// turnaround plus twice its deviation.
+void UpdateLead(Clock::time_point now) {
   Relay& r = g_relay;
   uint32_t lead = uint32_t(std::max(REXCVAR_GET(lockstep_lead), 0));
-  if (!lead && r.rate_ms && r.rtt_ms > 0) {
-    lead = uint32_t(std::ceil(r.rtt_ms / r.rate_ms)) + 1;
+  const bool fixed = lead != 0;
+  if (!fixed && r.rate_ms && r.turnaround_ms > 0) {
+    const double needed =
+        r.turnaround_ms + std::max(2.0 * r.turnaround_dev_ms, kMinMarginMs);
+    lead = uint32_t(std::ceil(needed / r.rate_ms));
   }
   lead = lead ? std::clamp(lead, kMinLead, kWindow) : kWindow;
+  // Settle freely over the first frames (the match is still starting up).
+  if (lead < r.lead && !fixed && r.frames_played >= kSettleFrames) {
+    if (r.lower_since == Clock::time_point{}) {
+      r.lower_since = now;
+    }
+    if (now - r.lower_since < kLowerAfter) {
+      return;
+    }
+  }
+  r.lower_since = {};
   if (lead != r.lead) {
-    REXLOG_INFO("[relay] client lead {} inputs (round trip {:.0f} ms, input rate {} ms)", lead,
-                r.rtt_ms, r.rate_ms);
+    REXLOG_INFO("[relay] client lead {} inputs (turnaround {:.0f} +/- {:.0f} ms, input rate {} ms)",
+                lead, r.turnaround_ms, r.turnaround_dev_ms, r.rate_ms);
     r.lead = lead;
   }
 }
 
-void HandleFrames(Reader& rd, uint8_t count) {
+void HandleFrames(Reader& rd, uint8_t count, Clock::time_point arrived) {
   Relay& r = g_relay;
   if (count != r.count) {
     return;
@@ -505,16 +531,20 @@ void HandleFrames(Reader& rd, uint8_t count) {
   const uint32_t inputs_received = rd.U32();
   const uint32_t first = rd.U32();
   const uint16_t n = rd.U16();
-  const auto now = Clock::now();
   while (r.inputs_acked < inputs_received && !r.unacked.empty()) {
-    const double sample =
-        std::chrono::duration<double, std::milli>(now - r.unacked_times.front()).count();
-    r.rtt_ms = r.rtt_ms > 0 ? r.rtt_ms * 0.9 + sample * 0.1 : sample;
+    const double sample = Ms(arrived - r.unacked_times.front());
+    if (r.turnaround_ms > 0) {
+      r.turnaround_dev_ms += (std::fabs(sample - r.turnaround_ms) - r.turnaround_dev_ms) * 0.25;
+      r.turnaround_ms += (sample - r.turnaround_ms) * 0.125;
+    } else {
+      r.turnaround_ms = sample;
+      r.turnaround_dev_ms = sample / 2;
+    }
     r.unacked.pop_front();
     r.unacked_times.pop_front();
     ++r.inputs_acked;
   }
-  UpdateLead();
+  UpdateLead(Clock::now());
   for (uint32_t i = 0; i < n; ++i) {
     Frame frame(r.count);
     for (Input& in : frame) {
@@ -668,11 +698,12 @@ void SendInputs(Clock::time_point now) {
 }
 
 // Reads the next packet into `buffer`; its length, or -1 if none is waiting.
-int ReceiveOne(uint8_t* buffer, size_t capacity, sockaddr_in& from) {
+int ReceiveOne(uint8_t* buffer, size_t capacity, sockaddr_in& from, Clock::time_point& arrived) {
   Relay& r = g_relay;
+  arrived = Clock::now();
   if (r.tunnel) {
     std::vector<uint8_t> packet;
-    if (!Nhl3on3TunnelReceiveRelay(packet)) {
+    if (!Nhl3on3TunnelReceiveRelay(packet, arrived)) {
       return -1;
     }
     const size_t n = std::min(packet.size(), capacity);
@@ -701,7 +732,8 @@ void Receive() {
   uint8_t buffer[2048];
   for (;;) {
     sockaddr_in from{};
-    const int n = ReceiveOne(buffer, sizeof(buffer), from);
+    Clock::time_point arrived;
+    const int n = ReceiveOne(buffer, sizeof(buffer), from, arrived);
     if (n < 0) {
       return;
     }
@@ -720,7 +752,7 @@ void Receive() {
     if (r.host && kind == kInputs) {
       HandleInputs(rd, slot, from);
     } else if (!r.host && kind == kFrames) {
-      HandleFrames(rd, count);
+      HandleFrames(rd, count, arrived);
     } else if (kind == kMessages && (r.host || slot == 0)) {
       HandleMessages(rd, slot, from);
     }
@@ -835,8 +867,17 @@ int32_t SendInput(const uint8_t* base, uint32_t dist, uint8_t type, uint32_t dat
   if (r.host) {
     r.clients[r.slot].pending.push_back(std::move(in));
   } else {
+    // The send window for this input opened when frame (input - lead) was
+    // played; any delay before the game sent it counts against the lead too.
+    auto opened = now;
+    if (r.inputs_sent > r.lead) {
+      const auto played = r.played_at[(r.inputs_sent - r.lead) % kPlayedSlots];
+      if (played != Clock::time_point{} && played <= now) {
+        opened = played;
+      }
+    }
     r.unacked.push_back(std::move(in));
-    r.unacked_times.push_back(now);
+    r.unacked_times.push_back(opened);
     r.last_send = {};
   }
   Pump();
@@ -871,6 +912,7 @@ int32_t QueryFrame(uint8_t* base, uint32_t dist, uint32_t types, uint32_t datas,
     }
   }
   ++r.frames_played;
+  r.played_at[r.frames_played % kPlayedSlots] = Clock::now();
   TimeFramePlayed(r.frames_played, FramesEnd() - r.frames_played);
   if (!r.host) {
     while (r.frames_base < r.frames_played && !r.frames.empty()) {

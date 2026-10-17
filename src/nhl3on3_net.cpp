@@ -266,7 +266,7 @@ struct Tunnel {
   std::atomic<uint32_t> vip{0};
   std::mutex mutex;
   std::unordered_map<uint16_t, std::deque<TunnelDatagram>> inbox;  // by virtual port
-  std::deque<std::vector<uint8_t>> relay_inbox;
+  std::deque<std::pair<std::chrono::steady_clock::time_point, std::vector<uint8_t>>> relay_inbox;
   // Datagram sockets bind an ephemeral native port; peers address them by the
   // port the game asked for (by guest socket), so instances sharing one PC
   // can all use the game's fixed ports.
@@ -358,7 +358,8 @@ void TunnelReceiveOne() {
     if (g_tunnel.relay_inbox.size() >= kTunnelQueueLimit * 2) {
       g_tunnel.relay_inbox.pop_front();
     }
-    g_tunnel.relay_inbox.emplace_back(body, body + size);
+    g_tunnel.relay_inbox.emplace_back(std::chrono::steady_clock::now(),
+                                      std::vector<uint8_t>(body, body + size));
   }
 }
 
@@ -2223,12 +2224,14 @@ void Nhl3on3TunnelSendRelay(const uint8_t* data, size_t size) {
   TunnelSend(packet);
 }
 
-bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet) {
+bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet,
+                               std::chrono::steady_clock::time_point& arrived) {
   std::lock_guard lock(g_tunnel.mutex);
   if (g_tunnel.relay_inbox.empty()) {
     return false;
   }
-  packet = std::move(g_tunnel.relay_inbox.front());
+  arrived = g_tunnel.relay_inbox.front().first;
+  packet = std::move(g_tunnel.relay_inbox.front().second);
   g_tunnel.relay_inbox.pop_front();
   return true;
 }

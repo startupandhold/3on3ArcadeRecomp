@@ -208,12 +208,15 @@
 0x82D33748 = { name = "sub_82D33748" }  # materialized at: 82D4CEAC
 0x82E12F38 = { name = "sub_82E12F38" }  # materialized at: 82E154B8
 
-# Ultrawide: camera setup (sub_82B76100) picks 16:9 or 4:3 into f13 and derives
-# the projection from it at 0x82B76140. The hook substitutes the display aspect.
+# Ultrawide: the gameplay camera update (sub_826B4F70) takes its aspect (f1)
+# from the 1280x720 render target, then stores the view window width (f13) and
+# height (f0) at +92 / +96 and their reciprocals at +100 / +104. The hook widens
+# the width only, so the extra width is added view (hor+). sub_82B76100 is the
+# UI camera and is left alone.
 [[midasm_hook]]
-name = "Nhl3on3CameraAspectHook"
-address = 0x82B76140
-registers = ["f13"]
+name = "Nhl3on3GameCameraWindowHook"
+address = 0x826B5538
+registers = ["f0", "f1", "f13"]
 
 # Ultrawide: sub_82724A88 initialises the screen object with a 1280x720 float
 # size, from which the gameplay camera derives its aspect. The hook widens the

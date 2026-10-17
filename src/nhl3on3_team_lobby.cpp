@@ -20,6 +20,22 @@
 //   GetControllerLogin(200 + k)               -> script name k (kScriptNames)
 //   GetControllerLogin(1100 + i, local)       whether player i is on this
 //                                                console
+// Ready status (both screens):
+//   GetControllerLogin(1200 + i, ready)       Select Sides: player i's ready flag
+//   GetControllerLogin(164 + side)            -> "1" if everyone on the side is
+//                                                ready, else "0"
+//   GetControllerLogin(160 + side)            -> "setReady" if that changed since
+//                                                it was last shown, else "-"
+//   GetControllerLogin(162 + side)            -> Starting Lineups: "animateReady"
+//                                                / "animateNotReady" on a change,
+//                                                else "-"
+//   GetControllerLogin(171)                   -> title line: who is ready and
+//                                                who is still waited for
+//   GetControllerLogin(170)                   -> "setTitle" if that changed, else
+//                                                "-"
+// "-" names nothing, so the script's call does nothing. Starting Lineups has
+// no room to report flags, so ready also comes off the wire: a client's
+// "RDY|true" to the host and the host's "UPD|i:ready=true" to everyone.
 // Indices are session order, the same on every console (m_aPlayers, and the
 // order the roster step visits members in).
 //
@@ -98,7 +114,11 @@ struct Player {
   int side = -1;  // -1: no pick
   int lock = -1;  // position lock index from the user record; -1: unknown
   bool here = false;  // on this console (the local player or a local guest)
+  bool ready = false;  // ready on the current screen
 };
+
+// Screens whose timer ticks the lobby; ready flags are per screen.
+enum class Screen { kNone, kSelectSides, kStartingLineups };
 
 // Remote teammate icons on Starting Lineups (position lock slots 4..6).
 constexpr uint32_t kTeammateSlots = 3;
@@ -109,6 +129,8 @@ constexpr const char* kScriptNames[] = {
     "lineupPanel",  "m_mySide",           "mcPositionLock", "getPosition",
     "setPosition",  "setConnectedStatus", "setText",        "removePadding",
     "gControllerIDCurrentScreen", "mPositions", "NAME",
+    // Must match SCRIPT_NAMES in tools/ui_mod.py.
+    "mainFrame", "SelectSides", "StartingLineups",
 };
 
 struct Lobby {
@@ -125,6 +147,12 @@ struct Lobby {
   std::array<std::pair<int, int>, kTeammateSlots> shown_teammates{};
   Clock::time_point teammates_refreshed{};
   std::string logged;
+  Screen screen = Screen::kNone;
+  // Per side "everyone ready", as last answered to 164 and as last shown.
+  std::array<int, 2> side_ready{-1, -1};
+  std::array<int, 2> shown_side_ready{-1, -1};
+  std::string status;        // as last answered to 171
+  std::string shown_status;  // as last shown
 };
 Lobby g_lobby;
 
@@ -206,6 +234,61 @@ void ApplyEntries(Lobby& lobby, std::string_view data, void (*set)(Lobby&, uint3
     }
     data = end == std::string_view::npos ? std::string_view() : data.substr(end + 1);
   }
+}
+
+// Ready flags belong to one screen; a new screen starts with nobody ready.
+void EnterScreen(Lobby& lobby, Screen screen) {
+  if (lobby.screen == screen) {
+    return;
+  }
+  lobby.screen = screen;
+  for (Player& p : lobby.players) {
+    p.ready = false;
+  }
+  lobby.side_ready = lobby.shown_side_ready = {-1, -1};
+  lobby.status.clear();
+  lobby.shown_status.clear();
+}
+
+void SetReady(Lobby& lobby, uint32_t index, bool ready) {
+  if (Player* p = At(lobby, index); p && p->ready != ready) {
+    p->ready = ready;
+    REXLOG_INFO("[team] player {} {}", index, ready ? "ready" : "not ready");
+  }
+}
+
+// Whether `side` has players and all of them are ready.
+bool SideReady(const Lobby& lobby, uint32_t side) {
+  bool any = false;
+  for (uint32_t i = 0; i < lobby.count; ++i) {
+    if (EffectiveSide(lobby, i) == side) {
+      if (i >= lobby.players.size() || !lobby.players[i].ready) {
+        return false;
+      }
+      any = true;
+    }
+  }
+  return any;
+}
+
+// "READY: a, b   WAITING: c" for team play (more than two players). Once shown
+// it stays up to date even if players leave.
+std::string StatusText(const Lobby& lobby) {
+  if (lobby.count <= 2 && lobby.shown_status.empty()) {
+    return {};
+  }
+  std::string ready, waiting;
+  for (uint32_t i = 0; i < lobby.count; ++i) {
+    const bool is_ready = i < lobby.players.size() && lobby.players[i].ready;
+    const std::string name =
+        i < lobby.players.size() && !lobby.players[i].name.empty() ? lobby.players[i].name : "?";
+    std::string& list = is_ready ? ready : waiting;
+    list += (list.empty() ? "" : ", ") + name;
+  }
+  if (waiting.empty()) {
+    return "ALL READY";
+  }
+  return ready.empty() ? "WAITING: " + waiting : "READY: " + ready + "   WAITING: " + waiting;
 }
 
 // The TPP to send: the host's has every known lock, a client's only its own.
@@ -377,6 +460,7 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
     {
       std::lock_guard lock_guard(g_lobby.mutex);
       Lobby& lobby = g_lobby;
+      EnterScreen(lobby, Screen::kStartingLineups);
       if (lobby.local < 0 || uint32_t(lobby.local) >= kMaxPlayers || lock < 0 || lock >= 16) {
         return {};
       }
@@ -401,10 +485,17 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
     }
     return {};
   }
+  if (code >= 1200 && code < 1200 + int32_t(kMaxPlayers)) {
+    const bool ready = ArgNumber(ctx, base, 1) == 1;
+    std::lock_guard lock(g_lobby.mutex);
+    SetReady(g_lobby, code - 1200, ready);
+    return {};
+  }
   if (code == 99) {
     const int32_t arg = ArgNumber(ctx, base, 1);
     {
       std::lock_guard lock(g_lobby.mutex);
+      EnterScreen(g_lobby, Screen::kSelectSides);
       g_lobby.local = arg >= 0 ? arg / 16 : -1;
       g_lobby.count = arg >= 0 ? std::min<uint32_t>(arg % 16, kMaxPlayers) : 0;
       LogTable(g_lobby);
@@ -481,6 +572,40 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
   if (code >= 150 && code < 150 + int32_t(kTeammateSlots)) {
     const int index = Teammate(lobby, code - 150);
     return index < 0 ? std::string() : " (" + lobby.players[index].name + ")";
+  }
+  if (code == 164 || code == 165) {
+    const uint32_t side = code - 164;
+    lobby.side_ready[side] = SideReady(lobby, side);
+    return lobby.side_ready[side] ? "1" : "0";
+  }
+  if (code == 160 || code == 161) {
+    const uint32_t side = code - 160;
+    if (lobby.side_ready[side] < 0 || lobby.side_ready[side] == lobby.shown_side_ready[side]) {
+      return "-";
+    }
+    lobby.shown_side_ready[side] = lobby.side_ready[side];
+    return "setReady";
+  }
+  if (code == 162 || code == 163) {
+    const uint32_t side = code - 162;
+    const int ready = SideReady(lobby, side);
+    if (ready == std::max(lobby.shown_side_ready[side], 0)) {
+      return "-";
+    }
+    lobby.shown_side_ready[side] = ready;
+    return ready ? "animateReady" : "animateNotReady";
+  }
+  if (code == 171) {
+    lobby.status = StatusText(lobby);
+    return lobby.status;
+  }
+  if (code == 170) {
+    if (lobby.status.empty() || lobby.status == lobby.shown_status) {
+      return "-";
+    }
+    lobby.shown_status = lobby.status;
+    REXLOG_INFO("[team] status: {}", lobby.status);
+    return "setTitle";
   }
   if (code >= 200 && code < 200 + int32_t(std::size(kScriptNames))) {
     return kScriptNames[code - 200];
@@ -573,6 +698,10 @@ void Reset() {
   lobby.locks_dirty = false;
   lobby.teammates_refreshed = {};
   lobby.logged.clear();
+  lobby.screen = Screen::kNone;
+  lobby.side_ready = lobby.shown_side_ready = {-1, -1};
+  lobby.status.clear();
+  lobby.shown_status.clear();
 }
 
 void OnControlMessage(std::string_view text) {
@@ -583,11 +712,30 @@ void OnControlMessage(std::string_view text) {
   }
   const std::string_view sender = text.substr(0, a), command = text.substr(a + 1, b - a - 1);
   const std::string_view data = text.substr(b + 1);
-  if (command != "TPS" && command != "TPT" && command != "TPP") {
+  if (command != "TPS" && command != "TPT" && command != "TPP" && command != "UPD" &&
+      command != "RDY") {
     return;
   }
   std::lock_guard lock(g_lobby.mutex);
   Lobby& lobby = g_lobby;
+  if (command == "RDY") {
+    for (uint32_t i = 0; i < lobby.players.size(); ++i) {
+      if (lobby.players[i].name == sender) {
+        SetReady(lobby, i, data == "true");
+      }
+    }
+    return;
+  }
+  if (command == "UPD") {
+    // "i:key=value;key=value"
+    const size_t colon = data.find(':');
+    const int index = colon == std::string_view::npos ? -1 : ParseInt(data.substr(0, colon));
+    const size_t at = data.find("ready=");
+    if (index >= 0 && at != std::string_view::npos && (at == colon + 1 || data[at - 1] == ';')) {
+      SetReady(lobby, uint32_t(index), data.substr(at + 6, 4) == "true");
+    }
+    return;
+  }
   if (command == "TPP") {
     std::vector<int> before;
     for (const Player& p : lobby.players) {

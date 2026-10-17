@@ -1,9 +1,10 @@
-// Display options: ultrawide aspect ratio and convenience render-quality presets.
+// Display options: ultrawide / portrait aspect ratio and convenience
+// render-quality presets.
 //
-// The game always renders into a 1280x720 front buffer. Ultrawide is done
-// anamorphically: the camera projection is widened to the target aspect while
-// the guest video mode reports that same aspect, so the presenter stretches the
-// 1280x720 frame back to correct proportions on a wide display.
+// The game always renders into a 1280x720 front buffer. Other aspects are done
+// anamorphically: the camera projection is changed to the target aspect and
+// the presenter stretches the 1280x720 frame to the display, which restores
+// correct proportions (wider for ultrawide, taller for portrait).
 
 #include "nhl3on3_display.h"
 
@@ -34,9 +35,15 @@
 #include "runtime_export.h"
 
 REXCVAR_DEFINE_STRING(aspect_ratio, "16:9", "NHL3on3/Display",
-                      "Output aspect ratio: 16:9, 21:9, 32:9, auto (desktop), or W:H / WxH "
-                      "(for example 3440x1440). Wider than 16:9 widens the in-game camera")
+                      "Output aspect ratio: 16:9, 21:9, 32:9, 9:16, 9:21, auto (desktop), or "
+                      "W:H / WxH (for example 3440x1440). Wider than 16:9 widens the in-game "
+                      "camera; narrower (portrait) makes it taller")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(ultrawide_fov, "hor+", "NHL3on3/Display",
+                      "How ultrawide widens the 3D view: hor+ (same height, more to the "
+                      "sides) or vert- (same width, less above and below). Portrait always "
+                      "keeps the width and shows more above and below");
 
 REXCVAR_DEFINE_STRING(fps_cap, "60", "NHL3on3/Display",
                       "Frame rate cap: 60 (stock), 90, 120, 144, any value 24-240, or "
@@ -137,17 +144,33 @@ void ConfigureDisplay() {
               rex::cvar::GetFlagByName("draw_resolution_scale_y"),
               rex::cvar::GetFlagByName("fullscreen"));
 
-  // Narrower-than-16:9 output keeps the stock camera and is letterboxed.
-  double aspect = std::clamp(ResolveAspect(REXCVAR_GET(aspect_ratio)), kNativeAspect, 4.0);
-  if (aspect - kNativeAspect < 0.01) {
+  double aspect = std::clamp(ResolveAspect(REXCVAR_GET(aspect_ratio)), 0.25, 4.0);
+  if (std::fabs(aspect - kNativeAspect) < 0.01) {
     return;
   }
   g_camera_aspect.store(float(aspect));
 
-  int width = int(std::lround(kGuestHeight * aspect)) & ~1;
-  SetIfDefault("video_mode_width", std::to_string(width));
-  SetIfDefault("video_mode_height", std::to_string(kGuestHeight));
-  REXLOG_INFO("Ultrawide: aspect {:.4f}, guest video mode {}x{}", aspect, width, kGuestHeight);
+  if (aspect > kNativeAspect) {
+    int width = int(std::lround(kGuestHeight * aspect)) & ~1;
+    SetIfDefault("video_mode_width", std::to_string(width));
+    SetIfDefault("video_mode_height", std::to_string(kGuestHeight));
+    REXLOG_INFO("Ultrawide: aspect {:.4f}, guest video mode {}x{}", aspect, width, kGuestHeight);
+    return;
+  }
+
+  // Portrait: a guest video mode narrower than 4:3 would switch the game to
+  // its 4:3 layouts, so the guest stays 1280x720 and the presenter stretches
+  // the frame to fill a portrait window instead of letterboxing it.
+  constexpr int kPortraitWindowHeight = 1280;
+  int width = int(std::lround(kPortraitWindowHeight * aspect)) & ~1;
+  SetIfDefault("window_width", std::to_string(width));
+  SetIfDefault("window_height", std::to_string(kPortraitWindowHeight));
+  SetIfDefault("present_letterbox", "false");
+  REXLOG_INFO("Portrait: aspect {:.4f}, window {}x{}", aspect, width, kPortraitWindowHeight);
+}
+
+float UltrawideAspect() {
+  return g_camera_aspect.load(std::memory_order_relaxed);
 }
 
 }  // namespace nhl3on3
@@ -355,13 +378,8 @@ extern "C" REX_FUNC(__imp__VdEnableRingBufferRPtrWriteBack) {
 // (swap packet address in the ring, ...)
 extern "C" REX_FUNC(__imp__VdSwap) {
   static const nhl3on3::GuestFunc original = nhl3on3::ResolveRuntimeExport("__imp__VdSwap");
-  {  // TEMP debug
-    static int trap_at = getenv("NHL3ON3_TRAP_SWAP") ? atoi(getenv("NHL3ON3_TRAP_SWAP")) : 0;
-    static int swaps = 0;
-    if (trap_at && ++swaps == trap_at) {
-      __builtin_debugtrap();
-    }
-  }
+  static std::once_flag draw_hooks;
+  std::call_once(draw_hooks, nhl3on3::InstallDrawHooks);
   if (REXCVAR_GET(latency_probe)) {
     probe::OnSwap(base, ctx.r3.u32);
   }
@@ -380,18 +398,32 @@ extern "C" REX_FUNC(__imp__VdSwap) {
   original(ctx, base);
 }
 
-// sub_82B76100 loads 16:9 (or 4:3 on non-widescreen modes) into f13 just before
-// deriving the camera projection from it.
-void Nhl3on3CameraAspectHook(PPCRegister& f13) {
-  float aspect = g_camera_aspect.load(std::memory_order_relaxed);
-  if (aspect > 0.0f && std::fabs(float(f13.f64) - float(kNativeAspect)) < 0.001f) {
-    f13.f64 = double(aspect);
+// f1 = render target aspect, f13 / f0 = view window width / height about to be stored.
+void Nhl3on3GameCameraWindowHook(PPCRegister& f0, PPCRegister& f1, PPCRegister& f13) {
+  const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
+  if (aspect <= 0.0f || std::fabs(float(f1.f64) - float(kNativeAspect)) >= 0.001f) {
+    return;
+  }
+  const float ratio = float(aspect / kNativeAspect);
+  const bool hor_plus = ratio > 1.0f && REXCVAR_GET(ultrawide_fov) != "vert-";
+  static thread_local float last_ratio = 0.0f;
+  if (ratio != last_ratio) {
+    last_ratio = ratio;
+    REXLOG_INFO("Ultrawide: game camera view window {:.4f} x {:.4f} -> {:.4f} x {:.4f} ({})",
+                f13.f64, f0.f64, hor_plus ? f13.f64 * ratio : f13.f64,
+                hor_plus ? f0.f64 : f0.f64 / ratio,
+                hor_plus ? "hor+" : (ratio > 1.0f ? "vert-" : "vert+"));
+  }
+  if (hor_plus) {
+    f13.f64 = double(float(f13.f64) * ratio);
+  } else {
+    f0.f64 = double(float(f0.f64) / ratio);
   }
 }
 
 void Nhl3on3ScreenWidthHook(PPCRegister& f0) {
   const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
-  if (aspect > 0.0f) {
+  if (aspect > float(kNativeAspect)) {
     f0.f64 = double(float(f0.f64 * aspect / kNativeAspect));
     REXLOG_INFO("Ultrawide: screen width {:.0f}", f0.f64);
   }

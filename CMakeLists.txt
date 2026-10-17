@@ -31,6 +31,7 @@ set(NHL3ON3_SOURCES
     src/xam_input_lock.cpp
     src/xusbcam_stubs.cpp
     src/nhl3on3_display.cpp
+    src/nhl3on3_widescreen.cpp
     src/nhl3on3_net.cpp
     src/nhl3on3_guest_log.cpp
     src/nhl3on3_remote_pad.cpp
