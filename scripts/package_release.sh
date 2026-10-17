@@ -61,11 +61,22 @@ require() {
   done
 }
 
+# Refuses a build older than the source it should contain.
+require_fresh() {
+  local newer
+  newer=$(find src nhl3on3_functions.toml CMakeLists.txt -type f -newer "$1" | head -1)
+  if [[ -n $newer ]]; then
+    echo "$1 is older than $newer; rebuild it before packaging" >&2
+    exit 1
+  fi
+}
+
 if [[ -f $win_build/nhl3on3.exe ]]; then
   name=NHL3on3-$version-windows_64_portable
   dir=$stage_root/$name
   mkdir -p "$dir"
   require "$win_build/nhl3on3.exe" "$win_build/rexruntime.dll" "$win_build/rexgpu-xenos.dll"
+  require_fresh "$win_build/nhl3on3.exe"
   cp "$win_build/nhl3on3.exe" "$win_build/rexruntime.dll" "$win_build/rexgpu-xenos.dll" "$dir/"
   cp launcher/nhl3on3_launcher.ps1 "launcher/NHL3on3 Launcher.bat" "$dir/"
   cp release/README-windows.txt "$dir/README.txt"
@@ -91,6 +102,7 @@ if [[ -f $linux_build/nhl3on3 ]]; then
   mkdir -p "$dir"
   require "$linux_build/nhl3on3" "$linux_build/nhl3on3-launcher" \
           "$linux_build/librexruntime.so" "$linux_build/librexgpu-xenos.so"
+  require_fresh "$linux_build/nhl3on3"
   cp "$linux_build/nhl3on3" "$linux_build/nhl3on3-launcher" \
      "$linux_build/librexruntime.so" "$linux_build/librexgpu-xenos.so" "$dir/"
   if readelf -d "$dir/nhl3on3" "$dir/librexruntime.so" "$dir/librexgpu-xenos.so" |
