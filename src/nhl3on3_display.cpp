@@ -13,6 +13,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -31,6 +32,8 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
 
 #include "runtime_export.h"
 
@@ -44,6 +47,17 @@ REXCVAR_DEFINE_STRING(ultrawide_fov, "hor+", "NHL3on3/Display",
                       "How ultrawide widens the 3D view: hor+ (same height, more to the "
                       "sides) or vert- (same width, less above and below). Portrait always "
                       "keeps the width and shows more above and below");
+
+REXCVAR_DEFINE_STRING(portrait_camera, "topdown", "NHL3on3/Display",
+                      "Match camera with a portrait aspect_ratio: topdown (fixed, looking "
+                      "down at the ice) or game (the stock camera)");
+
+REXCVAR_DEFINE_DOUBLE(topdown_tilt, 12.0, "NHL3on3/Display",
+                      "Top-down camera tilt away from straight down, in degrees");
+
+REXCVAR_DEFINE_DOUBLE(topdown_zoom, 1.0, "NHL3on3/Display",
+                      "Top-down camera distance, relative to the stock camera's at the "
+                      "opening face-off (smaller is closer)");
 
 REXCVAR_DEFINE_STRING(fps_cap, "60", "NHL3on3/Display",
                       "Frame rate cap: 60 (stock), 90, 120, 144, any value 24-240, or "
@@ -137,12 +151,24 @@ void ConfigureDisplay() {
     int scale = std::clamp(quality[0] - '0', 1, 3);
     SetIfDefault("draw_resolution_scale_x", std::to_string(scale));
     SetIfDefault("draw_resolution_scale_y", std::to_string(scale));
+    if (scale > 1) {
+      // Scaled matches drop to ~25 FPS on an RTX 3080 with the host render
+      // target path, 2x MSAA and memexport readback; this set holds 60.
+#if defined(_WIN32)
+      SetIfDefault("render_target_path_d3d12", "rov");
+#endif
+      SetIfDefault("native_2x_msaa", "false");
+      SetIfDefault("readback_memexport", "false");
+    }
   }
-  REXLOG_INFO("Display: vsync {}, render scale {}x{}, fullscreen {}",
+  REXLOG_INFO("Display: vsync {}, render scale {}x{}, fullscreen {}, 2x MSAA {}, "
+              "memexport readback {}",
               rex::cvar::GetFlagByName("vsync"),
               rex::cvar::GetFlagByName("draw_resolution_scale_x"),
               rex::cvar::GetFlagByName("draw_resolution_scale_y"),
-              rex::cvar::GetFlagByName("fullscreen"));
+              rex::cvar::GetFlagByName("fullscreen"),
+              rex::cvar::GetFlagByName("native_2x_msaa"),
+              rex::cvar::GetFlagByName("readback_memexport"));
 
   double aspect = std::clamp(ResolveAspect(REXCVAR_GET(aspect_ratio)), 0.25, 4.0);
   if (std::fabs(aspect - kNativeAspect) < 0.01) {
@@ -159,10 +185,14 @@ void ConfigureDisplay() {
   }
 
   // Portrait: a guest video mode narrower than 4:3 would switch the game to
-  // its 4:3 layouts, so the guest stays 1280x720 and the presenter stretches
-  // the frame to fill a portrait window instead of letterboxing it.
+  // its 4:3 layouts, so the guest stays 16:9 and the presenter stretches the
+  // frame to fill a portrait window instead of letterboxing it. The video mode
+  // must be set: left at its default the SDK takes it from the window size.
+  // 1282, not 1280: the SDK only counts a value that differs from the default.
   constexpr int kPortraitWindowHeight = 1280;
   int width = int(std::lround(kPortraitWindowHeight * aspect)) & ~1;
+  SetIfDefault("video_mode_width", "1282");
+  SetIfDefault("video_mode_height", std::to_string(kGuestHeight));
   SetIfDefault("window_width", std::to_string(width));
   SetIfDefault("window_height", std::to_string(kPortraitWindowHeight));
   SetIfDefault("present_letterbox", "false");
@@ -398,11 +428,150 @@ extern "C" REX_FUNC(__imp__VdSwap) {
   original(ctx, base);
 }
 
-// f1 = render target aspect, f13 / f0 = view window width / height about to be stored.
-void Nhl3on3GameCameraWindowHook(PPCRegister& f0, PPCRegister& f1, PPCRegister& f13) {
+namespace topdown {
+
+struct Vec3 {
+  float v[3];
+  float& operator[](int i) { return v[i]; }
+  float operator[](int i) const { return v[i]; }
+};
+
+Vec3 operator+(const Vec3& a, const Vec3& b) { return {a[0] + b[0], a[1] + b[1], a[2] + b[2]}; }
+Vec3 operator*(const Vec3& a, float s) { return {a[0] * s, a[1] * s, a[2] * s}; }
+float Dot(const Vec3& a, const Vec3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+Vec3 Cross(const Vec3& a, const Vec3& b) {
+  return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+Vec3 Axis(int i, float sign) {
+  Vec3 out{};
+  out[i] = sign;
+  return out;
+}
+
+float LoadFloat(const uint8_t* p) {
+  const uint32_t bits = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+void StoreFloat(uint8_t* p, float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  p[0] = uint8_t(bits >> 24);
+  p[1] = uint8_t(bits >> 16);
+  p[2] = uint8_t(bits >> 8);
+  p[3] = uint8_t(bits);
+}
+
+// The camera matrix rows are right, up, at (view direction), position.
+Vec3 LoadRow(const uint8_t* matrix, int row) {
+  const uint8_t* p = matrix + row * 16;
+  return {LoadFloat(p), LoadFloat(p + 4), LoadFloat(p + 8)};
+}
+
+void StoreRow(uint8_t* matrix, int row, const Vec3& value) {
+  uint8_t* p = matrix + row * 16;
+  for (int i = 0; i < 3; ++i) {
+    StoreFloat(p + i * 4, value[i]);
+  }
+}
+
+std::string Format(const Vec3& v) { return fmt::format("({:.2f}, {:.2f}, {:.2f})", v[0], v[1], v[2]); }
+
+// World axes and distance come from the stock camera when a match starts: its
+// up row picks the world up axis, its view direction picks the rink's long axis
+// and its distance to the ice sets the framing. The ice is assumed to be the
+// plane through the origin with center ice at the origin.
+struct State {
+  bool latched = false;
+  std::chrono::steady_clock::time_point last_call;
+  Vec3 world_up{};
+  Vec3 rink_long{};
+  float distance = 0.0f;
+  float handedness = 1.0f;
+  int logged = 0;
+};
+
+void Apply(uint8_t* matrix) {
+  using Clock = std::chrono::steady_clock;
+  static State state;
+  const Clock::time_point now = Clock::now();
+  if (now - state.last_call > std::chrono::seconds(1)) {
+    state.latched = false;
+    state.logged = 0;
+  }
+  state.last_call = now;
+
+  const Vec3 right = LoadRow(matrix, 0);
+  const Vec3 up = LoadRow(matrix, 1);
+  const Vec3 at = LoadRow(matrix, 2);
+  const Vec3 pos = LoadRow(matrix, 3);
+  if (state.logged < 3) {
+    static Clock::time_point next_log;
+    if (now >= next_log) {
+      next_log = now + std::chrono::seconds(2);
+      ++state.logged;
+      REXLOG_INFO("Topdown: stock camera right {} up {} at {} pos {}", Format(right), Format(up),
+                  Format(at), Format(pos));
+    }
+  }
+
+  if (!state.latched) {
+    int up_axis = 0;
+    for (int i = 1; i < 3; ++i) {
+      if (std::fabs(up[i]) > std::fabs(up[up_axis])) {
+        up_axis = i;
+      }
+    }
+    state.world_up = Axis(up_axis, up[up_axis] < 0.0f ? -1.0f : 1.0f);
+    int long_axis = up_axis == 0 ? 1 : 0;
+    for (int i = 0; i < 3; ++i) {
+      if (i != up_axis && std::fabs(at[i]) > std::fabs(at[long_axis])) {
+        long_axis = i;
+      }
+    }
+    state.rink_long = Axis(long_axis, at[long_axis] < 0.0f ? -1.0f : 1.0f);
+    const float height = Dot(pos, state.world_up);
+    const float descent = -Dot(at, state.world_up);
+    const float to_ice = descent > 0.05f ? height / descent : 0.0f;
+    const float from_origin = std::sqrt(Dot(pos, pos));
+    state.distance = to_ice > 0.0f ? to_ice : from_origin;
+    state.handedness = Dot(right, Cross(up, at)) < 0.0f ? -1.0f : 1.0f;
+    state.latched = true;
+    REXLOG_INFO(
+        "Topdown: world up {} rink long axis {} camera height {:.2f}, distance to ice {:.2f}, "
+        "to origin {:.2f}, looking at {}, handedness {}",
+        Format(state.world_up), Format(state.rink_long), height, to_ice, from_origin,
+        Format(pos + at * to_ice), state.handedness);
+  }
+
+  const float tilt = float(std::clamp(REXCVAR_GET(topdown_tilt), 0.0, 80.0) * 3.14159265358979 / 180.0);
+  const float zoom = float(std::clamp(REXCVAR_GET(topdown_zoom), 0.1, 10.0));
+  const Vec3 new_at = state.world_up * -std::cos(tilt) + state.rink_long * std::sin(tilt);
+  const Vec3 new_up = state.world_up * std::sin(tilt) + state.rink_long * std::cos(tilt);
+  const Vec3 new_right = Cross(new_up, new_at) * state.handedness;
+  const Vec3 new_pos = new_at * -(state.distance * zoom);
+  StoreRow(matrix, 0, new_right);
+  StoreRow(matrix, 1, new_up);
+  StoreRow(matrix, 2, new_at);
+  StoreRow(matrix, 3, new_pos);
+}
+
+}  // namespace topdown
+
+// r25 = camera (matrix at +0), f1 = render target aspect, f13 / f0 = view
+// window width / height about to be stored.
+void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister& f1,
+                                 PPCRegister& f13) {
   const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
   if (aspect <= 0.0f || std::fabs(float(f1.f64) - float(kNativeAspect)) >= 0.001f) {
     return;
+  }
+  if (aspect < float(kNativeAspect) && REXCVAR_GET(portrait_camera) == "topdown") {
+    if (auto* memory = REX_KERNEL_MEMORY()) {
+      topdown::Apply(memory->virtual_membase() + r25.u32);
+    }
   }
   const float ratio = float(aspect / kNativeAspect);
   const bool hor_plus = ratio > 1.0f && REXCVAR_GET(ultrawide_fov) != "vert-";
