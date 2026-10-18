@@ -45,8 +45,8 @@ REXCVAR_DEFINE_STRING(aspect_ratio, "16:9", "NHL3on3/Display",
 
 REXCVAR_DEFINE_STRING(ultrawide_fov, "hor+", "NHL3on3/Display",
                       "How ultrawide widens the 3D view: hor+ (same height, more to the "
-                      "sides) or vert- (same width, less above and below). Portrait always "
-                      "keeps the width and shows more above and below");
+                      "sides) or vert- (same width, less above and below). Portrait keeps "
+                      "the width and shows more above and below");
 
 REXCVAR_DEFINE_STRING(portrait_camera, "topdown", "NHL3on3/Display",
                       "Match camera with a portrait aspect_ratio: topdown (fixed, looking "
@@ -528,7 +528,6 @@ struct State {
   float distance = 0.0f;
   float handedness = 1.0f;
   int logged = 0;
-  bool seen_stock = false;
 };
 
 bool Near(const Vec3& a, const Vec3& b) {
@@ -545,17 +544,15 @@ void FollowStockDirection(State& state, const Vec3& right, const Vec3& up, const
   if (IsPlaceholder(right, up, at) || Near(at, state.written_at)) {
     return;
   }
-  if (!state.seen_stock) {
-    state.seen_stock = true;
-    REXLOG_INFO("Topdown: first stock camera right {} up {} at {}", Format(right), Format(up),
-                Format(at));
-  }
+  // A view from the side (the pre-game camera) looks across the rink, so it
+  // says nothing about which end is yours. A camera looking down the rink
+  // does: that direction is the end you attack, and it changes with your side.
   const float along = Dot(at, state.rink_long);
-  if (along < -0.1f) {
-    state.rink_long = state.rink_long * -1.0f;
-    REXLOG_INFO("Topdown: stock camera looks along {}; screen up follows it",
-                Format(state.rink_long));
+  if (along > -0.5f) {
+    return;
   }
+  state.rink_long = state.rink_long * -1.0f;
+  REXLOG_INFO("Topdown: screen up follows the stock camera along {}", Format(state.rink_long));
 }
 
 void Apply(uint8_t* matrix) {
@@ -565,7 +562,6 @@ void Apply(uint8_t* matrix) {
   if (now - state.last_call > std::chrono::seconds(1)) {
     state.latched = false;
     state.logged = 0;
-    state.seen_stock = false;
   }
   state.last_call = now;
 
@@ -597,7 +593,9 @@ void Apply(uint8_t* matrix) {
         long_axis = i;
       }
     }
-    state.rink_long = Axis(long_axis, at[long_axis] < 0.0f ? -1.0f : 1.0f);
+    // Opposite the placeholder's look direction: that placeholder faces the end
+    // the centre-ice logo reads as upside down.
+    state.rink_long = Axis(long_axis, at[long_axis] < 0.0f ? 1.0f : -1.0f);
     const float height = Dot(pos, state.world_up);
     const float descent = -Dot(at, state.world_up);
     const float to_ice = descent > 0.05f ? height / descent : 0.0f;
@@ -636,7 +634,9 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
   if (aspect <= 0.0f || std::fabs(float(f1.f64) - float(kNativeAspect)) >= 0.001f) {
     return;
   }
-  if (aspect < float(kNativeAspect) && REXCVAR_GET(portrait_camera) == "topdown") {
+  const bool topdown =
+      aspect < float(kNativeAspect) && REXCVAR_GET(portrait_camera) == "topdown";
+  if (topdown) {
     if (auto* memory = REX_KERNEL_MEMORY()) {
       topdown::Apply(memory->virtual_membase() + r25.u32);
     }
@@ -644,12 +644,15 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
   const float ratio = float(aspect / kNativeAspect);
   const bool hor_plus = ratio > 1.0f && REXCVAR_GET(ultrawide_fov) != "vert-";
   static thread_local float last_ratio = 0.0f;
-  if (ratio != last_ratio) {
+  static thread_local bool last_topdown = false;
+  if (ratio != last_ratio || topdown != last_topdown) {
     last_ratio = ratio;
+    last_topdown = topdown;
+    const double width = hor_plus ? f13.f64 * ratio : f13.f64;
+    const double height = hor_plus ? f0.f64 : f0.f64 / ratio;
     REXLOG_INFO("Ultrawide: game camera view window {:.4f} x {:.4f} -> {:.4f} x {:.4f} ({})",
-                f13.f64, f0.f64, hor_plus ? f13.f64 * ratio : f13.f64,
-                hor_plus ? f0.f64 : f0.f64 / ratio,
-                hor_plus ? "hor+" : (ratio > 1.0f ? "vert-" : "vert+"));
+                f13.f64, f0.f64, width, height,
+                topdown ? "topdown" : (hor_plus ? "hor+" : (ratio > 1.0f ? "vert-" : "vert+")));
   }
   if (hor_plus) {
     f13.f64 = double(float(f13.f64) * ratio);
