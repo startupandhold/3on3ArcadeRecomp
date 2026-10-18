@@ -10,6 +10,7 @@
 #include "nhl3on3_display.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -235,15 +236,18 @@ constexpr uint32_t kFrameHeight = 720;
 
 std::string g_ui_list;
 std::set<uint64_t> g_ui_shaders;
-float g_ui_squeeze_x = 1.0f;  // 1 = off
-float g_ui_squeeze_y = 1.0f;
+// Read by the game thread too (nhl3on3::UiSqueeze).
+std::atomic<float> g_ui_squeeze_x{1.0f};  // 1 = off
+std::atomic<float> g_ui_squeeze_y{1.0f};
 
 void RefreshUiSettings() {
   const float aspect = nhl3on3::UltrawideAspect();
   const float native = float(16.0 / 9.0);
   const bool on = REXCVAR_GET(ultrawide_ui_16x9) && aspect > 0.0f;
-  g_ui_squeeze_x = (on && aspect > native) ? native / aspect : 1.0f;
-  g_ui_squeeze_y = (on && aspect < native) ? aspect / native : 1.0f;
+  g_ui_squeeze_x.store((on && aspect > native) ? native / aspect : 1.0f,
+                       std::memory_order_relaxed);
+  g_ui_squeeze_y.store((on && aspect < native) ? aspect / native : 1.0f,
+                       std::memory_order_relaxed);
   const std::string list = REXCVAR_GET(ultrawide_ui_shaders);
   if (list == g_ui_list) {
     return;
@@ -271,7 +275,8 @@ void RefreshUiSettings() {
 }
 
 bool IsUiDraw(gfx::CommandProcessor* cp) {
-  if (g_ui_squeeze_x >= 1.0f && g_ui_squeeze_y >= 1.0f) {
+  if (g_ui_squeeze_x.load(std::memory_order_relaxed) >= 1.0f &&
+      g_ui_squeeze_y.load(std::memory_order_relaxed) >= 1.0f) {
     return false;
   }
   const auto& r = *g_regs;
@@ -362,7 +367,8 @@ bool HookedDraw(gfx::CommandProcessor* cp, gfx::xenos::PrimitiveType prim, uint3
   if (!ui) {
     return g_draw(cp, prim, count, index_buffer, major_mode_explicit);
   }
-  const SavedRegs saved = Squeeze(g_ui_squeeze_x, g_ui_squeeze_y);
+  const SavedRegs saved = Squeeze(g_ui_squeeze_x.load(std::memory_order_relaxed),
+                                  g_ui_squeeze_y.load(std::memory_order_relaxed));
   const bool result = g_draw(cp, prim, count, index_buffer, major_mode_explicit);
   Restore(saved);
   return result;
@@ -408,8 +414,13 @@ void InstallDrawHooks() {
   REXLOG_INFO(
       "Ultrawide: draw hooks {} (IssueDraw slot {}, IssueSwap slot {}), 2D squeezed to {:.3f} x "
       "{:.3f}",
-      ok ? "installed" : "FAILED", draw_offset / 8, swap_offset / 8, g_ui_squeeze_x,
-      g_ui_squeeze_y);
+      ok ? "installed" : "FAILED", draw_offset / 8, swap_offset / 8, g_ui_squeeze_x.load(),
+      g_ui_squeeze_y.load());
+}
+
+void UiSqueeze(float& x, float& y) {
+  x = g_ui_squeeze_x.load(std::memory_order_relaxed);
+  y = g_ui_squeeze_y.load(std::memory_order_relaxed);
 }
 
 }  // namespace nhl3on3

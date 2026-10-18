@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Adds players to the 3-on-3 rosters from a JSON file of names, teams,
-types and headshots (see game/roster/roster.json).
+"""Adds players to the 3-on-3 arcade switch list from a JSON file of names,
+teams, types and headshots (see roster/roster.json). Headshots are
+PNG files in roster/headshots/, named by the paths in that JSON. They are
+not part of the repo.
+
+The game applies this itself on startup when those PNGs are present. This
+script is the same edit, for trying a roster without rebuilding the game.
 
 Usage: roster_mod.py [GAME_DIR] [--roster PATH] [--dry-run] [--restore]
 
@@ -10,19 +15,22 @@ first so its front-end mod is in data0.big; this tool builds on top of it.
 What it changes:
   db/nhlng.db       player records (cPbu) and, for new players, ratings
                     copied from a star of the same type and position.
-  data0.big / .bh   a large and small portrait per player, appended to the
-                    archive under fe/ion/artassets/playerheads[small]/.
+  data0.big / .bh   a large and small portrait per player under
+                    fe/ion/artassets/playerheads[small]/.
 
-Players already in the database (matched by name) are updated in place;
-anyone else takes over a free agent's record. A player joining a team sends
-that team's lowest-rated player in the same position group (forward,
-defence, goalie) to free agency, so roster sizes stay the same. Players
-without a headshot file are skipped unless they already have a portrait.
+The Starting Lineups switch list is a fixed pool of the original 43 arcade
+stars (the IDs that ship with portraits). New names only appear there when
+they take over one of those star slots — appending a portrait on a new ID
+is not enough. This tool claims lesser-known star slots for custom players
+(or an explicit "replaces" target), and keeps legends unless asked to
+replace them. A player joining a team sends that team's lowest-rated player
+in the same position group to free agency. Players without a headshot are
+skipped unless they already have a portrait.
 
 Every run rebuilds from backups: db/nhlng.db.orig, and data0.big.preroster /
-data0.bh.preroster (the archive as the game left it). When the game updates
-its front-end mod it rebuilds data0.big without the portraits; run this tool
-again afterwards. --restore puts the backups back.
+data0.bh.preroster (the archive as the game left it). A newer front-end mod
+rebuilds data0.big without the portraits; the next launch of the game puts
+them back. --restore puts the backups back.
 """
 import argparse
 import json
@@ -39,7 +47,7 @@ from ea_tdb import Database  # noqa: E402
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 DEFAULT_GAME = os.path.join(REPO, "game", "extracted")
-DEFAULT_ROSTER = os.path.join(REPO, "game", "roster", "roster.json")
+DEFAULT_ROSTER = os.path.join(REPO, "roster", "roster.json")
 
 TEAMS = ["ANA", "ATL", "BOS", "BUF", "CGY", "CAR", "CHI", "COL", "CBJ", "DAL", "DET", "EDM", "FLA",
          "LA", "MIN", "MTL", "NSH", "NJ", "NYI", "NYR", "OTT", "PHI", "PHX", "PIT", "STL", "SJ", "TB",
@@ -50,9 +58,12 @@ TYPES = ("all_around", "fast", "strong")
 # cPbu (players) fields.
 FIRST, LAST, BIRTHPLACE = "PedH", "RMbQ", "JzFM"
 ID, ASSET_ID, KEY = "Nzao", "rnOl", "zIBw"
+FACE = "DaPp"  # face / portrait asset id; featured stars use FACE == ID
 TEAM, NHL_TEAM = "BSXd", "WBbd"  # NHL_TEAM is team + 1, or 0 for a free agent
-POSITION, NUMBER = "aljv", "tRVs"
+POSITION, NUMBER, SHOOTS = "aljv", "tRVs", "pkRG"  # SHOOTS: 0 left, 1 right
 BIRTH_YEAR, BIRTH_MONTH, BIRTH_DAY = "dnFq", "pLKJ", "iwsK"  # year - 1900
+# Height/weight and the fields that travel with type templates (label + build).
+BODY = ("PQgy", "WZNs", "jfuZ", "QDTK", "GDhI", "QBpy", "dhKk")
 SKATER_RATINGS, GOALIE_RATINGS = ("yvSd", "ajmx"), ("yuHm",)
 PORTRAIT_IDS = range(0, 4000)  # the p0_4000 folder
 
@@ -74,6 +85,25 @@ PORTRAIT_TEMPLATE_ID = 1082
 MARKER = "data0.nhl3on3"
 STATE = "data0.roster"
 
+# Original arcade stars kept unless a roster entry explicitly replaces them.
+KEEP_STARS = {
+    "Sidney Crosby", "Alexander Ovechkin", "Evgeni Malkin", "Patrick Kane",
+    "Jonathan Toews", "Nicklas Lidstrom", "Zdeno Chara", "Henrik Lundqvist",
+    "Martin Brodeur", "Pavel Datsyuk", "Jarome Iginla", "Joe Thornton",
+    "Henrik Zetterberg", "Shea Weber", "Anze Kopitar", "Vincent Lecavalier",
+    "Ilya Kovalchuk", "Chris Pronger",
+}
+
+# Claim order for star slots (least iconic first). Must be original arcade stars.
+CLAIM_ORDER = [
+    "Nikolai Antropov", "Sean Avery", "Brad Boyes", "Kristian Huselius",
+    "Alexander Frolov", "Andrew Cogliano", "Milan Lucic", "Jeremy Roenick",
+    "Shane Doan", "Nathan Horton", "Alex Kovalev", "Daniel Briere",
+    "Jean-Sebastien Giguere", "Rick DiPietro", "Roberto Luongo",
+    "Mike Modano", "Joe Sakic", "Dion Phaneuf", "Mike Green", "Thomas Vanek",
+    "Saku Koivu", "Jason Spezza", "Eric Staal", "Dany Heatley", "Marian Gaborik",
+]
+
 
 def normalize(name):
     decomposed = unicodedata.normalize("NFKD", name)
@@ -82,6 +112,10 @@ def normalize(name):
 
 def group(position):
     return "G" if position == 4 else "D" if position == 3 else "F"
+
+
+def full_name(first, last):
+    return f"{first} {last}"
 
 
 # --- Archive ------------------------------------------------------------------
@@ -120,11 +154,12 @@ class Archive:
         _, off, size, _, data = self.index[name]
         return data if data is not None else ea_big.unpack(bytes(self.big[off:off + size]))
 
-    def put(self, name, data):
+    def put(self, name, data, unpacked=0):
         if name in self.index:
+            self.index[name][3] = unpacked
             self.index[name][4] = data
         else:
-            entry = [name, 0, 0, 0, data]
+            entry = [name, 0, 0, unpacked, data]
             self.entries.append(entry)
             self.index[name] = entry
 
@@ -140,7 +175,8 @@ class Archive:
                 e[1] += shift
             else:
                 big += bytes(-len(big) % 64)
-                e[1], e[2], e[3] = len(big), len(e[4]), 0
+                e[1], e[2] = len(big), len(e[4])
+                # e[3] (unpacked) kept from put(); 0 means stored uncompressed.
                 big += e[4]
         p = 16
         for e in self.entries:
@@ -158,7 +194,12 @@ class Archive:
 
 
 def portrait_package(archive, folder, texture_size, display_size, image):
-    """A portrait .big built from the template player's, with new pixels."""
+    """Portrait .big from the template player's, with new pixels.
+
+    Stored uncompressed (bh unpacked size 0), same as the front-end screen
+    patches. A literal-only RefPack blob is larger than its payload, and the
+    game's loader rejects that (null texture -> crash in the switch list).
+    """
     tw, th = texture_size
     nested = bytearray(archive.read(f"{folder}/p{PORTRAIT_TEMPLATE_ID}.big"))
     for name, off, size in ea_big.entries(nested):
@@ -220,6 +261,10 @@ class Players:
                 if field != KEY:
                     t.set(dst, field, t.get(src, field))
 
+    def copy_body(self, source, target):
+        for field in BODY:
+            self.set(target, field, self.rows[source][field])
+
 
 def validate(player, k):
     where = f"player {k + 1} ({player.get('first_name', '')} {player.get('last_name', '')})"
@@ -236,43 +281,110 @@ def validate(player, k):
         raise ValueError(f"{where}: jersey_number must be 0-99")
 
 
-def apply_players(players, roster, has_portrait, log):
-    """Edits the database; returns [(player, row)] for the players applied."""
-    protected = set()
-    for p in players.rows:
-        if has_portrait(p[ID]):
-            protected.add(p[KEY])
-    matched = []
-    for player in roster:
-        row = players.find(player["first_name"], player["last_name"])
-        matched.append(row)
-        if row is not None:
-            protected.add(players.rows[row][KEY])
+def star_ids(has_portrait):
+    """Player IDs that already have portraits in the base archive (the arcade pool)."""
+    return {pid for pid in PORTRAIT_IDS if has_portrait(pid)}
 
-    def free_agents(position_group):
+
+def apply_players(players, roster, has_portrait, log):
+    """Edits the database; returns [(player, row)] for the players applied.
+
+    Custom players are bound to original arcade-star IDs so they appear in the
+    Starting Lineups switch list. Lesser-known stars are claimed first unless
+    "replaces" names a specific player.
+    """
+    stars = star_ids(has_portrait)
+    protected = set()
+    keep = {normalize(n) for n in KEEP_STARS}
+    for player in roster:
+        keep.add(normalize(full_name(player["first_name"], player["last_name"])))
+        if player.get("replaces"):
+            keep.add(normalize(player["replaces"]))
+
+    def row_name(r):
+        p = players.rows[r]
+        return full_name(p[FIRST], p[LAST])
+
+    def find_star_row(name):
+        first, _, last = name.partition(" ")
+        row = players.find(first, last)
+        if row is not None and players.rows[row][ID] in stars:
+            return row
+        # Some stars have multi-word first names (Jean-Sebastien).
         for r, p in enumerate(players.rows):
-            if (p[NHL_TEAM] == 0 and p[ID] == p[ASSET_ID] and p[ID] in PORTRAIT_IDS
-                    and not has_portrait(p[ID]) and p[KEY] not in protected
-                    and group(p[POSITION]) == position_group and players.has_ratings(r)):
-                yield r
+            if p[ID] in stars and normalize(row_name(r)) == normalize(name):
+                return r
+        return None
+
+    # Star rows we may overwrite, in claim order then any remaining non-kept.
+    # Keep skaters and goalies separate — rating tables differ by position group.
+    claimable = []
+    seen = set()
+    for name in CLAIM_ORDER:
+        row = find_star_row(name)
+        if row is None or players.rows[row][KEY] in seen:
+            continue
+        if normalize(name) in keep:
+            continue
+        claimable.append(row)
+        seen.add(players.rows[row][KEY])
+    for r, p in enumerate(players.rows):
+        if p[ID] not in stars or p[KEY] in seen:
+            continue
+        if normalize(row_name(r)) in keep:
+            continue
+        claimable.append(r)
+        seen.add(p[KEY])
+
+    def claim_slot(position_group):
+        for i, row in enumerate(claimable):
+            if group(players.rows[row][POSITION]) != position_group:
+                continue
+            claimable.pop(i)
+            return row
+        return None
 
     applied = []
-    for player, row in zip(roster, matched):
+    for player in roster:
         team = TEAMS.index(player["team"])
         position = POSITIONS.index(player["position"])
-        name = f"{player['first_name']} {player['last_name']}"
-        if row is None:
-            row = next(free_agents(group(position)), None)
+        name = full_name(player["first_name"], player["last_name"])
+        existing = players.find(player["first_name"], player["last_name"])
+
+        if player.get("replaces"):
+            row = find_star_row(player["replaces"])
             if row is None:
-                raise ValueError(f"{name}: no free {player['position']} record left to use")
-            protected.add(players.rows[row][KEY])
-            template = players.find(*TEMPLATES[(player.get("type") or "all_around", group(position))].split(" ", 1))
-            players.set(row, POSITION, position)
-            players.copy_ratings(template, row)
-            log(f"{name}: new player (record of {players.rows[row][FIRST]} {players.rows[row][LAST]}, "
-                f"id {players.rows[row][ID]})")
+                raise ValueError(f"{name}: replaces {player['replaces']!r} but that arcade star was not found")
+            log(f"{name}: replaces {player['replaces']} (id {players.rows[row][ID]})")
+        elif existing is not None and players.rows[existing][ID] in stars:
+            row = existing
+            log(f"{name}: existing arcade star, id {players.rows[row][ID]}")
         else:
-            log(f"{name}: existing player, id {players.rows[row][ID]}")
+            row = claim_slot(group(position))
+            if row is None:
+                raise ValueError(f"{name}: no arcade {player['position']} star slots left to claim")
+            old = row_name(row)
+            log(f"{name}: takes arcade slot of {old} (id {players.rows[row][ID]})")
+            if existing is not None and existing != row:
+                # Park the displaced star identity on the old non-star row, free agent.
+                disp_first = players.rows[row][FIRST]
+                disp_last = players.rows[row][LAST]
+                players.set(existing, FIRST, disp_first)
+                players.set(existing, LAST, disp_last)
+                players.set(existing, TEAM, 0)
+                players.set(existing, NHL_TEAM, 0)
+                protected.add(players.rows[existing][KEY])
+                log(f"  {disp_first} {disp_last} moved to free agency (was id {players.rows[existing][ID]})")
+
+        protected.add(players.rows[row][KEY])
+        template = players.find(*TEMPLATES[(player.get("type") or "all_around", group(position))].split(" ", 1))
+        # Always take the JSON type's ratings and build, including players who
+        # were already arcade stars (Forsberg, Selanne, …).
+        players.set(row, POSITION, position)
+        if template is not None:
+            players.copy_ratings(template, row)
+            players.copy_body(template, row)
+
         p = players.rows[row]
         if p[NHL_TEAM] != team + 1:
             roster_players = [r for r, q in enumerate(players.rows)
@@ -292,6 +404,14 @@ def apply_players(players, roster, has_portrait, log):
         players.set(row, NHL_TEAM, team + 1)
         players.set(row, POSITION, position)
         players.set(row, NUMBER, int(player["jersey_number"]))
+        shoots = player.get("shoots")
+        if shoots:
+            side = str(shoots).casefold()
+            if side not in ("left", "right", "l", "r"):
+                raise ValueError(f"{name}: shoots must be left or right")
+            players.set(row, SHOOTS, 0 if side in ("left", "l") else 1)
+        players.set(row, FACE, players.rows[row][ID])
+        players.set(row, ASSET_ID, players.rows[row][ID])
         if player.get("birth_date"):
             year, month, day = (int(x) for x in player["birth_date"].split("-"))
             players.set(row, BIRTH_YEAR, year - 1900)
@@ -362,7 +482,8 @@ def build(game_dir, roster_path, dry_run):
         player_id = players.rows[row][ID]
         for folder, texture_size, display_size in PORTRAITS:
             archive.put(f"{folder}/p{player_id}.big",
-                        portrait_package(archive, folder, texture_size, display_size, image))
+                        portrait_package(archive, folder, texture_size, display_size, image),
+                        unpacked=0)
         print(f"  portrait p{player_id} from {player['headshot']}")
     if skipped:
         print(f"skipped (no headshot yet): {', '.join(skipped)}")

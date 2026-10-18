@@ -176,27 +176,22 @@ void ConfigureDisplay() {
   }
   g_camera_aspect.store(float(aspect));
 
-  if (aspect > kNativeAspect) {
-    int width = int(std::lround(kGuestHeight * aspect)) & ~1;
-    SetIfDefault("video_mode_width", std::to_string(width));
-    SetIfDefault("video_mode_height", std::to_string(kGuestHeight));
-    REXLOG_INFO("Ultrawide: aspect {:.4f}, guest video mode {}x{}", aspect, width, kGuestHeight);
-    return;
-  }
-
-  // Portrait: a guest video mode narrower than 4:3 would switch the game to
-  // its 4:3 layouts, so the guest stays 16:9 and the presenter stretches the
-  // frame to fill a portrait window instead of letterboxing it. The video mode
+  // The guest video mode stays 16:9 and the presenter stretches the frame to
+  // fill a window of the target aspect instead of letterboxing it. A wider
+  // video mode loses UI text (glyphs drop out of names, scores and menus); one
+  // narrower than 4:3 switches the game to its 4:3 layouts. The video mode
   // must be set: left at its default the SDK takes it from the window size.
   // 1282, not 1280: the SDK only counts a value that differs from the default.
-  constexpr int kPortraitWindowHeight = 1280;
-  int width = int(std::lround(kPortraitWindowHeight * aspect)) & ~1;
+  const bool wide = aspect > kNativeAspect;
+  const int window_height = wide ? kGuestHeight : 1280;
+  const int window_width = int(std::lround(window_height * aspect)) & ~1;
   SetIfDefault("video_mode_width", "1282");
   SetIfDefault("video_mode_height", std::to_string(kGuestHeight));
-  SetIfDefault("window_width", std::to_string(width));
-  SetIfDefault("window_height", std::to_string(kPortraitWindowHeight));
+  SetIfDefault("window_width", std::to_string(window_width));
+  SetIfDefault("window_height", std::to_string(window_height));
   SetIfDefault("present_letterbox", "false");
-  REXLOG_INFO("Portrait: aspect {:.4f}, window {}x{}", aspect, width, kPortraitWindowHeight);
+  REXLOG_INFO("{}: aspect {:.4f}, window {}x{}", wide ? "Ultrawide" : "Portrait", aspect,
+              window_width, window_height);
 }
 
 float UltrawideAspect() {
@@ -405,6 +400,43 @@ extern "C" REX_FUNC(__imp__VdEnableRingBufferRPtrWriteBack) {
   original(ctx, base);
 }
 
+namespace {
+
+// With another aspect the game must still see exactly 1280x720: it copies the
+// video mode into its display parameters, and any other size there loses
+// glyphs from its UI text.
+void ReportGuestVideoMode(uint8_t* base, uint32_t mode) {
+  if (nhl3on3::UltrawideAspect() <= 0.0f || !mode) {
+    return;
+  }
+  uint8_t* p = base + mode;
+  for (auto [offset, value] : {std::pair{0u, 1280u}, std::pair{4u, 720u}}) {
+    p[offset] = uint8_t(value >> 24);
+    p[offset + 1] = uint8_t(value >> 16);
+    p[offset + 2] = uint8_t(value >> 8);
+    p[offset + 3] = uint8_t(value);
+  }
+}
+
+}  // namespace
+
+// (X_VIDEO_MODE* out): display width at +0, height at +4.
+extern "C" REX_FUNC(__imp__XGetVideoMode) {
+  static const nhl3on3::GuestFunc original =
+      nhl3on3::ResolveRuntimeExport("__imp__XGetVideoMode");
+  const uint32_t mode = ctx.r3.u32;
+  original(ctx, base);
+  ReportGuestVideoMode(base, mode);
+}
+
+extern "C" REX_FUNC(__imp__VdQueryVideoMode) {
+  static const nhl3on3::GuestFunc original =
+      nhl3on3::ResolveRuntimeExport("__imp__VdQueryVideoMode");
+  const uint32_t mode = ctx.r3.u32;
+  original(ctx, base);
+  ReportGuestVideoMode(base, mode);
+}
+
 // (swap packet address in the ring, ...)
 extern "C" REX_FUNC(__imp__VdSwap) {
   static const nhl3on3::GuestFunc original = nhl3on3::ResolveRuntimeExport("__imp__VdSwap");
@@ -483,15 +515,48 @@ std::string Format(const Vec3& v) { return fmt::format("({:.2f}, {:.2f}, {:.2f})
 // up row picks the world up axis, its view direction picks the rink's long axis
 // and its distance to the ice sets the framing. The ice is assumed to be the
 // plane through the origin with center ice at the origin.
+//
+// For the first seconds of a match the camera is an identity placeholder;
+// once the real one runs, it looks down the rink the way the local side
+// attacks, and the top of the screen follows it.
 struct State {
   bool latched = false;
   std::chrono::steady_clock::time_point last_call;
   Vec3 world_up{};
   Vec3 rink_long{};
+  Vec3 written_at{};
   float distance = 0.0f;
   float handedness = 1.0f;
   int logged = 0;
+  bool seen_stock = false;
 };
+
+bool Near(const Vec3& a, const Vec3& b) {
+  return std::fabs(a[0] - b[0]) < 1e-3f && std::fabs(a[1] - b[1]) < 1e-3f &&
+         std::fabs(a[2] - b[2]) < 1e-3f;
+}
+
+bool IsPlaceholder(const Vec3& right, const Vec3& up, const Vec3& at) {
+  return Near(right, Axis(0, 1.0f)) && Near(up, Axis(1, 1.0f)) && Near(at, Axis(2, 1.0f));
+}
+
+// Points rink_long the way the stock camera looks along the rink.
+void FollowStockDirection(State& state, const Vec3& right, const Vec3& up, const Vec3& at) {
+  if (IsPlaceholder(right, up, at) || Near(at, state.written_at)) {
+    return;
+  }
+  if (!state.seen_stock) {
+    state.seen_stock = true;
+    REXLOG_INFO("Topdown: first stock camera right {} up {} at {}", Format(right), Format(up),
+                Format(at));
+  }
+  const float along = Dot(at, state.rink_long);
+  if (along < -0.1f) {
+    state.rink_long = state.rink_long * -1.0f;
+    REXLOG_INFO("Topdown: stock camera looks along {}; screen up follows it",
+                Format(state.rink_long));
+  }
+}
 
 void Apply(uint8_t* matrix) {
   using Clock = std::chrono::steady_clock;
@@ -500,6 +565,7 @@ void Apply(uint8_t* matrix) {
   if (now - state.last_call > std::chrono::seconds(1)) {
     state.latched = false;
     state.logged = 0;
+    state.seen_stock = false;
   }
   state.last_call = now;
 
@@ -545,6 +611,7 @@ void Apply(uint8_t* matrix) {
         Format(state.world_up), Format(state.rink_long), height, to_ice, from_origin,
         Format(pos + at * to_ice), state.handedness);
   }
+  FollowStockDirection(state, right, up, at);
 
   const float tilt = float(std::clamp(REXCVAR_GET(topdown_tilt), 0.0, 80.0) * 3.14159265358979 / 180.0);
   const float zoom = float(std::clamp(REXCVAR_GET(topdown_zoom), 0.1, 10.0));
@@ -556,6 +623,7 @@ void Apply(uint8_t* matrix) {
   StoreRow(matrix, 1, new_up);
   StoreRow(matrix, 2, new_at);
   StoreRow(matrix, 3, new_pos);
+  state.written_at = new_at;
 }
 
 }  // namespace topdown
@@ -590,10 +658,20 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
   }
 }
 
-void Nhl3on3ScreenWidthHook(PPCRegister& f0) {
-  const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
-  if (aspect > float(kNativeAspect)) {
-    f0.f64 = double(float(f0.f64 * aspect / kNativeAspect));
-    REXLOG_INFO("Ultrawide: screen width {:.0f}", f0.f64);
+// r31 = projected point: x, y in 1280x720 frame pixels (big-endian floats).
+void Nhl3on3ScreenProjectHook(PPCRegister& r31) {
+  float kx, ky;
+  nhl3on3::UiSqueeze(kx, ky);
+  if (kx >= 1.0f && ky >= 1.0f) {
+    return;
   }
+  auto* memory = REX_KERNEL_MEMORY();
+  if (!memory) {
+    return;
+  }
+  uint8_t* point = memory->virtual_membase() + r31.u32;
+  const float x = topdown::LoadFloat(point);
+  const float y = topdown::LoadFloat(point + 4);
+  topdown::StoreFloat(point, 640.0f + (x - 640.0f) / kx);
+  topdown::StoreFloat(point + 4, 360.0f + (y - 360.0f) / ky);
 }

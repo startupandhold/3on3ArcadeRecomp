@@ -43,7 +43,9 @@ mkdir -p "$out"
 stage_root=$(mktemp -d)
 trap 'rm -rf "$stage_root"' EXIT
 
-# Files both platforms ship: the license and the game/ folder.
+# Files both platforms ship: the license and an empty game/ folder.
+# The custom roster (roster.json + headshots) is a separate zip; see
+# scripts/package_roster.sh.
 stage_common() {
   local dir=$1
   mkdir -p "$dir/game"

@@ -833,6 +833,24 @@ void OnMultiSetup(uint32_t dist, uint32_t slot, uint32_t count) {
               r.host ? "host" : "client", FormatIp(ip), kPort);
 }
 
+void OnDistDestroyed(uint32_t dist) {
+  std::lock_guard lock(g_mutex);
+  Relay& r = g_relay;
+  if (!dist || dist != r.dist) {
+    return;
+  }
+  REXLOG_INFO("[relay] dist {:08X} destroyed: slot {} of {}, inputs sent {} (taken {}), frames "
+              "played {}, messages received {}, sent {} ({} unacknowledged)",
+              dist, r.slot, r.count, r.inputs_sent, r.inputs_acked, r.frames_played,
+              r.host_messages.in_next, r.host_messages.out_base + r.host_messages.out.size(),
+              r.host_messages.out.size());
+  if (r.socket != kNoSocket) {
+    CloseSocket(r.socket);
+  }
+  r = Relay{};
+  g_timing = Timing{};
+}
+
 bool Carries(uint32_t dist) {
   std::lock_guard lock(g_mutex);
   return dist && dist == g_relay.dist;

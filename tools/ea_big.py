@@ -68,6 +68,28 @@ def refpack_decompress(data):
     return bytes(out)
 
 
+def refpack_compress(data):
+    """EA RefPack (0x10FB) using literal runs only. Round-trips with
+    refpack_decompress; good enough for archive entries the game loads."""
+    out = bytearray(b"\x10\xFB")
+    out += len(data).to_bytes(3, "big")
+    i, n = 0, len(data)
+    while i < n:
+        left = n - i
+        if left < 4:
+            out.append(0xFC | left)
+            out += data[i:]
+            break
+        # Opcode 0xE0..0xFB encodes lit = ((b0 & 0x1F) << 2) + 4 (4..112, step 4).
+        lit = min(112, left & ~3)
+        if left - lit in (1, 2, 3) and lit >= 8:
+            lit -= 4
+        out.append(0xE0 | ((lit - 4) >> 2))
+        out += data[i:i + lit]
+        i += lit
+    return bytes(out)
+
+
 def unpack(data):
     if len(data) >= 2 and data[1] == 0xFB and data[0] & 0xFE in (0x10, 0x90):
         return refpack_decompress(data)

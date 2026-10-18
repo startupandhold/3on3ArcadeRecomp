@@ -270,6 +270,7 @@ extern "C" REX_FUNC(__imp__sub_82758228);
 extern "C" REX_FUNC(sub_82758228) {
   REXLOG_INFO("[dist] destroy dist {:08X} (owner {:08X}); backtrace: {}", ctx.r4.u32,
               ctx.r3.u32, Nhl3on3GuestBacktrace(ctx, base));
+  relay::OnDistDestroyed(ctx.r3.u32);
   __imp__sub_82758228(ctx, base);
 }
 

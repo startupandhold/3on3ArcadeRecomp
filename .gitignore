@@ -1,5 +1,8 @@
 # Copyrighted game content - never commit
 game/
+
+# Custom roster + headshots ship as a separate zip, not in the repo
+/roster/
 *.xex
 *.big
 *.bh

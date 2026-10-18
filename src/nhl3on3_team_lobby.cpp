@@ -47,6 +47,9 @@
 //                    its user record at match start. Clients only reach the
 //                    host, so the host's TPP carries every lock it knows
 //                    (i=lock;...) and is resent as soon as a client's arrives.
+//   TRF|id           this console's roster pack id (RosterOnlineId), on change
+//                    and every second. Mismatched packs desync in lockstep, so
+//                    the lobby refuses to start until everyone matches.
 // The roster step waits for every player's lock (see PositionsReady), since
 // they must agree on all of them. Two teammates with the same lock: the first
 // in session order keeps it, the other gets none.
@@ -54,6 +57,7 @@
 // every console sees its own and everyone else's.
 
 #include "nhl3on3_team_lobby.h"
+#include "nhl3on3_roster.h"
 
 #include <algorithm>
 #include <array>
@@ -115,6 +119,7 @@ struct Player {
   int lock = -1;  // position lock index from the user record; -1: unknown
   bool here = false;  // on this console (the local player or a local guest)
   bool ready = false;  // ready on the current screen
+  std::string roster_id;  // TRF from that console; empty until heard
 };
 
 // Screens whose timer ticks the lobby; ready flags are per screen.
@@ -153,6 +158,9 @@ struct Lobby {
   std::array<int, 2> shown_side_ready{-1, -1};
   std::string status;        // as last answered to 171
   std::string shown_status;  // as last shown
+  bool roster_mismatch = false;
+  bool roster_mismatch_logged = false;
+  std::string sent_roster_id;
 };
 Lobby g_lobby;
 
@@ -257,8 +265,36 @@ void SetReady(Lobby& lobby, uint32_t index, bool ready) {
   }
 }
 
+// True when every known peer roster id matches ours. Unknown (empty) ids are
+// ignored until that console's TRF arrives.
+bool RosterMismatch(Lobby& lobby) {
+  const std::string local = nhl3on3::RosterOnlineId();
+  bool mismatch = false;
+  for (uint32_t i = 0; i < lobby.count && i < lobby.players.size(); ++i) {
+    const std::string& id = lobby.players[i].roster_id;
+    if (!id.empty() && id != local) {
+      mismatch = true;
+      break;
+    }
+  }
+  if (mismatch && !lobby.roster_mismatch_logged) {
+    lobby.roster_mismatch_logged = true;
+    REXLOG_ERROR("[team] roster pack mismatch (local {}); everyone needs the same "
+                 "roster zip or none",
+                 local);
+  }
+  if (!mismatch) {
+    lobby.roster_mismatch_logged = false;
+  }
+  lobby.roster_mismatch = mismatch;
+  return mismatch;
+}
+
 // Whether `side` has players and all of them are ready.
-bool SideReady(const Lobby& lobby, uint32_t side) {
+bool SideReady(Lobby& lobby, uint32_t side) {
+  if (RosterMismatch(lobby)) {
+    return false;
+  }
   bool any = false;
   for (uint32_t i = 0; i < lobby.count; ++i) {
     if (EffectiveSide(lobby, i) == side) {
@@ -273,7 +309,10 @@ bool SideReady(const Lobby& lobby, uint32_t side) {
 
 // "READY: a, b   WAITING: c" for team play (more than two players). Once shown
 // it stays up to date even if players leave.
-std::string StatusText(const Lobby& lobby) {
+std::string StatusText(Lobby& lobby) {
+  if (RosterMismatch(lobby)) {
+    return "ROSTER MISMATCH: same pack required";
+  }
   if (lobby.count <= 2 && lobby.shown_status.empty()) {
     return {};
   }
@@ -343,14 +382,18 @@ void SendToPeers(const PPCContext& caller, uint8_t* base, const std::string& tex
 }
 
 // Sends the local pick (or, on the host, the whole table) when it changed or
-// a second has passed. Called on the game thread; the lock is not held.
+// a second has passed. Also keeps the roster pack id on the wire. Called on
+// the game thread; the lock is not held.
 void MaybeSend(const PPCContext& ctx, uint8_t* base) {
-  std::string message;
+  std::string message, roster_message;
   {
     std::lock_guard lock(g_lobby.mutex);
     Lobby& lobby = g_lobby;
     const auto now = Clock::now();
-    if (lobby.local < 0 || (!lobby.dirty && now - lobby.last_send < kResend)) {
+    const std::string roster_id = nhl3on3::RosterOnlineId();
+    const bool roster_due =
+        lobby.local >= 0 && (lobby.sent_roster_id != roster_id || now - lobby.last_send >= kResend);
+    if (lobby.local < 0 || (!lobby.dirty && now - lobby.last_send < kResend && !roster_due)) {
       return;
     }
     lobby.dirty = false;
@@ -366,9 +409,19 @@ void MaybeSend(const PPCContext& ctx, uint8_t* base) {
                lobby.players[lobby.local].side >= 0) {
       message = fmt::format("TPS|{}={}", lobby.local, lobby.players[lobby.local].side);
     }
+    if (roster_due) {
+      lobby.sent_roster_id = roster_id;
+      if (uint32_t(lobby.local) < lobby.players.size()) {
+        lobby.players[lobby.local].roster_id = roster_id;
+      }
+      roster_message = "TRF|" + roster_id;
+    }
   }
   if (!message.empty()) {
     SendToPeers(ctx, base, message);
+  }
+  if (!roster_message.empty()) {
+    SendToPeers(ctx, base, roster_message);
   }
 }
 
@@ -662,6 +715,9 @@ bool PositionsReady(const PPCContext& ctx, uint8_t* base) {
   {
     std::lock_guard lock(g_lobby.mutex);
     Lobby& lobby = g_lobby;
+    if (RosterMismatch(lobby)) {
+      return false;
+    }
     for (uint32_t i = 0; i < lobby.count; ++i) {
       ready = ready && i < lobby.players.size() && lobby.players[i].lock >= 0;
     }
@@ -702,6 +758,9 @@ void Reset() {
   lobby.side_ready = lobby.shown_side_ready = {-1, -1};
   lobby.status.clear();
   lobby.shown_status.clear();
+  lobby.roster_mismatch = false;
+  lobby.roster_mismatch_logged = false;
+  lobby.sent_roster_id.clear();
 }
 
 void OnControlMessage(std::string_view text) {
@@ -713,11 +772,23 @@ void OnControlMessage(std::string_view text) {
   const std::string_view sender = text.substr(0, a), command = text.substr(a + 1, b - a - 1);
   const std::string_view data = text.substr(b + 1);
   if (command != "TPS" && command != "TPT" && command != "TPP" && command != "UPD" &&
-      command != "RDY") {
+      command != "RDY" && command != "TRF") {
     return;
   }
   std::lock_guard lock(g_lobby.mutex);
   Lobby& lobby = g_lobby;
+  if (command == "TRF") {
+    for (uint32_t i = 0; i < lobby.players.size(); ++i) {
+      if (lobby.players[i].name == sender) {
+        if (lobby.players[i].roster_id != data) {
+          lobby.players[i].roster_id = std::string(data);
+          REXLOG_INFO("[team] player {} roster id {}", i, lobby.players[i].roster_id);
+        }
+      }
+    }
+    RosterMismatch(lobby);
+    return;
+  }
   if (command == "RDY") {
     for (uint32_t i = 0; i < lobby.players.size(); ++i) {
       if (lobby.players[i].name == sender) {

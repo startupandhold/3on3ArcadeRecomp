@@ -46,6 +46,7 @@ MAX_RELAY_PACKET = 1400
 MAX_SLOTS = 12
 RESEND = 0.020
 MATCH_IDLE = 30.0
+STARTUP_STALL = 10.0  # seconds without a first frame before the slots are logged
 
 
 def format_ip(ip):
@@ -112,6 +113,7 @@ class Slot:
         self.frames_acked = 0
         self.frames_sent = 0
         self.last_send = 0.0
+        self.last_packet = 0.0
         self.pending = deque()
 
 
@@ -123,12 +125,26 @@ class Match:
         self.slots = [Slot() for _ in range(count)]
         self.frames = deque()
         self.frames_base = 0
-        self.last_packet = time.monotonic()
+        self.started = self.last_packet = time.monotonic()
         self.built_logged = 0
+        self.stall_logged = False
 
     @property
     def frames_end(self):
         return self.frames_base + len(self.frames)
+
+    def log_slots(self, why, now):
+        """Logs each slot's traffic, to show which console went quiet."""
+        log.info("match %s: %s after %.1fs, %d frames built", self.key, why,
+                 now - self.started, self.frames_end)
+        for index, slot in enumerate(self.slots):
+            ch = slot.messages
+            quiet = f"{now - slot.last_packet:.1f}s ago" if slot.last_packet else "never"
+            log.info("match %s:   slot %d %s: last packet %s, messages from it %d, "
+                     "to it %d (%d unacknowledged), inputs %d, frames acked %d",
+                     self.key, index, format_ip(slot.vip) if slot.vip else "-", quiet,
+                     ch.in_next, ch.out_base + len(ch.out), len(ch.out),
+                     slot.inputs_received, slot.frames_acked)
 
     def header(self, kind):
         return bytearray(RELAY_HEADER.pack(RELAY_MAGIC, kind, 0, self.count, 0))
@@ -141,7 +157,7 @@ class Match:
         if slot.vip != vip:
             log.info("match %s: slot %d is %s", self.key, slot_index, format_ip(vip))
             slot.vip = vip
-        self.last_packet = time.monotonic()
+        self.last_packet = slot.last_packet = time.monotonic()
         if len(data) < at + 10:
             return
         acked, first, n = struct.unpack_from("<IIH", data, at)
@@ -362,6 +378,8 @@ class Tunnel(asyncio.DatagramProtocol):
         key = (game.id, count)
         match = self.matches.get(key)
         if not match:
+            if count > len(game.players):
+                return
             match = self.matches[key] = Match(self, f"{game.id}/{count}", count)
             log.info("match %s: relay started", match.key)
         match.handle(kind, slot, vip, data, RELAY_HEADER.size)
@@ -375,9 +393,13 @@ class Tunnel(asyncio.DatagramProtocol):
             now = time.monotonic()
             for key, match in list(self.matches.items()):
                 if now - match.last_packet > MATCH_IDLE:
-                    log.info("match %s: relay ended", match.key)
+                    match.log_slots("relay ended", now)
                     del self.matches[key]
                 else:
+                    if (not match.stall_logged and match.frames_end == 0
+                            and now - match.started > STARTUP_STALL):
+                        match.stall_logged = True
+                        match.log_slots("no first frame", now)
                     match.pump(now)
             if now - last_sweep >= 10:
                 last_sweep = now

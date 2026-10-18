@@ -16,4 +16,7 @@ void NotePadRead();
 // Call once the guest GPU is set up.
 void InstallDrawHooks();
 
+// Factors by which 2D draws are scaled about the frame centre (1 = not).
+void UiSqueeze(float& x, float& y);
+
 }  // namespace nhl3on3

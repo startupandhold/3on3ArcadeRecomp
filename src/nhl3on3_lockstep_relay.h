@@ -16,6 +16,10 @@ namespace nhl3on3::lockstep_relay {
 // The match's dist object was set up as `slot` of `count` slots.
 void OnMultiSetup(uint32_t dist, uint32_t slot, uint32_t count);
 
+// The dist object `dist` is being destroyed: stops relaying it, so a later
+// match never pumps the old relay or receives its leftover messages.
+void OnDistDestroyed(uint32_t dist);
+
 // Whether the relay carries `dist`'s input.
 bool Carries(uint32_t dist);
 
