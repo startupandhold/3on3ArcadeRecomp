@@ -82,11 +82,16 @@ extern "C" REX_FUNC(__imp__XamInputGetState) {
   static const auto original = nhl3on3::ResolveRuntimeExport("__imp__XamInputGetState");
   nhl3on3::NotePadRead();
   std::lock_guard lock(g_input_mutex);
-  if (!IsAnyUser(ctx.r3.u32, ctx.r4.u32) && remote_pad::GetState(base, ctx.r3.u32, ctx.r5.u32)) {
+  const uint32_t state = ctx.r5.u32;
+  if (!IsAnyUser(ctx.r3.u32, ctx.r4.u32) && remote_pad::GetState(base, ctx.r3.u32, state)) {
+    nhl3on3::RemapPadSticks(base, state);
     ctx.r3.u64 = 0;
     return;
   }
   CallPhysical(original, ctx, base);
+  if (ctx.r3.u32 == 0) {
+    nhl3on3::RemapPadSticks(base, state);
+  }
 }
 
 // (user_index, reserved, X_INPUT_VIBRATION*). Remote controllers have no rumble.

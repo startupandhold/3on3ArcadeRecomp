@@ -52,6 +52,11 @@ REXCVAR_DEFINE_STRING(portrait_camera, "topdown", "NHL3on3/Display",
                       "Match camera with a portrait aspect_ratio: topdown (fixed, looking "
                       "down at the ice) or game (the stock camera)");
 
+REXCVAR_DEFINE_STRING(topdown_direction, "auto", "NHL3on3/Display",
+                      "Which end of the rink is at the top of the top-down camera: auto "
+                      "(follows the game camera's side of the rink) or reverse (the "
+                      "opposite end)");
+
 REXCVAR_DEFINE_DOUBLE(topdown_tilt, 12.0, "NHL3on3/Display",
                       "Top-down camera tilt away from straight down, in degrees");
 
@@ -516,9 +521,10 @@ std::string Format(const Vec3& v) { return fmt::format("({:.2f}, {:.2f}, {:.2f})
 // and its distance to the ice sets the framing. The ice is assumed to be the
 // plane through the origin with center ice at the origin.
 //
-// For the first seconds of a match the camera is an identity placeholder;
-// once the real one runs, it looks down the rink the way the local side
-// attacks, and the top of the screen follows it.
+// For the first seconds of a match the camera is an identity placeholder. The
+// real one watches from the side of the rink, and the top of the screen is
+// the end opposite its screen right; if the side camera moves to the other
+// side of the rink, the top of the screen follows.
 struct State {
   bool latched = false;
   std::chrono::steady_clock::time_point last_call;
@@ -539,20 +545,65 @@ bool IsPlaceholder(const Vec3& right, const Vec3& up, const Vec3& at) {
   return Near(right, Axis(0, 1.0f)) && Near(up, Axis(1, 1.0f)) && Near(at, Axis(2, 1.0f));
 }
 
-// Points rink_long the way the stock camera looks along the rink.
+// Points rink_long at the end opposite the side camera's screen right. Shots
+// looking down the rink (replays, celebrations) don't show which side the
+// camera is on, so only side views count.
 void FollowStockDirection(State& state, const Vec3& right, const Vec3& up, const Vec3& at) {
   if (IsPlaceholder(right, up, at) || Near(at, state.written_at)) {
     return;
   }
-  // A view from the side (the pre-game camera) looks across the rink, so it
-  // says nothing about which end is yours. A camera looking down the rink
-  // does: that direction is the end you attack, and it changes with your side.
-  const float along = Dot(at, state.rink_long);
-  if (along > -0.5f) {
+  const float along = Dot(right, state.rink_long);
+  if (along < 0.5f) {
     return;
   }
   state.rink_long = state.rink_long * -1.0f;
-  REXLOG_INFO("Topdown: screen up follows the stock camera along {}", Format(state.rink_long));
+  REXLOG_INFO("Topdown: side camera right {}; screen up is {}", Format(right),
+              Format(state.rink_long));
+}
+
+// The game turns the sticks into directions on the ice with its own camera,
+// not the top-down one: stick right is that camera's right, stick up its
+// forward. The map takes a stick as meant on the top-down screen to the stick
+// that gives the same direction through the game's camera.
+struct StickMap {
+  float m[4] = {1.0f, 0.0f, 0.0f, 1.0f};  // x' = m0 x + m1 y, y' = m2 x + m3 y
+  std::chrono::steady_clock::time_point updated;
+};
+std::mutex g_stick_mutex;
+StickMap g_stick;
+
+Vec3 OnIce(const Vec3& v, const Vec3& world_up) {
+  const Vec3 flat = v + world_up * -Dot(v, world_up);
+  const float length = std::sqrt(Dot(flat, flat));
+  return length > 1e-4f ? flat * (1.0f / length) : Vec3{};
+}
+
+void UpdateStickMap(const Vec3& world_up, const Vec3& right, const Vec3& up, const Vec3& at,
+                    const Vec3& view_right, const Vec3& view_up) {
+  const Vec3 stock_right = OnIce(right, world_up);
+  // Forward on the ice: across stock_right, on the side the camera faces.
+  Vec3 stock_forward = OnIce(Cross(world_up, stock_right), world_up);
+  if (Dot(stock_forward, OnIce(at, world_up) + OnIce(up, world_up)) < 0.0f) {
+    stock_forward = stock_forward * -1.0f;
+  }
+  const Vec3 target_right = OnIce(view_right, world_up);
+  const Vec3 target_up = OnIce(view_up, world_up);
+  const float m[4] = {Dot(target_right, stock_right), Dot(target_up, stock_right),
+                      Dot(target_right, stock_forward), Dot(target_up, stock_forward)};
+  static float logged[4] = {};
+  bool changed = false;
+  for (int i = 0; i < 4; ++i) {
+    changed |= std::fabs(m[i] - logged[i]) > 0.25f;
+  }
+  if (changed) {
+    std::memcpy(logged, m, sizeof(m));
+    REXLOG_INFO("Topdown: sticks x' = {:.2f} x + {:.2f} y, y' = {:.2f} x + {:.2f} y "
+                "(game camera right {} forward {})",
+                m[0], m[1], m[2], m[3], Format(stock_right), Format(stock_forward));
+  }
+  std::lock_guard lock(g_stick_mutex);
+  std::memcpy(g_stick.m, m, sizeof(m));
+  g_stick.updated = std::chrono::steady_clock::now();
 }
 
 void Apply(uint8_t* matrix) {
@@ -611,12 +662,17 @@ void Apply(uint8_t* matrix) {
   }
   FollowStockDirection(state, right, up, at);
 
+  const Vec3 screen_up =
+      REXCVAR_GET(topdown_direction) == "reverse" ? state.rink_long * -1.0f : state.rink_long;
   const float tilt = float(std::clamp(REXCVAR_GET(topdown_tilt), 0.0, 80.0) * 3.14159265358979 / 180.0);
   const float zoom = float(std::clamp(REXCVAR_GET(topdown_zoom), 0.1, 10.0));
-  const Vec3 new_at = state.world_up * -std::cos(tilt) + state.rink_long * std::sin(tilt);
-  const Vec3 new_up = state.world_up * std::sin(tilt) + state.rink_long * std::cos(tilt);
+  const Vec3 new_at = state.world_up * -std::cos(tilt) + screen_up * std::sin(tilt);
+  const Vec3 new_up = state.world_up * std::sin(tilt) + screen_up * std::cos(tilt);
   const Vec3 new_right = Cross(new_up, new_at) * state.handedness;
   const Vec3 new_pos = new_at * -(state.distance * zoom);
+  if (!IsPlaceholder(right, up, at) && !Near(at, state.written_at)) {
+    UpdateStickMap(state.world_up, right, up, at, new_right, screen_up);
+  }
   StoreRow(matrix, 0, new_right);
   StoreRow(matrix, 1, new_up);
   StoreRow(matrix, 2, new_at);
@@ -625,6 +681,41 @@ void Apply(uint8_t* matrix) {
 }
 
 }  // namespace topdown
+
+namespace nhl3on3 {
+
+void RemapPadSticks(uint8_t* base, uint32_t state) {
+  if (!state) {
+    return;
+  }
+  float m[4];
+  {
+    std::lock_guard lock(topdown::g_stick_mutex);
+    // Only while the top-down camera is running (menus keep the stock sticks).
+    if (std::chrono::steady_clock::now() - topdown::g_stick.updated >
+        std::chrono::milliseconds(500)) {
+      return;
+    }
+    std::memcpy(m, topdown::g_stick.m, sizeof(m));
+  }
+  // X_INPUT_STATE: left stick x, y at +8, +10; right stick at +12, +14.
+  for (uint32_t offset : {8u, 12u}) {
+    uint8_t* p = base + state + offset;
+    const float x = float(int16_t(uint16_t(p[0] << 8 | p[1])));
+    const float y = float(int16_t(uint16_t(p[2] << 8 | p[3])));
+    auto pack = [](float v) {
+      return uint16_t(int16_t(std::clamp(std::lround(v), -32768l, 32767l)));
+    };
+    const uint16_t nx = pack(m[0] * x + m[1] * y);
+    const uint16_t ny = pack(m[2] * x + m[3] * y);
+    p[0] = uint8_t(nx >> 8);
+    p[1] = uint8_t(nx);
+    p[2] = uint8_t(ny >> 8);
+    p[3] = uint8_t(ny);
+  }
+}
+
+}  // namespace nhl3on3
 
 // r25 = camera (matrix at +0), f1 = render target aspect, f13 / f0 = view
 // window width / height about to be stored.
@@ -663,8 +754,8 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
 
 // r31 = projected point: x, y in 1280x720 frame pixels (big-endian floats).
 void Nhl3on3ScreenProjectHook(PPCRegister& r31) {
-  float kx, ky;
-  nhl3on3::UiSqueeze(kx, ky);
+  float kx, ky, cy;
+  nhl3on3::UiSqueeze(kx, ky, cy);
   if (kx >= 1.0f && ky >= 1.0f) {
     return;
   }
@@ -676,5 +767,5 @@ void Nhl3on3ScreenProjectHook(PPCRegister& r31) {
   const float x = topdown::LoadFloat(point);
   const float y = topdown::LoadFloat(point + 4);
   topdown::StoreFloat(point, 640.0f + (x - 640.0f) / kx);
-  topdown::StoreFloat(point + 4, 360.0f + (y - 360.0f) / ky);
+  topdown::StoreFloat(point + 4, cy + (y - cy) / ky);
 }

@@ -54,6 +54,12 @@ const std::vector<Setting> kSettings = {
      {{"16:9", "16:9"}, {"21:9", "21:9"}, {"32:9", "32:9"}, {"auto", "auto"}},
      "Wider than 16:9 widens the in-game camera (ultrawide).\n'auto' matches the desktop; you "
      "can also type W:H or a resolution such as 3440x1440."},
+    {"Display", "topdown_direction", "Portrait: top of screen", Kind::Choice, Toml::String,
+     "auto", {{"auto", "Auto"}, {"reverse", "Reverse"}},
+     "Portrait top-down camera only. Reverse puts the other end of the rink at the top."},
+    {"Display", "portrait_ui_position", "Portrait: HUD position", Kind::Choice, Toml::String,
+     "top", {{"top", "Top"}, {"center", "Center"}, {"bottom", "Bottom"}},
+     "Where the scoreboard and menus sit in a portrait window."},
     {"Display", "fps_cap", "Frame rate cap", Kind::Edit, Toml::String, "60",
      {{"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"},
       {"240", "240"}, {"unlocked", "unlocked"}},

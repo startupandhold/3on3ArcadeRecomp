@@ -45,6 +45,10 @@ REXCVAR_DEFINE_BOOL(ultrawide_ui_16x9, true, "NHL3on3/Display",
                     "With an ultrawide or portrait aspect_ratio, keep menus, HUD and movies at "
                     "16:9 in the centre of the screen; only the 3D game view fills it");
 
+REXCVAR_DEFINE_STRING(portrait_ui_position, "top", "NHL3on3/Display",
+                      "With a portrait aspect_ratio and ultrawide_ui_16x9, where the 16:9 "
+                      "menus and HUD sit: top, center or bottom");
+
 REXCVAR_DEFINE_STRING(ultrawide_ui_shaders,
                       "F07567B2B29BD61D,E3E21FD906F68A1C,5773DC18083C4C20",
                       "NHL3on3/Debug",
@@ -152,10 +156,11 @@ bool PatchSlot(void** slot, T replacement, T& original) {
 struct DrawKey {
   uint64_t vs, ps;
   uint32_t vte, xscale, xoffset, yscale, yoffset, surface, color, scissor_tl, scissor_br;
+  uint32_t tex_w, tex_h;
   bool ui;
   auto Tie() const {
     return std::tie(vs, ps, vte, xscale, xoffset, yscale, yoffset, surface, color, scissor_tl,
-                    scissor_br, ui);
+                    scissor_br, tex_w, tex_h, ui);
   }
   bool operator<(const DrawKey& o) const { return Tie() < o.Tie(); }
 };
@@ -177,6 +182,28 @@ float AsFloat(uint32_t v) {
   return f;
 }
 
+// Largest 2D texture the active pixel shader samples (0 x 0 if none, or if
+// the shader hasn't been analysed yet).
+void LargestTexture(gfx::CommandProcessor* cp, uint32_t& width, uint32_t& height) {
+  width = height = 0;
+  auto* ps = cp->active_pixel_shader();
+  if (!ps) {
+    return;
+  }
+  for (const auto& binding : ps->texture_bindings()) {
+    const auto fetch = g_regs->GetTextureFetch(binding.fetch_constant);
+    if (fetch.dimension != gfx::xenos::DataDimension::k2DOrStacked) {
+      continue;
+    }
+    const uint32_t w = fetch.size_2d.width + 1;
+    const uint32_t h = fetch.size_2d.height + 1;
+    if (w * h > width * height) {
+      width = w;
+      height = h;
+    }
+  }
+}
+
 void TraceDraw(gfx::CommandProcessor* cp, bool ui) {
   const auto& r = *g_regs;
   DrawKey key{};
@@ -194,6 +221,7 @@ void TraceDraw(gfx::CommandProcessor* cp, bool ui) {
   key.color = r[gfx::XE_GPU_REG_RB_COLOR_INFO];
   key.scissor_tl = r[gfx::XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
   key.scissor_br = r[gfx::XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+  LargestTexture(cp, key.tex_w, key.tex_h);
   std::lock_guard lock(g_trace_mutex);
   auto& s = g_frame[key];
   if (!s.count++) {
@@ -214,10 +242,10 @@ void DumpFrame() {
     for (auto& [k, s] : rows) {
       REXLOG_INFO(
           "[draws]  #{:4} x{:4} vs {:016X} ps {:016X} vte {:08X} vp x {:.1f}+{:.1f} y {:.1f}+{:.1f} "
-          "surf {:08X} color {:08X} scissor {:08X}-{:08X}{}",
+          "surf {:08X} color {:08X} scissor {:08X}-{:08X} tex {}x{}{}",
           s.first_index, s.count, k.vs, k.ps, k.vte, AsFloat(k.xscale), AsFloat(k.xoffset),
           AsFloat(k.yscale), AsFloat(k.yoffset), k.surface, k.color, k.scissor_tl, k.scissor_br,
-          k.ui ? " ui16:9" : "");
+          k.tex_w, k.tex_h, k.ui ? " ui16:9" : "");
     }
   }
   g_frame.clear();
@@ -228,8 +256,9 @@ void DumpFrame() {
 //
 // Menus, HUD and movies are drawn straight into the 1280-wide frame with a few
 // 2D pixel shaders. Their viewport (and scissor) is narrowed around the centre
-// by 16:9 / aspect (ultrawide), or flattened by aspect / 16:9 (portrait), so
-// the presenter's stretch restores their proportions.
+// by 16:9 / aspect (ultrawide), or flattened by aspect / 16:9 towards the top,
+// centre or bottom (portrait), so the presenter's stretch restores their
+// proportions.
 
 constexpr uint32_t kFrameWidth = 1280;
 constexpr uint32_t kFrameHeight = 720;
@@ -239,6 +268,7 @@ std::set<uint64_t> g_ui_shaders;
 // Read by the game thread too (nhl3on3::UiSqueeze).
 std::atomic<float> g_ui_squeeze_x{1.0f};  // 1 = off
 std::atomic<float> g_ui_squeeze_y{1.0f};
+std::atomic<float> g_ui_centre_y{kFrameHeight / 2.0f};  // frame row ky scales about
 
 void RefreshUiSettings() {
   const float aspect = nhl3on3::UltrawideAspect();
@@ -248,6 +278,11 @@ void RefreshUiSettings() {
                        std::memory_order_relaxed);
   g_ui_squeeze_y.store((on && aspect < native) ? aspect / native : 1.0f,
                        std::memory_order_relaxed);
+  const std::string position = REXCVAR_GET(portrait_ui_position);
+  g_ui_centre_y.store(position == "center" ? kFrameHeight / 2.0f
+                      : position == "bottom" ? float(kFrameHeight)
+                                             : 0.0f,
+                      std::memory_order_relaxed);
   const std::string list = REXCVAR_GET(ultrawide_ui_shaders);
   if (list == g_ui_list) {
     return;
@@ -274,21 +309,39 @@ void RefreshUiSettings() {
   }
 }
 
+// Set once the 3D scene (drawn multisampled) has been rendered this frame.
+bool g_scene_drawn = false;
+
 bool IsUiDraw(gfx::CommandProcessor* cp) {
   if (g_ui_squeeze_x.load(std::memory_order_relaxed) >= 1.0f &&
       g_ui_squeeze_y.load(std::memory_order_relaxed) >= 1.0f) {
     return false;
   }
-  const auto& r = *g_regs;
-  if ((r[gfx::XE_GPU_REG_RB_SURFACE_INFO] & 0x3FFF) != kFrameWidth) {
+  const uint32_t surface = (*g_regs)[gfx::XE_GPU_REG_RB_SURFACE_INFO];
+  if ((surface >> 16) & 3) {
+    g_scene_drawn = true;
+  }
+  if ((surface & 0x3FFF) != kFrameWidth) {
     return false;
   }
   auto* ps = cp->active_pixel_shader();
-  return ps && g_ui_shaders.count(ps->ucode_data_hash());
+  if (!ps || !g_ui_shaders.count(ps->ucode_data_hash())) {
+    return false;
+  }
+  // The finished 3D scene (with the in-game HUD drawn into it) is copied to
+  // the frame with the same 2D shaders; that copy has to stay full screen.
+  // Movies also sample frame-sized textures but come without a 3D pass.
+  if (g_scene_drawn) {
+    uint32_t w, h;
+    LargestTexture(cp, w, h);
+    if (w >= kFrameWidth && h >= kFrameHeight) {
+      return false;
+    }
+  }
+  return true;
 }
 
-uint32_t SqueezeCoord(uint32_t v, float k, uint32_t size) {
-  const float c = size / 2.0f;
+uint32_t SqueezeCoord(uint32_t v, float k, float c, uint32_t size) {
   return uint32_t(std::clamp(std::lround(c + (float(v) - c) * k), 0l, long(size)));
 }
 
@@ -296,14 +349,13 @@ struct SavedRegs {
   uint32_t vte, xscale, xoffset, yscale, yoffset, scissor_tl, scissor_br;
 };
 
-// Scales one viewport axis by k around the frame centre. Screen = scale * v +
+// Scales one viewport axis by k around frame coordinate c. Screen = scale * v +
 // offset; with scale/offset disabled in VTE_CNTL they're 1 and 0.
 void SqueezeAxis(uint32_t vte, uint32_t scale_bit, uint32_t scale_reg, uint32_t offset_reg,
-                 float k, uint32_t size) {
+                 float k, float c) {
   auto& r = *g_regs;
   const float scale = (vte & scale_bit) ? AsFloat(r[scale_reg]) : 1.0f;
   const float offset = (vte & (scale_bit << 1)) ? AsFloat(r[offset_reg]) : 0.0f;
-  const float c = size / 2.0f;
   const float new_scale = scale * k;
   const float new_offset = c + (offset - c) * k;
   std::memcpy(&r[scale_reg], &new_scale, 4);
@@ -311,7 +363,7 @@ void SqueezeAxis(uint32_t vte, uint32_t scale_bit, uint32_t scale_reg, uint32_t 
 }
 
 // Scissor TL / BR hold x in bits 0-13 and y in bits 16-29.
-void SqueezeScissor(uint32_t shift, float k, uint32_t size) {
+void SqueezeScissor(uint32_t shift, float k, float c, uint32_t size) {
   auto& r = *g_regs;
   const uint32_t mask = 0x3FFFu << shift;
   uint32_t& tl = r[gfx::XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
@@ -319,12 +371,12 @@ void SqueezeScissor(uint32_t shift, float k, uint32_t size) {
   const uint32_t lo = (tl & mask) >> shift;
   const uint32_t hi = (br & mask) >> shift;
   if (lo > 0 || hi < size) {
-    tl = (tl & ~mask) | (SqueezeCoord(lo, k, size) << shift);
-    br = (br & ~mask) | (SqueezeCoord(std::min(hi, size), k, size) << shift);
+    tl = (tl & ~mask) | (SqueezeCoord(lo, k, c, size) << shift);
+    br = (br & ~mask) | (SqueezeCoord(std::min(hi, size), k, c, size) << shift);
   }
 }
 
-SavedRegs Squeeze(float kx, float ky) {
+SavedRegs Squeeze(float kx, float ky, float cy) {
   auto& r = *g_regs;
   SavedRegs saved{r[gfx::XE_GPU_REG_PA_CL_VTE_CNTL],      r[gfx::XE_GPU_REG_PA_CL_VPORT_XSCALE],
                   r[gfx::XE_GPU_REG_PA_CL_VPORT_XOFFSET], r[gfx::XE_GPU_REG_PA_CL_VPORT_YSCALE],
@@ -333,14 +385,14 @@ SavedRegs Squeeze(float kx, float ky) {
   uint32_t vte = saved.vte;
   if (kx < 1.0f) {
     SqueezeAxis(saved.vte, 1, gfx::XE_GPU_REG_PA_CL_VPORT_XSCALE,
-                gfx::XE_GPU_REG_PA_CL_VPORT_XOFFSET, kx, kFrameWidth);
-    SqueezeScissor(0, kx, kFrameWidth);
+                gfx::XE_GPU_REG_PA_CL_VPORT_XOFFSET, kx, kFrameWidth / 2.0f);
+    SqueezeScissor(0, kx, kFrameWidth / 2.0f, kFrameWidth);
     vte |= 3;
   }
   if (ky < 1.0f) {
     SqueezeAxis(saved.vte, 4, gfx::XE_GPU_REG_PA_CL_VPORT_YSCALE,
-                gfx::XE_GPU_REG_PA_CL_VPORT_YOFFSET, ky, kFrameHeight);
-    SqueezeScissor(16, ky, kFrameHeight);
+                gfx::XE_GPU_REG_PA_CL_VPORT_YOFFSET, ky, cy);
+    SqueezeScissor(16, ky, cy, kFrameHeight);
     vte |= 0xC;
   }
   r[gfx::XE_GPU_REG_PA_CL_VTE_CNTL] = vte;
@@ -368,7 +420,8 @@ bool HookedDraw(gfx::CommandProcessor* cp, gfx::xenos::PrimitiveType prim, uint3
     return g_draw(cp, prim, count, index_buffer, major_mode_explicit);
   }
   const SavedRegs saved = Squeeze(g_ui_squeeze_x.load(std::memory_order_relaxed),
-                                  g_ui_squeeze_y.load(std::memory_order_relaxed));
+                                  g_ui_squeeze_y.load(std::memory_order_relaxed),
+                                  g_ui_centre_y.load(std::memory_order_relaxed));
   const bool result = g_draw(cp, prim, count, index_buffer, major_mode_explicit);
   Restore(saved);
   return result;
@@ -379,6 +432,7 @@ void HookedSwap(gfx::CommandProcessor* cp, uint32_t ptr, uint32_t width, uint32_
     DumpFrame();
   }
   RefreshUiSettings();
+  g_scene_drawn = false;
   g_swap(cp, ptr, width, height);
 }
 
@@ -418,9 +472,10 @@ void InstallDrawHooks() {
       g_ui_squeeze_y.load());
 }
 
-void UiSqueeze(float& x, float& y) {
+void UiSqueeze(float& x, float& y, float& centre_y) {
   x = g_ui_squeeze_x.load(std::memory_order_relaxed);
   y = g_ui_squeeze_y.load(std::memory_order_relaxed);
+  centre_y = g_ui_centre_y.load(std::memory_order_relaxed);
 }
 
 }  // namespace nhl3on3
