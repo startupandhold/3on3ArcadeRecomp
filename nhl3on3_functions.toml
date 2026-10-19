@@ -218,6 +218,15 @@ name = "Nhl3on3GameCameraWindowHook"
 address = 0x826B5538
 registers = ["r25", "f0", "f1", "f13"]
 
+# Ultrawide / portrait: sub_8279C150 builds the culling frustum from the
+# camera's horizontal and vertical half-angles (radians, just stored at +0 /
+# +4 of r31), not from the view window above. The hook widens them to match
+# the widened view, or objects in the extra view are culled.
+[[midasm_hook]]
+name = "Nhl3on3CullFrustumHook"
+address = 0x8279C17C
+registers = ["r31"]
+
 # Ultrawide / portrait: sub_8272E080 projects a world point (r4) to screen
 # pixels for the in-game overlays (player arrows and names): 0-1 from
 # sub_8272BD00 times the screen object's 1280x720 size, stored to r3 (r31)

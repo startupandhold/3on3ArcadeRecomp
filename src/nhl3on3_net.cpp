@@ -53,6 +53,7 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xmemory.h>
 
+#include "nhl3on3_roster.h"
 #include "nhl3on3_team_lobby.h"
 #include "runtime_export.h"
 
@@ -230,8 +231,11 @@ bool Online() {
 // server, so nobody needs open ports.
 //
 // Packets (little-endian), header: u32 magic, u8 kind, 3 reserved bytes
-//   kHello     u32 nonce, u32 wanted address    kWelcome  u32 nonce, u32 address
-//   kKeepalive u32 address
+//   kHello     u32 nonce, u32 wanted address, u32 roster
+//                                               kWelcome  u32 nonce, u32 address
+//   kKeepalive u32 address, u32 roster
+//              roster: the roster pack id (0 = stock); quick match only pairs
+//              games with the same one
 //   kData      out: u32 dest ip, u16 dest port, u16 source port, payload
 //              in:  u32 source ip, u16 source port, u16 dest port, payload
 //   kRelay     one lockstep relay packet (nhl3on3_lockstep_relay.cpp)
@@ -315,6 +319,15 @@ std::vector<uint8_t> TunnelPacket(uint8_t kind, size_t reserve = 0) {
   return packet;
 }
 
+uint32_t TunnelRosterId() {
+  const std::string id = nhl3on3::RosterOnlineId();
+  if (id == "stock") {
+    return 0;
+  }
+  const uint32_t value = uint32_t(std::strtoul(id.c_str(), nullptr, 16));
+  return value ? value : 1;
+}
+
 int TunnelSend(const std::vector<uint8_t>& packet) {
   return ::sendto(g_tunnel.socket, reinterpret_cast<const char*>(packet.data()),
                   int(packet.size()), 0, reinterpret_cast<const sockaddr*>(&g_tunnel.server),
@@ -368,8 +381,9 @@ void TunnelLoop() {
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_keepalive) {
-      auto packet = TunnelPacket(kTunnelKeepalive, 4);
+      auto packet = TunnelPacket(kTunnelKeepalive, 8);
       PutLE32(packet, g_tunnel.vip.load());
+      PutLE32(packet, TunnelRosterId());
       TunnelSend(packet);
       next_keepalive = now + kTunnelKeepaliveInterval;
     }
@@ -401,9 +415,10 @@ uint32_t TunnelRegister(uint32_t server_ip) {
   t.server.sin_addr.s_addr = htonl(server_ip);
   const uint32_t nonce = uint32_t(std::random_device{}());
   for (int attempt = 0; attempt < 10; ++attempt) {
-    auto hello = TunnelPacket(kTunnelHello, 8);
+    auto hello = TunnelPacket(kTunnelHello, 12);
     PutLE32(hello, nonce);
     PutLE32(hello, 0);
+    PutLE32(hello, TunnelRosterId());
     TunnelSend(hello);
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
     while (std::chrono::steady_clock::now() < until && TunnelReadable(50)) {

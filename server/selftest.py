@@ -21,12 +21,14 @@ RELAY_SLOTS = 3
 
 
 class Player:
-    def __init__(self, name):
+    def __init__(self, name, roster=None):
         self.name = name
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.settimeout(2)
-        self.udp.sendto(HEADER.pack(TUNNEL_MAGIC, K_HELLO) + struct.pack("<II", 1234, 0),
-                        (HOST, 3670))
+        hello = struct.pack("<II", 1234, 0)
+        if roster is not None:
+            hello += struct.pack("<I", roster)
+        self.udp.sendto(HEADER.pack(TUNNEL_MAGIC, K_HELLO) + hello, (HOST, 3670))
         data = self.udp.recv(2048)
         magic, kind = HEADER.unpack_from(data)
         nonce, self.vip = struct.unpack_from("<II", data, HEADER.size)
@@ -145,6 +147,16 @@ def main():
     names = [f.get("NAME") for cmd, f in e.frames(1) if cmd in (b"auth", b"pers")]
     assert names == ["alpha2", "alpha2"], names
     print("duplicate gamertag renamed")
+
+    # Roster packs: a stock game (roster 0, or none sent) never meets a pack.
+    f, g, h = Player("Foxtrot", 0x1234ABCD), Player("Golf", 0), Player("Hotel", 0x1234ABCD)
+    f.search(ranked=True)
+    g.search(ranked=True)
+    assert f.last_mgm(1.5) is None, "stock matched a roster pack"
+    h.search(ranked=True)
+    mgm = f.last_mgm()
+    assert mgm and {mgm["OPPO0"], mgm["OPPO1"]} == {"Foxtrot", "Hotel"}, mgm
+    print("roster packs only match the same pack")
     print("PASS")
 
 

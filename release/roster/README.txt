@@ -10,6 +10,8 @@ launcher), so you end up with:
 Launch the game. It adds these players on startup. Replacing a headshot
 or editing roster.json and launching again updates the roster.
 
-Online team play: everyone in the match needs this same pack (or nobody
-uses one). Mixed installs desync. The lobby shows ROSTER MISMATCH and
-will not start until the packs match.
+Online: everyone in a match needs this same pack (or nobody uses one), as
+mixed installs desync. Quick match only pairs you with players on the same
+pack version; players without a pack still play each other on the stock
+roster. If a mismatch does get through, the team play lobby shows ROSTER
+MISMATCH and will not start until the packs match.

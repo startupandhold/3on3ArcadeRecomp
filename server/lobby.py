@@ -102,6 +102,17 @@ class Client:
         virtual address the server assigned)."""
         return self.mac_ip or self.peer_ip
 
+    @property
+    def roster(self):
+        """The game's roster pack id as its tunnel reported it; 0 is stock (and
+        anyone not on the tunnel). Different packs desync, so quick match keeps
+        them apart."""
+        try:
+            a, b, c, d = (int(p) for p in self.ip.split("."))
+        except ValueError:
+            return 0
+        return self.lobby.rosters.get((a << 24) | (b << 16) | (c << 8) | d, 0)
+
     def learn(self, request):
         mac = request.get("MAC", "").lstrip("$")
         if len(mac) == 12 and mac.startswith("0022"):
@@ -135,6 +146,7 @@ class Game:
 
     def open_to(self, client):
         return (not self.ranked and not self.closed and self.players
+                and self.players[0].roster == client.roster
                 and len(self.players) < TEAM_MAX_CONSOLES
                 and sum(p.users for p in self.players) + client.users <= TEAM_MAX_PLAYERS)
 
@@ -143,8 +155,10 @@ class Lobby:
     def __init__(self, public_ip):
         self.public_ip = public_ip
         self.clients = set()
-        # Searching clients, one queue per kind (ranked or not).
-        self.queues = {True: [], False: []}
+        # Searching clients, one queue per kind (ranked or not) and roster pack.
+        self.queues = {}
+        # Roster pack id by tunnel virtual address (see Client.roster).
+        self.rosters = {}
         # Unranked games still taking players.
         self.open_games = []
 
@@ -322,10 +336,12 @@ class Lobby:
                          ", ".join(p.name for p in game.players))
                 self.notify_later(game, [client])
                 return
-        queue = self.queues[ranked]
+        roster = client.roster
+        queue = self.queues.setdefault((ranked, roster), [])
         if not queue:
             queue.append(client)
-            log.info("quick match (%s): %s waiting", kind, client.name)
+            log.info("quick match (%s): %s waiting (roster %s)", kind, client.name,
+                     f"{roster:08x}" if roster else "stock")
             return
         players = [queue.pop(0), client]
         game = Game(players[0].search, players, ranked)

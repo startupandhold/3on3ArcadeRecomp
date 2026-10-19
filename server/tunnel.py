@@ -10,10 +10,12 @@ here: every console is a relay client and the server is the host, building
 frame N once it holds input N from every slot.
 
 Tunnel packets (little-endian), header: u32 magic, u8 kind, 3 reserved bytes
-  kHello      c->s  u32 nonce, u32 wanted virtual address (0 = any)
+  kHello      c->s  u32 nonce, u32 wanted virtual address (0 = any)[, u32 roster]
   kWelcome    s->c  u32 nonce, u32 virtual address
-  kKeepalive  c->s  u32 virtual address; also re-registers it after a server
-                    restart or a NAT mapping change
+  kKeepalive  c->s  u32 virtual address[, u32 roster]; also re-registers it
+                    after a server restart or a NAT mapping change
+The optional roster is the game's roster pack id (0 = stock, also assumed
+for clients that don't send one); quick match only pairs equal ids.
   kData       c->s  u32 dest address, u16 dest port, u16 source port, payload
               s->c  u32 source address, u16 source port, u16 dest port, payload
   kRelay      both  one lockstep relay packet
@@ -325,6 +327,16 @@ class Tunnel(asyncio.DatagramProtocol):
         self.bind(vip, addr)
         log.info("%s:%d re-registered as %s", addr[0], addr[1], format_ip(vip))
 
+    def note_roster(self, addr, body, at):
+        peer = self.by_addr.get(addr)
+        if not peer:
+            return
+        roster = struct.unpack_from("<I", body, at)[0] if len(body) >= at + 4 else 0
+        if self.lobby.rosters.get(peer.vip, 0) != roster:
+            log.info("%s roster pack %s", format_ip(peer.vip),
+                     f"{roster:08x}" if roster else "stock")
+        self.lobby.rosters[peer.vip] = roster
+
     # -- packets ----------------------------------------------------------
 
     def datagram_received(self, data, addr):
@@ -343,8 +355,10 @@ class Tunnel(asyncio.DatagramProtocol):
         if kind == K_HELLO and len(body) >= 8:
             nonce, wanted = struct.unpack_from("<II", body)
             self.register(addr, nonce, wanted)
+            self.note_roster(addr, body, 8)
         elif kind == K_KEEPALIVE and len(body) >= 4:
             self.keepalive(addr, struct.unpack_from("<I", body)[0])
+            self.note_roster(addr, body, 4)
         elif not peer:
             return
         elif kind == K_DATA and len(body) >= 8:

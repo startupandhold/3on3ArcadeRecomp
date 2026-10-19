@@ -672,6 +672,10 @@ void Apply(uint8_t* matrix) {
   const Vec3 new_pos = new_at * -(state.distance * zoom);
   if (!IsPlaceholder(right, up, at) && !Near(at, state.written_at)) {
     UpdateStickMap(state.world_up, right, up, at, new_right, screen_up);
+  } else if (Near(at, state.written_at)) {
+    // The game's camera didn't move since the last frame: same map, still live.
+    std::lock_guard lock(g_stick_mutex);
+    g_stick.updated = now;
   }
   StoreRow(matrix, 0, new_right);
   StoreRow(matrix, 1, new_up);
@@ -750,6 +754,31 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
   } else {
     f0.f64 = double(float(f0.f64) / ratio);
   }
+}
+
+// r31 = frustum: horizontal and vertical half-angles (radians, big-endian
+// floats) at +0 / +4.
+void Nhl3on3CullFrustumHook(PPCRegister& r31) {
+  const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
+  if (aspect <= 0.0f) {
+    return;
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  if (!memory) {
+    return;
+  }
+  const float ratio = float(aspect / kNativeAspect);
+  const bool hor_plus = ratio > 1.0f && REXCVAR_GET(ultrawide_fov) != "vert-";
+  uint8_t* angle = memory->virtual_membase() + r31.u32 + (hor_plus ? 0 : 4);
+  const float widen = hor_plus ? ratio : 1.0f / ratio;
+  if (widen <= 1.0f) {
+    return;
+  }
+  const float half = topdown::LoadFloat(angle);
+  if (!(half > 0.0f && half < 1.5f)) {
+    return;
+  }
+  topdown::StoreFloat(angle, std::min(std::atan(std::tan(half) * widen), 1.5f));
 }
 
 // r31 = projected point: x, y in 1280x720 frame pixels (big-endian floats).
