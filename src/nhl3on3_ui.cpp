@@ -18,6 +18,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#include "nhl3on3_chat_keyboard.h"
+
 REXCVAR_DEFINE_BOOL(skip_intro, true, "NHL3on3/General",
                     "Skip the EA Sports Freestyle intro movie at boot");
 
@@ -29,6 +31,9 @@ REXCVAR_DEFINE_STRING(menu_renames, "XBOX LIVE=ONLINE MULTIPLAYER", "NHL3on3/Gen
 
 REXCVAR_DEFINE_BOOL(log_ui_text, false, "NHL3on3/General",
                     "Log every string the front end localizes (to find text for menu_renames)");
+
+REXCVAR_DEFINE_BOOL(log_ui_trace, true, "NHL3on3/General",
+                    "Log the front-end scripts' trace() output");
 
 namespace {
 
@@ -81,6 +86,9 @@ void Parse(Renames& r, const std::string& spec) {
   if (REXCVAR_GET(team_play) >= 3) {
     r.text.emplace("UNRANKED VERSUS PLAY", "ONLINE TEAM PLAY");
   }
+  // The online menu's PLAY A FRIEND item opens the lobby rooms (see
+  // patch_main_menu_items in tools/ui_mod.py).
+  r.text.emplace("PLAY A FRIEND", "ONLINE LOBBY");
   // The main menu's quit item exits the game directly (QuitArcadeGame below).
   r.text.emplace("RETURN TO GAME LIBRARY", "QUIT GAME");
 }
@@ -192,6 +200,43 @@ extern "C" REX_FUNC(sub_829CBE38) {
   REXLOG_INFO("Quit game selected; exiting.");
   rex::FlushLogging();
   std::_Exit(0);
+}
+
+// The Apt trace action (VM state): converts the top of the script stack to a
+// string (sub_82C00AA0, which returns a pointer to the string object; its
+// characters start at +8) and prints it through the host's debug print,
+// which the retail game leaves silent. The conversion made during a trace is
+// logged instead, and passed to the chat keyboard.
+namespace {
+thread_local bool g_in_ui_trace = false;
+}
+
+extern "C" REX_FUNC(__imp__sub_82C11FD8);
+extern "C" REX_FUNC(sub_82C11FD8) {
+  g_in_ui_trace = true;
+  __imp__sub_82C11FD8(ctx, base);
+  g_in_ui_trace = false;
+}
+
+extern "C" REX_FUNC(__imp__sub_82C00AA0);
+extern "C" REX_FUNC(sub_82C00AA0) {
+  __imp__sub_82C00AA0(ctx, base);
+  if (!g_in_ui_trace) {
+    return;
+  }
+  g_in_ui_trace = false;
+  const auto load = [&](uint32_t at) {
+    const uint8_t* p = base + at;
+    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+  };
+  if (const uint32_t object = ctx.r3.u32 ? load(ctx.r3.u32) : 0) {
+    const char* chars = reinterpret_cast<const char*>(base + object + 8);
+    const std::string_view text(chars, strnlen(chars, 512));
+    nhl3on3::chat_keyboard::NoteUiTrace(text);
+    if (REXCVAR_GET(log_ui_trace)) {
+      REXLOG_INFO("[ui] trace: {}", text);
+    }
+  }
 }
 
 void Nhl3on3LocalizeLookupHook(PPCRegister& r1) {

@@ -35,6 +35,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#include "nhl3on3_vr.h"
 #include "runtime_export.h"
 
 REXCVAR_DEFINE_STRING(aspect_ratio, "16:9", "NHL3on3/Display",
@@ -50,7 +51,15 @@ REXCVAR_DEFINE_STRING(ultrawide_fov, "hor+", "NHL3on3/Display",
 
 REXCVAR_DEFINE_STRING(portrait_camera, "topdown", "NHL3on3/Display",
                       "Match camera with a portrait aspect_ratio: topdown (fixed, looking "
-                      "down at the ice) or game (the stock camera)");
+                      "down at the whole rink), classic (closer and more tilted, scrolling "
+                      "up and down the rink with the play) or game (the stock camera)");
+
+REXCVAR_DEFINE_DOUBLE(classic_tilt, 35.0, "NHL3on3/Display",
+                      "Classic portrait camera tilt away from straight down, in degrees");
+
+REXCVAR_DEFINE_DOUBLE(classic_zoom, 0.75, "NHL3on3/Display",
+                      "Classic portrait camera distance, relative to the top-down camera's "
+                      "(smaller is closer)");
 
 REXCVAR_DEFINE_STRING(topdown_direction, "auto", "NHL3on3/Display",
                       "Which end of the rink is at the top of the top-down camera: auto "
@@ -59,6 +68,14 @@ REXCVAR_DEFINE_STRING(topdown_direction, "auto", "NHL3on3/Display",
 
 REXCVAR_DEFINE_DOUBLE(topdown_tilt, 12.0, "NHL3on3/Display",
                       "Top-down camera tilt away from straight down, in degrees");
+
+REXCVAR_DEFINE_DOUBLE(topdown_roof_height, 20.0, "NHL3on3/Display",
+                      "Top-down camera: hide everything higher than this above the ice "
+                      "(arena roof, scoreboard, lights), in game units (about feet). 0 "
+                      "shows everything");
+
+REXCVAR_DEFINE_BOOL(camera_probe, false, "NHL3on3/Debug",
+                    "Log the game camera's fields a few times in a top-down match");
 
 REXCVAR_DEFINE_DOUBLE(topdown_zoom, 1.0, "NHL3on3/Display",
                       "Top-down camera distance, relative to the stock camera's at the "
@@ -89,6 +106,10 @@ constexpr double kNativeAspect = 16.0 / 9.0;
 constexpr int kGuestHeight = 720;
 
 std::atomic<float> g_camera_aspect{0.0f};
+
+// VR: the latest eye's view window (tangents), for culling.
+std::atomic<float> g_vr_cull_tan_x{0.0f};
+std::atomic<float> g_vr_cull_tan_y{0.0f};
 
 bool ParsePair(std::string_view text, double& a, double& b) {
   size_t sep = text.find_first_of(":xX");
@@ -139,7 +160,11 @@ void SetIfDefault(std::string_view name, std::string_view value) {
 namespace nhl3on3 {
 
 void ConfigureDisplay() {
-  const std::string fps = REXCVAR_GET(fps_cap);
+  std::string fps = REXCVAR_GET(fps_cap);
+  if (vr::Enabled() && !rex::cvar::HasNonDefaultValue("fps_cap")) {
+    // Each eye gets every other frame.
+    fps = "120";
+  }
   if (fps == "unlocked" || fps == "0") {
     SetIfDefault("vsync", "false");
     REXLOG_INFO("Frame rate: unlocked");
@@ -447,6 +472,9 @@ extern "C" REX_FUNC(__imp__VdSwap) {
   static const nhl3on3::GuestFunc original = nhl3on3::ResolveRuntimeExport("__imp__VdSwap");
   static std::once_flag draw_hooks;
   std::call_once(draw_hooks, nhl3on3::InstallDrawHooks);
+  if (nhl3on3::vr::Enabled()) {
+    nhl3on3::vr::OnGuestSwap();
+  }
   if (REXCVAR_GET(latency_probe)) {
     probe::OnSwap(base, ctx.r3.u32);
   }
@@ -533,8 +561,10 @@ struct State {
   Vec3 written_at{};
   float distance = 0.0f;
   float handedness = 1.0f;
+  float follow = 0.0f;  // classic: camera target along screen up, smoothed
   int logged = 0;
 };
+State g_state;
 
 bool Near(const Vec3& a, const Vec3& b) {
   return std::fabs(a[0] - b[0]) < 1e-3f && std::fabs(a[1] - b[1]) < 1e-3f &&
@@ -557,6 +587,7 @@ void FollowStockDirection(State& state, const Vec3& right, const Vec3& up, const
     return;
   }
   state.rink_long = state.rink_long * -1.0f;
+  state.follow = -state.follow;
   REXLOG_INFO("Topdown: side camera right {}; screen up is {}", Format(right),
               Format(state.rink_long));
 }
@@ -606,9 +637,10 @@ void UpdateStickMap(const Vec3& world_up, const Vec3& right, const Vec3& up, con
   g_stick.updated = std::chrono::steady_clock::now();
 }
 
-void Apply(uint8_t* matrix) {
+// Returns the world up axis.
+Vec3 Apply(uint8_t* matrix) {
   using Clock = std::chrono::steady_clock;
-  static State state;
+  State& state = g_state;
   const Clock::time_point now = Clock::now();
   if (now - state.last_call > std::chrono::seconds(1)) {
     state.latched = false;
@@ -664,12 +696,40 @@ void Apply(uint8_t* matrix) {
 
   const Vec3 screen_up =
       REXCVAR_GET(topdown_direction) == "reverse" ? state.rink_long * -1.0f : state.rink_long;
-  const float tilt = float(std::clamp(REXCVAR_GET(topdown_tilt), 0.0, 80.0) * 3.14159265358979 / 180.0);
-  const float zoom = float(std::clamp(REXCVAR_GET(topdown_zoom), 0.1, 10.0));
+  const bool classic = REXCVAR_GET(portrait_camera) == "classic" && !nhl3on3::vr::Enabled();
+  const double tilt_degrees = classic ? REXCVAR_GET(classic_tilt) : REXCVAR_GET(topdown_tilt);
+  const float tilt = float(std::clamp(tilt_degrees, 0.0, 80.0) * 3.14159265358979 / 180.0);
+  const float zoom = float(std::clamp(
+      classic ? REXCVAR_GET(classic_zoom) * REXCVAR_GET(topdown_zoom) : REXCVAR_GET(topdown_zoom),
+      0.1, 10.0));
+
+  // Classic: the camera scrolls along the rink to where the stock camera looks
+  // (it follows the puck), stopping where the end boards reach the screen
+  // edge. The stock view's height spans 2 * distance * 0.375 / ratio of the ice
+  // at zoom 1 (view window 0.375 high, widened by 16:9 / aspect).
+  if (!classic) {
+    state.follow = 0.0f;
+  } else if (!IsPlaceholder(right, up, at) && !Near(at, state.written_at)) {
+    const float descent = -Dot(at, state.world_up);
+    if (descent > 0.05f) {
+      const Vec3 look = pos + at * (Dot(pos, state.world_up) / descent);
+      const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
+      const float half_view =
+          state.distance * 0.375f * (aspect > 0.0f ? float(kNativeAspect) / aspect : 1.0f);
+      const float limit = std::max(0.0f, half_view * (1.0f - zoom));
+      const float target = std::clamp(Dot(look, screen_up), -limit, limit);
+      static Clock::time_point last_follow;
+      const float dt = std::min(
+          0.1f, std::chrono::duration<float>(now - last_follow).count());
+      last_follow = now;
+      state.follow += (target - state.follow) * (1.0f - std::exp(-dt / 0.25f));
+    }
+  }
+
   const Vec3 new_at = state.world_up * -std::cos(tilt) + screen_up * std::sin(tilt);
   const Vec3 new_up = state.world_up * std::sin(tilt) + screen_up * std::cos(tilt);
   const Vec3 new_right = Cross(new_up, new_at) * state.handedness;
-  const Vec3 new_pos = new_at * -(state.distance * zoom);
+  const Vec3 new_pos = screen_up * state.follow + new_at * -(state.distance * zoom);
   if (!IsPlaceholder(right, up, at) && !Near(at, state.written_at)) {
     UpdateStickMap(state.world_up, right, up, at, new_right, screen_up);
   } else if (Near(at, state.written_at)) {
@@ -682,6 +742,92 @@ void Apply(uint8_t* matrix) {
   StoreRow(matrix, 2, new_at);
   StoreRow(matrix, 3, new_pos);
   state.written_at = new_at;
+  return state.world_up;
+}
+
+// Clip-space plane that keeps what's at most topdown_roof_height above the
+// ice, for the GPU's user clip plane (kept where dot(plane, clip) >= 0).
+// Assumes the game's D3D-style projection: clip x = x / window width, y = y /
+// window height, z = far / (far - near) * (z - near), w = z, in view space.
+struct RoofPlane {
+  float plane[4] = {};
+  std::chrono::steady_clock::time_point updated;
+};
+std::mutex g_roof_mutex;
+RoofPlane g_roof;
+
+void PublishRoof(const uint8_t* camera, const Vec3& world_up, float window_w, float window_h) {
+  const float height = float(REXCVAR_GET(topdown_roof_height));
+  if (height <= 0.0f) {
+    return;
+  }
+  const float near_clip = LoadFloat(camera + 112);
+  const float far_clip = LoadFloat(camera + 116);
+  if (!(near_clip > 0.0f && far_clip > near_clip && window_w > 0.0f && window_h > 0.0f)) {
+    return;
+  }
+  const Vec3 right = LoadRow(camera, 0);
+  const Vec3 up = LoadRow(camera, 1);
+  const Vec3 at = LoadRow(camera, 2);
+  const Vec3 pos = LoadRow(camera, 3);
+  // height - (world_up . p) with p = pos + x right + y up + z at, and the
+  // constant rewritten as (Z - A W) / B since clip space has no constant term.
+  const float a = far_clip / (far_clip - near_clip);
+  const float b = -near_clip * a;
+  const float k = height - Dot(world_up, pos);
+  const float plane[4] = {-window_w * Dot(world_up, right), -window_h * Dot(world_up, up), k / b,
+                          -k * a / b - Dot(world_up, at)};
+  static float logged[4] = {};
+  if (std::fabs(plane[1] - logged[1]) + std::fabs(plane[2] - logged[2]) +
+          std::fabs(plane[3] - logged[3]) >
+      1e-3f) {
+    std::memcpy(logged, plane, sizeof(plane));
+    REXLOG_INFO("Topdown: roof cut {:.1f} above the ice (camera {:.1f} up, near {:g} far {:g}), "
+                "clip plane ({:.4f}, {:.4f}, {:.4f}, {:.4f})",
+                height, Dot(world_up, pos), near_clip, far_clip, plane[0], plane[1], plane[2],
+                plane[3]);
+  }
+  std::lock_guard lock(g_roof_mutex);
+  std::memcpy(g_roof.plane, plane, sizeof(plane));
+  g_roof.updated = std::chrono::steady_clock::now();
+}
+
+// VR: the camera at a tracked eye, with the rink as a model on a table in
+// front of the player. The headset's seated space (x right, y up, -z ahead)
+// maps to the rink as the top-down view shows it: ahead is the end at the top
+// of that view, so the sticks work the same way.
+void ApplyEye(uint8_t* matrix, const nhl3on3::vr::EyeView& eye) {
+  float scale, centre[3];
+  nhl3on3::vr::TableTransform(scale, centre);
+  const Vec3 up_axis = g_state.world_up;
+  const Vec3 ahead_axis =
+      REXCVAR_GET(topdown_direction) == "reverse" ? g_state.rink_long * -1.0f : g_state.rink_long;
+  // The camera's right row points to the left of the screen (RenderWare), so
+  // the player's right is the top-down camera's right row reversed.
+  const Vec3 left_axis = Cross(ahead_axis, up_axis * -1.0f) * g_state.handedness;
+  auto to_game = [&](float x, float y, float z) {
+    return left_axis * -x + up_axis * y + ahead_axis * -z;
+  };
+  // v + 2 w (q x v) + 2 q x (q x v), q = (x, y, z).
+  const Vec3 q{eye.orientation[0], eye.orientation[1], eye.orientation[2]};
+  const float w = eye.orientation[3];
+  auto rotate = [&](const Vec3& v) {
+    const Vec3 t = Cross(q, v) * 2.0f;
+    return v + t * w + Cross(q, t);
+  };
+  const Vec3 xr_up = rotate(Vec3{0.0f, 1.0f, 0.0f});
+  const Vec3 xr_ahead = rotate(Vec3{0.0f, 0.0f, -1.0f});
+  const Vec3 at = to_game(xr_ahead[0], xr_ahead[1], xr_ahead[2]);
+  const Vec3 up = to_game(xr_up[0], xr_up[1], xr_up[2]);
+  const Vec3 right = Cross(up, at) * g_state.handedness;
+  const Vec3 pos = to_game((eye.position[0] - centre[0]) / scale,
+                           (eye.position[1] - centre[1]) / scale,
+                           (eye.position[2] - centre[2]) / scale);
+  StoreRow(matrix, 0, right);
+  StoreRow(matrix, 1, up);
+  StoreRow(matrix, 2, at);
+  StoreRow(matrix, 3, pos);
+  g_state.written_at = at;
 }
 
 }  // namespace topdown
@@ -719,21 +865,67 @@ void RemapPadSticks(uint8_t* base, uint32_t state) {
   }
 }
 
+bool RoofClipPlane(float plane[4]) {
+  std::lock_guard lock(topdown::g_roof_mutex);
+  if (std::chrono::steady_clock::now() - topdown::g_roof.updated >
+      std::chrono::milliseconds(500)) {
+    return false;
+  }
+  std::memcpy(plane, topdown::g_roof.plane, sizeof(topdown::g_roof.plane));
+  return true;
+}
+
 }  // namespace nhl3on3
+
+// The stock match camera's view window width (16:9, 0.6667 x 0.375).
+constexpr double kTopdownWindowWidth = 2.0 / 3.0;
 
 // r25 = camera (matrix at +0), f1 = render target aspect, f13 / f0 = view
 // window width / height about to be stored.
 void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister& f1,
                                  PPCRegister& f13) {
+  if (nhl3on3::vr::Enabled()) {
+    nhl3on3::vr::EyeView eye;
+    auto* memory = REX_KERNEL_MEMORY();
+    if (!memory || std::fabs(float(f1.f64) - float(kNativeAspect)) >= 0.001f ||
+        !nhl3on3::vr::FrameEye(eye)) {
+      return;
+    }
+    uint8_t* camera = memory->virtual_membase() + r25.u32;
+    const topdown::Vec3 world_up = topdown::Apply(camera);
+    topdown::ApplyEye(camera, eye);
+    f13.f64 = double(eye.tan_x);
+    f0.f64 = double(eye.tan_y);
+    g_vr_cull_tan_x.store(eye.tan_x, std::memory_order_relaxed);
+    g_vr_cull_tan_y.store(eye.tan_y, std::memory_order_relaxed);
+    nhl3on3::vr::NoteStereoFrame();
+    topdown::PublishRoof(camera, world_up, eye.tan_x, eye.tan_y);
+    return;
+  }
   const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
   if (aspect <= 0.0f || std::fabs(float(f1.f64) - float(kNativeAspect)) >= 0.001f) {
     return;
   }
   const bool topdown =
-      aspect < float(kNativeAspect) && REXCVAR_GET(portrait_camera) == "topdown";
+      aspect < float(kNativeAspect) && (REXCVAR_GET(portrait_camera) == "topdown" ||
+                                        REXCVAR_GET(portrait_camera) == "classic");
+  const uint8_t* camera = nullptr;
+  topdown::Vec3 world_up{};
   if (topdown) {
     if (auto* memory = REX_KERNEL_MEMORY()) {
-      topdown::Apply(memory->virtual_membase() + r25.u32);
+      world_up = topdown::Apply(memory->virtual_membase() + r25.u32);
+      camera = memory->virtual_membase() + r25.u32;
+      if (REXCVAR_GET(camera_probe)) {
+        static std::atomic<int> calls{0};
+        const int call = calls.fetch_add(1);
+        if (call == 0 || call == 600 || call == 3000) {
+          std::string line;
+          for (int offset = 64; offset < 384; offset += 4) {
+            line += fmt::format(" +{}={:g}", offset, topdown::LoadFloat(camera + offset));
+          }
+          REXLOG_INFO("Topdown: camera {:08X} fields{}", r25.u32, line);
+        }
+      }
     }
   }
   const float ratio = float(aspect / kNativeAspect);
@@ -749,6 +941,20 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
                 f13.f64, f0.f64, width, height,
                 topdown ? "topdown" : (hor_plus ? "hor+" : (ratio > 1.0f ? "vert-" : "vert+")));
   }
+  if (camera) {
+    // Every camera through here gets the same fixed view: the stock 16:9 width
+    // and the portrait height. The game also passes a narrower camera (and
+    // zooms); left narrow, it culls players beyond its edges out of the view.
+    static std::atomic<int> odd_windows{0};
+    if (std::fabs(f13.f64 - kTopdownWindowWidth) > 0.01 && odd_windows.fetch_add(1) < 5) {
+      REXLOG_INFO("Topdown: camera {:08X} view window {:.4f} x {:.4f} set to the full view",
+                  r25.u32, f13.f64, f0.f64);
+    }
+    f13.f64 = kTopdownWindowWidth;
+    f0.f64 = kTopdownWindowWidth / double(aspect);
+    topdown::PublishRoof(camera, world_up, float(f13.f64), float(f0.f64));
+    return;
+  }
   if (hor_plus) {
     f13.f64 = double(float(f13.f64) * ratio);
   } else {
@@ -756,20 +962,47 @@ void Nhl3on3GameCameraWindowHook(PPCRegister& r25, PPCRegister& f0, PPCRegister&
   }
 }
 
-// r31 = frustum: horizontal and vertical half-angles (radians, big-endian
-// floats) at +0 / +4.
-void Nhl3on3CullFrustumHook(PPCRegister& r31) {
+namespace {
+
+// frustum: horizontal and vertical half-angles (radians, big-endian floats)
+// at +0 / +4.
+void WidenCullFrustum(uint8_t* frustum) {
+  if (nhl3on3::vr::Enabled()) {
+    // The eye's view window, with a margin for head motion before the frame
+    // is shown.
+    const float tans[2] = {g_vr_cull_tan_x.load(std::memory_order_relaxed),
+                           g_vr_cull_tan_y.load(std::memory_order_relaxed)};
+    for (int i = 0; i < 2; ++i) {
+      uint8_t* angle = frustum + 4 * i;
+      const float half = topdown::LoadFloat(angle);
+      if (tans[i] > 0.0f && half > 0.0f && half < 1.5f) {
+        topdown::StoreFloat(angle, std::min(std::max(half, std::atan(tans[i]) * 1.15f), 1.5f));
+      }
+    }
+    return;
+  }
   const float aspect = g_camera_aspect.load(std::memory_order_relaxed);
   if (aspect <= 0.0f) {
     return;
   }
-  auto* memory = REX_KERNEL_MEMORY();
-  if (!memory) {
+  const std::string portrait_camera = REXCVAR_GET(portrait_camera);
+  if (aspect < float(kNativeAspect) &&
+      (portrait_camera == "topdown" || portrait_camera == "classic")) {
+    // The frustum may come from the game's own camera, which keeps swinging
+    // around the rink while ours stays put: open it almost fully so nothing
+    // in our view is culled.
+    for (int i = 0; i < 2; ++i) {
+      uint8_t* angle = frustum + 4 * i;
+      const float half = topdown::LoadFloat(angle);
+      if (half > 0.0f && half < 1.45f) {
+        topdown::StoreFloat(angle, 1.45f);
+      }
+    }
     return;
   }
   const float ratio = float(aspect / kNativeAspect);
   const bool hor_plus = ratio > 1.0f && REXCVAR_GET(ultrawide_fov) != "vert-";
-  uint8_t* angle = memory->virtual_membase() + r31.u32 + (hor_plus ? 0 : 4);
+  uint8_t* angle = frustum + (hor_plus ? 0 : 4);
   const float widen = hor_plus ? ratio : 1.0f / ratio;
   if (widen <= 1.0f) {
     return;
@@ -779,6 +1012,23 @@ void Nhl3on3CullFrustumHook(PPCRegister& r31) {
     return;
   }
   topdown::StoreFloat(angle, std::min(std::atan(std::tan(half) * widen), 1.5f));
+}
+
+}  // namespace
+
+// r31 = frustum (see WidenCullFrustum); f1 = its horizontal half-angle, which
+// the function goes on to make the bounding cone from.
+void Nhl3on3CullFrustumHook(PPCRegister& r31, PPCRegister& f1) {
+  auto* memory = REX_KERNEL_MEMORY();
+  if (!memory) {
+    return;
+  }
+  WidenCullFrustum(memory->virtual_membase() + r31.u32);
+  const uint8_t* angles = memory->virtual_membase() + r31.u32;
+  const float widest = std::max(topdown::LoadFloat(angles), topdown::LoadFloat(angles + 4));
+  if (widest > float(f1.f64) && widest < 1.5f) {
+    f1.f64 = double(widest);
+  }
 }
 
 // r31 = projected point: x, y in 1280x720 frame pixels (big-endian floats).

@@ -3,8 +3,8 @@
 One small Python process (standard library only) that does everything online
 play needs:
 
-- **Lobby** (TCP 10901, 30380, 42127): sign-in, quick match and game
-  membership, replacing EA's servers.
+- **Lobby** (TCP 10901, 30380, 42127): sign-in, quick match, created sessions
+  and game membership, replacing EA's servers.
 - **Tunnel** (UDP 3670): each game registers and gets a virtual address
   (`10.66.x.y`). All traffic between players goes through the server, so
   nobody has to forward ports, and players behind any home router can play.
@@ -27,6 +27,13 @@ There is nothing to configure:
   The host starts the match once everyone is ready. A game can have up to 8
   consoles and 8 players (guests count; 3 skaters and a goalie per side).
   After it starts, new searchers wait for, or open, the next game.
+- **Create Session** (the online menu's first item, in place of Play a Friend)
+  opens a game with you as host, waiting for players. It shows up in
+  **Online Team Play → Custom Match** for everyone with the same roster pack,
+  and Online Team Play quick match searches join it too, unless it was
+  created as a private session. After that it plays like any team play game:
+  everyone lands on Select Sides and the host starts the match. A ranked
+  session takes one opponent.
 
 ## Hosting on Fly.io
 

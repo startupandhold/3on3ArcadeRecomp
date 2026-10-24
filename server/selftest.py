@@ -2,7 +2,8 @@
 """Exercises a running server the way game instances would: tunnel
 registration and forwarding, ranked and team play quick matches (a team play
 game opens with two players, a third joins it, and starting it closes it),
-lockstep relay frames, and renaming a gamertag that is already signed in.
+lockstep relay frames, renaming a gamertag that is already signed in, and a
+created session that is listed, joined and closed when its host leaves.
 
     python selftest.py [host]
 """
@@ -53,7 +54,9 @@ class Player:
                 length = struct.unpack(">I", self.buffer[8:12])[0]
                 if len(self.buffer) < length:
                     break
-                out.append((self.buffer[:4], lobby_fields(self.buffer[12:length].split(b"\0")[0])))
+                # An error reply's command includes its status, e.g. b"gjoiugam".
+                cmd = self.buffer[:4] if self.buffer[4:8] == b"\0\0\0\0" else self.buffer[:8]
+                out.append((cmd, lobby_fields(self.buffer[12:length].split(b"\0")[0])))
                 self.buffer = self.buffer[length:]
         return out
 
@@ -147,6 +150,35 @@ def main():
     names = [f.get("NAME") for cmd, f in e.frames(1) if cmd in (b"auth", b"pers")]
     assert names == ["alpha2", "alpha2"], names
     print("duplicate gamertag renamed")
+
+    # Created session: India hosts it and Delta's waiting team play search
+    # joins it; Juliett finds it in the Custom Match list and joins it.
+    i, j = Player("India"), Player("Juliett")
+    i.frames(0.3)
+    i.tcp.sendall(lobby_frame(b"gcre", {"NAME": "India", "SYSFLAGS": 0, "MAXSIZE": 2}))
+    created = [f for cmd, f in i.frames(1.5) if cmd == b"gcre"]
+    assert created and created[0]["HOST"] == "India", created
+    game_id = created[0]["IDENT"]
+    mgm = d.last_mgm()
+    assert mgm and mgm["IDENT"] == game_id and mgm["COUNT"] == "2", mgm
+    j.frames(0.3)
+    j.tcp.sendall(lobby_frame(b"gsea", {"COUNT": 20, "SYSFLAGS": 0}))
+    listed = j.frames(1)
+    rows = [f for cmd, f in listed if cmd == b"+gam"]
+    assert any(cmd == b"gsea" for cmd, _ in listed), listed
+    assert [r["IDENT"] for r in rows] == [game_id] and rows[0]["COUNT"] == "2", rows
+    j.tcp.sendall(lobby_frame(b"gjoi", {"IDENT": game_id}))
+    mgm = i.last_mgm()
+    assert mgm and mgm["COUNT"] == "3" and mgm["OPPO2"] == "Juliett", mgm
+    print("created session listed and joined")
+
+    j.tcp.sendall(lobby_frame(b"gjoi", {"IDENT": 999999}))
+    assert any(cmd == b"gjoiugam" for cmd, _ in j.frames(1)), "joined an unknown game"
+    i.tcp.sendall(lobby_frame(b"glea", {}))
+    i.frames(0.5)
+    j.tcp.sendall(lobby_frame(b"gsea", {"COUNT": 20}))
+    assert not [f for cmd, f in j.frames(1) if cmd == b"+gam"], "listed a game without a host"
+    print("a session closes when its host leaves")
 
     # Roster packs: a stock game (roster 0, or none sent) never meets a pack.
     f, g, h = Player("Foxtrot", 0x1234ABCD), Player("Golf", 0), Player("Hotel", 0x1234ABCD)

@@ -221,11 +221,14 @@ registers = ["r25", "f0", "f1", "f13"]
 # Ultrawide / portrait: sub_8279C150 builds the culling frustum from the
 # camera's horizontal and vertical half-angles (radians, just stored at +0 /
 # +4 of r31), not from the view window above. The hook widens them to match
-# the widened view, or objects in the extra view are culled.
+# the widened view, or objects in the extra view are culled. f1 still holds
+# the horizontal half-angle, which the next call turns into the bounding cone
+# at +8; the hook sets it to the wider of the two, or a tall (portrait) view
+# loses objects at its top and bottom.
 [[midasm_hook]]
 name = "Nhl3on3CullFrustumHook"
 address = 0x8279C17C
-registers = ["r31"]
+registers = ["r31", "f1"]
 
 # Ultrawide / portrait: sub_8272E080 projects a world point (r4) to screen
 # pixels for the in-game overlays (player arrows and names): 0-1 from

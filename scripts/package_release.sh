@@ -80,6 +80,7 @@ if [[ -f $win_build/nhl3on3.exe ]]; then
   require "$win_build/nhl3on3.exe" "$win_build/rexruntime.dll" "$win_build/rexgpu-xenos.dll"
   require_fresh "$win_build/nhl3on3.exe"
   cp "$win_build/nhl3on3.exe" "$win_build/rexruntime.dll" "$win_build/rexgpu-xenos.dll" "$dir/"
+  cp thirdparty/openxr/bin/openxr_loader.dll "$dir/"
   cp launcher/nhl3on3_launcher.ps1 "launcher/NHL3on3 Launcher.bat" "$dir/"
   cp release/README-windows.txt "$dir/README.txt"
   if [[ -n $vcredist && -d $vcredist ]]; then

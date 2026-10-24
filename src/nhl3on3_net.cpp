@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <random>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1066,38 +1067,96 @@ uint32_t CaptureSocketError(PPCContext& ctx, uint8_t* base) {
 
 namespace {
 
-// Whether the last quick match search was ranked, from the gqwk request's
-// SYSFLAGS. Team play side picks only apply to unranked games.
+// Whether the current lobby game is ranked: from the SYSFLAGS of the gqwk or
+// gcre request, then of the game the server reports. Team play side picks
+// only apply to unranked games.
 constexpr uint32_t kRankedSysflag = 1u << 18;
 std::atomic<bool> g_ranked_search{false};
 // Consoles in the current lobby game, from the COUNT of the server's +mgm
 // (membership) and +ses (game started) updates.
 std::atomic<int> g_game_consoles{0};
 
-// (caller, socket, buffer, length): notes each lobby gqwk the game sends.
+// The value of `key` in a lobby body ("\nKEY=value" lines), if present.
+std::optional<std::string_view> LobbyField(std::string_view body, std::string_view key) {
+  for (size_t at = 0; at < body.size();) {
+    size_t end = body.find('\n', at);
+    if (end == std::string_view::npos) end = body.size();
+    const std::string_view line = body.substr(at, end - at);
+    if (line.size() > key.size() && line.substr(0, key.size()) == key && line[key.size()] == '=') {
+      return line.substr(key.size() + 1);
+    }
+    at = end + 1;
+  }
+  return std::nullopt;
+}
+
+// A lobby body on one line for the log, without addresses and passwords.
+std::string LobbySummary(std::string_view body) {
+  std::string out;
+  for (size_t at = 0; at < body.size() && out.size() < 240;) {
+    size_t end = body.find_first_of("\n\t", at);
+    if (end == std::string_view::npos) end = body.size();
+    std::string_view line = body.substr(at, end - at);
+    if (const size_t nul = line.find('\0'); nul != std::string_view::npos) {
+      line = line.substr(0, nul);
+      end = body.size();
+    }
+    const bool hidden = line.starts_with("MADDR") || line.starts_with("MA=") ||
+                        line.starts_with("PASS=") || line.starts_with("LKEY=");
+    if (!line.empty() && !hidden) {
+      out.append(out.empty() ? "" : " ").append(line);
+    }
+    at = end + 1;
+  }
+  return out.size() > 240 ? out.substr(0, 240) + "..." : out;
+}
+
+bool RankedFlags(std::string_view value) {
+  return (uint32_t(std::strtoul(std::string(value.substr(0, 12)).c_str(), nullptr, 10)) &
+          kRankedSysflag) != 0;
+}
+
+// (caller, socket, buffer, length): each request that puts the game in a new
+// lobby game (gqwk quick match search, gcre create session, gjoi join from
+// the Custom Match list) starts a fresh team play lobby.
 void NoteLobbySend(const uint8_t* base, uint32_t buffer, uint32_t length) {
-  if (!Online() || !buffer || length < 12 || std::memcmp(base + buffer, "gqwk", 4) != 0) {
+  if (!Online() || !buffer || length < 12) {
     return;
   }
+  const std::string_view cmd(reinterpret_cast<const char*>(base + buffer), 4);
   const std::string_view body(reinterpret_cast<const char*>(base + buffer + 12), length - 12);
-  const size_t at = body.find("SYSFLAGS=");
-  if (at == std::string_view::npos) {
+  if (cmd != "~png") {
+    REXLOG_INFO("[lobby] -> {} {}", cmd, LobbySummary(body));
+  }
+  if (cmd != "gqwk" && cmd != "gcre" && cmd != "gjoi") {
     return;
   }
-  const uint32_t flags = uint32_t(std::strtoul(std::string(body.substr(at + 9, 12)).c_str(),
-                                               nullptr, 10));
-  const bool ranked = (flags & kRankedSysflag) != 0;
+  const auto flags = LobbyField(body, "SYSFLAGS");
+  if (cmd == "gqwk" && !flags) {
+    return;  // MODE=3 cancels a search
+  }
+  const bool ranked = flags && RankedFlags(*flags);
   g_ranked_search.store(ranked);
   g_game_consoles.store(0);
   nhl3on3::team_lobby::Reset();
-  REXLOG_INFO("[mm] quick match search: {}", ranked ? "ranked" : "unranked (team play)");
+  const char* kind = ranked ? "ranked" : "unranked (team play)";
+  if (cmd == "gqwk") {
+    REXLOG_INFO("[mm] quick match search: {}", kind);
+  } else if (cmd == "gcre") {
+    REXLOG_INFO("[mm] create session: {}", kind);
+  } else {
+    REXLOG_INFO("[mm] join session {}", LobbyField(body, "IDENT").value_or("?"));
+  }
 }
 
 // (buffer, received bytes): the game reads each lobby packet as a 12-byte
 // header (cmd, status, BE size including the header) and then its body; a
-// +mgm (membership) or +ses (game started) body updates the console count.
+// +mgm (membership), +ses (game started), gcre or gjoi body updates the
+// console count and whether the game is ranked.
 void NoteLobbyRecv(const uint8_t* base, uint32_t buffer, uint32_t received) {
   static thread_local uint32_t pending_body = 0;
+  static thread_local char pending_cmd[9] = {};
+  static thread_local bool pending_game = false;
   if (!Online() || !buffer || received == 0xFFFFFFFF || received == 0) {
     return;
   }
@@ -1105,19 +1164,46 @@ void NoteLobbyRecv(const uint8_t* base, uint32_t buffer, uint32_t received) {
   if (pending_body && received == pending_body) {
     pending_body = 0;
     const std::string body = "\n" + std::string(reinterpret_cast<const char*>(data), received);
+    REXLOG_INFO("[lobby] <- {} {}", pending_cmd, LobbySummary(std::string_view(body).substr(1)));
+    if (!pending_game) {
+      return;
+    }
     if (const size_t at = body.find("\nCOUNT="); at != std::string::npos) {
       const int consoles = std::atoi(body.c_str() + at + 7);
       if (g_game_consoles.exchange(consoles) != consoles) {
         REXLOG_INFO("[mm] lobby game has {} consoles", consoles);
       }
     }
+    if (const size_t at = body.find("\nSYSFLAGS="); at != std::string::npos) {
+      const bool ranked = RankedFlags(std::string_view(body).substr(at + 10));
+      if (g_ranked_search.exchange(ranked) != ranked) {
+        REXLOG_INFO("[mm] lobby game is {}", ranked ? "ranked" : "unranked (team play)");
+      }
+    }
     return;
   }
   pending_body = 0;
-  if (received == 12 &&
-      (std::memcmp(data, "+mgm", 4) == 0 || std::memcmp(data, "+ses", 4) == 0)) {
-    const uint32_t size = LoadBE32(data + 8);
-    pending_body = size > 12 ? size - 12 : 0;
+  if (received != 12 || std::memcmp(data, "~png", 4) == 0) {
+    return;
+  }
+  // The command and its 4-character status (zero on success) for the log.
+  std::memcpy(pending_cmd, data, 4);
+  pending_cmd[4] = 0;
+  if (LoadBE32(data + 4) != 0) {
+    std::memcpy(pending_cmd + 4, data + 4, 4);
+    pending_cmd[8] = 0;
+    for (int i = 4; i < 8; ++i) {
+      if (pending_cmd[i] < 0x20 || pending_cmd[i] > 0x7E) pending_cmd[i] = '?';
+    }
+  }
+  // Error replies (a nonzero status) carry no game.
+  pending_game = LoadBE32(data + 4) == 0 &&
+                 (std::memcmp(data, "+mgm", 4) == 0 || std::memcmp(data, "+ses", 4) == 0 ||
+                  std::memcmp(data, "gcre", 4) == 0 || std::memcmp(data, "gjoi", 4) == 0);
+  const uint32_t size = LoadBE32(data + 8);
+  pending_body = size > 12 ? size - 12 : 0;
+  if (!pending_body) {
+    REXLOG_INFO("[lobby] <- {}", pending_cmd);
   }
 }
 
@@ -2209,7 +2295,46 @@ NHL3ON3_TRACE_PASSTHROUGH(XNetLogonGetMachineID)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetStartup)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_WSAStartup)
 NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetQosListen)
-NHL3ON3_TRACE_PASSTHROUGH(NetDll_XNetQosLookup)
+
+// (caller, cxna, XNADDR* apxna[], XNKID* apxnkid[], XNKEY* apxnkey[], cina,
+//  IN_ADDR aina[], DWORD adwServiceId[], cProbes, dwBitsPerSec, dwFlags,
+//  WSAEVENT, XNQOS** out): QoS probes of other consoles (cxna) and servers
+// (cina). The SDK's is a stub that never completes, and the lobby waits on
+// it, so every target is reported as reached with a good connection.
+extern "C" REX_FUNC(__imp__NetDll_XNetQosLookup) {
+  NHL3ON3_TRACE("XNetQosLookup");
+  NHL3ON3_ORIGINAL(__imp__NetDll_XNetQosLookup);
+  if (!Online()) {
+    return original(ctx, base);
+  }
+  const auto stack_arg = [&](int arg) {
+    return LoadBE32(base + ctx.r1.u32 + 0x54 + (arg - 8) * 8);
+  };
+  const uint32_t targets = ctx.r4.u32 + ctx.r8.u32;
+  const uint32_t event = stack_arg(11), out = stack_arg(12);
+  REXLOG_INFO("[net] XNetQosLookup({} consoles, {} servers)", ctx.r4.u32, ctx.r8.u32);
+  if (out) {
+    const uint32_t entries = std::max<uint32_t>(targets, 1);
+    const uint32_t size = uint32_t(offsetof(XnQos, info) + sizeof(XnQosInfo) * entries);
+    const uint32_t guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(size);
+    std::memset(base + guest, 0, size);
+    auto* qos = reinterpret_cast<XnQos*>(base + guest);
+    StoreBE32(qos->count, targets);
+    for (uint32_t i = 0; i < targets; ++i) {
+      XnQosInfo& info = qos->info[i];
+      info.flags = kQosInfoContacted;
+      StoreBE16(info.probes_xmit, 4);
+      StoreBE16(info.probes_recv, 4);
+      StoreBE16(info.rtt_min, 20);
+      StoreBE16(info.rtt_med, 25);
+      StoreBE32(info.up_bps, 10'000'000);
+      StoreBE32(info.down_bps, 50'000'000);
+    }
+    StoreBE32(base + out, guest);
+  }
+  SignalEvent(event);
+  ctx.r3.u64 = 0;
+}
 
 uint32_t Nhl3on3LocalIp() {
   return State().local_ip;

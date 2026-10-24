@@ -18,6 +18,10 @@ void NotePadRead();
 // move players the way they point on screen. No-op otherwise.
 void RemapPadSticks(uint8_t* base, uint32_t state);
 
+// Top-down camera roof cut: the clip-space plane (kept where dot(plane, clip)
+// >= 0) for 3D scene draws. False when it's off or no top-down match is on.
+bool RoofClipPlane(float plane[4]);
+
 // Wraps the GPU command processor's draw and swap (nhl3on3_widescreen.cpp).
 // Call once the guest GPU is set up.
 void InstallDrawHooks();

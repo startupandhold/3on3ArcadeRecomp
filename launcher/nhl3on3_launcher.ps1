@@ -30,6 +30,9 @@ $Settings = @(
   @{ Tab = 'Display'; Key = 'aspect_ratio'; Label = 'Aspect ratio'; Kind = 'edit'; Toml = 'string'; Default = '16:9'
      Choices = [ordered]@{ '16:9' = '16:9'; '21:9' = '21:9'; '32:9' = '32:9'; 'auto' = 'auto' }
      Tip = "Wider than 16:9 widens the in-game camera (ultrawide).`n'auto' matches the desktop; you can also type W:H or a resolution such as 3440x1440." }
+  @{ Tab = 'Display'; Key = 'portrait_camera'; Label = 'Portrait: match camera'; Kind = 'choice'; Toml = 'string'; Default = 'topdown'
+     Choices = [ordered]@{ 'topdown' = 'Top-down (whole rink)'; 'classic' = 'Classic (tilted, follows play)'; 'game' = 'Game camera' }
+     Tip = "Portrait aspect ratios only. Classic is closer and more tilted, like old-school hockey games,`nand scrolls up and down the rink with the play." }
   @{ Tab = 'Display'; Key = 'fps_cap'; Label = 'Frame rate cap'; Kind = 'edit'; Toml = 'string'; Default = '60'
      Choices = [ordered]@{ '60' = '60'; '90' = '90'; '120' = '120'; '144' = '144'; '165' = '165'; '240' = '240'; 'unlocked' = 'unlocked' }
      Tip = "60 is stock. Any value from 24 to 240, or 'unlocked'." }
@@ -47,6 +50,9 @@ $Settings = @(
   @{ Tab = 'Game'; Key = 'input_backend'; Label = 'Controller input'; Kind = 'choice'; Toml = 'string'; Default = 'sdl'
      Choices = [ordered]@{ 'sdl' = 'SDL'; 'xinput' = 'XInput' } }
   @{ Tab = 'Game'; Key = 'mnk_mode'; Label = 'Keyboard as controller'; Kind = 'bool'; Toml = 'bool'; Default = 'false' }
+
+  @{ Tab = 'VR'; Key = 'vr'; Label = 'VR headset (OpenXR)'; Kind = 'bool'; Toml = 'bool'; Default = 'false'
+     Tip = "Matches in 3D on a tabletop rink, menus on a virtual screen.`nNeeds an OpenXR runtime (Virtual Desktop VDXR, SteamVR, Oculus) and runs at 120 FPS (60 per eye)." }
 
   @{ Tab = 'Online'; Key = 'online'; Label = 'Online play'; Kind = 'bool'; Toml = 'bool'; Default = 'false' }
   @{ Tab = 'Online'; Key = 'online_gamertag'; Label = 'Gamertag'; Kind = 'text'; Toml = 'string'; Default = ''

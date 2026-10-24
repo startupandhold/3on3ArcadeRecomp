@@ -35,6 +35,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_net.cpp
     src/nhl3on3_guest_log.cpp
     src/nhl3on3_remote_pad.cpp
+    src/nhl3on3_chat_keyboard.cpp
     src/nhl3on3_dist_trace.cpp
     src/nhl3on3_lockstep_relay.cpp
     src/nhl3on3_ui.cpp
@@ -44,6 +45,7 @@ set(NHL3ON3_SOURCES
     src/nhl3on3_save_trace.cpp
     src/nhl3on3_settings.cpp
     src/nhl3on3_team_lobby.cpp
+    src/nhl3on3_vr.cpp
 )
 
 if(WIN32)
@@ -61,6 +63,19 @@ endif()
 
 # Stage the SDK's shared runtime and the Xenos GPU plugin beside the executable.
 get_filename_component(NHL3ON3_SDK_ROOT "${rexglue_DIR}/../../.." ABSOLUTE)
+
+# VR (OpenXR): headers only; openxr_loader.dll is loaded at runtime when vr is on.
+# The SDK's Direct3D 12 headers include DxbcConverter.h from include/dxc.
+target_include_directories(nhl3on3 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/openxr/include"
+    "${NHL3ON3_SDK_ROOT}/include/dxc")
+if(WIN32)
+    add_custom_command(TARGET nhl3on3 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/openxr/bin/openxr_loader.dll"
+            $<TARGET_FILE_DIR:nhl3on3>
+        VERBATIM)
+endif()
 if(WIN32)
     file(GLOB NHL3ON3_SDK_SHARED "${NHL3ON3_SDK_ROOT}/bin/*.dll")
 else()

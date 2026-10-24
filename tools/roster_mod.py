@@ -362,7 +362,8 @@ def apply_players(players, roster, has_portrait, log):
         else:
             row = claim_slot(group(position))
             if row is None:
-                raise ValueError(f"{name}: no arcade {player['position']} star slots left to claim")
+                log(f"{name}: skipped, no arcade {player['position']} star slot left to claim")
+                continue
             old = row_name(row)
             log(f"{name}: takes arcade slot of {old} (id {players.rows[row][ID]})")
             if existing is not None and existing != row:

@@ -600,11 +600,100 @@ def patch_pimp_full_nhl(apt_bytes, const_bytes):
     return bytes(data), [(0x5ED, body_end)], pool_at
 
 
+def patch_main_menu_items(apt_bytes, const_bytes):
+    """mainMenuItems, which builds the front end's menus. The online menu
+    (arrOnlineSubMenu) is PLAY A FRIEND, QUICK RANKED VERSUS PLAY, UNRANKED
+    VERSUS PLAY (ONLINE TEAM PLAY) and TERMS AND CONDITIONS; the unranked item
+    opens arrCoop: QUICK MATCH, CUSTOM MATCH, CREATE SESSION.
+
+    Patched: the PLAY A FRIEND item (Xbox Live friend invites, which the
+    lobby server has no equivalent for) opens the ONLINE LOBBY screen (EA's
+    lobby rooms: the players online, chat and the open sessions, which can be
+    joined or created from there; server/lobby.py). The menu text is renamed
+    by src/nhl3on3_ui.cpp.
+
+    The callback's PLAY A FRIEND branch does what the Leaderboards item does
+    for its screen: gLoginMenuAction(controller, gLoadOnlineScreenCb,
+    {strScreenID: SCREEN.ONLINE_LOBBY, mcRoot: EA_ZONE}). The pool has no
+    "ONLINE_LOBBY", so the callback's trace text (which only feeds trace) is
+    overwritten with it in the .const file.
+    """
+    data = bytearray(apt_bytes)
+    consts = bytearray(const_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool_at, friend, friend_end = 0x78, 0xA0C, 0xA4C
+    expect(data, friend, "a299a29ab50271a25c52129d0000002071a205734f7571af0675ae14afa771af02af78"
+                         "b50571b29899000000000000097471af02b50271b20399000000000000")
+    trace, trace_at, screen_key = "main menu callback: screenName=", 0xA38, b"ONLINE_LOBBY"
+    expect(consts, trace_at, trace.encode().hex() + "00")
+    pool = frame_pool(apt, pool_at)
+    assemble(data, [
+        Chunk(friend, friend_end, [
+            ("pushConst", "strScreenID"),
+            ("pushGlobalVar",), ("getNamedMember", "SCREEN"), ("pushConst", trace),
+            ("getMember",),
+            ("pushConst", "mcRoot"), ("pushGlobalVar",), ("getNamedMember", "EA_ZONE"),
+            ("pushByte", 2), ("initObject",),
+            ("pushGlobalVar",), ("getNamedMember", "gLoadOnlineScreenCb"),
+            ("pushGlobalVar",), ("getNamedMember", "EA_ZONE"),
+            ("getNamedMember", "gControllerIDCurrentScreen"),
+            ("pushByte", 3), ("pushGlobalVar",), ("callNamedMethodPop", "gLoginMenuAction"),
+        ]),
+    ], pool)
+    consts[trace_at:trace_at + len(screen_key) + 1] = screen_key + b"\0"
+    return bytes(data), [(friend, friend_end)], pool_at, bytes(consts)
+
+
+ONLINE_PALE_TEXT = 0xE6E6E6
+ONLINE_DARK_TEXT = 0x202020
+
+
+def patch_online_text_color(apt_bytes, const_bytes):
+    """EA's online screens (lobby list, lobby room, their shared components)
+    draw unhighlighted text in pale grey 0xE6E6E6, meant for a dark panel; on
+    this game's light blue panel it is nearly invisible. Highlighted rows
+    (black on a white bar) are unaffected.
+
+    Patched: every text field defined in that grey, and every pushLong of it
+    (e.g. COLOR_UNHIGHLIGHT, which rows are reset to), use dark grey instead.
+    A text character is (type 2, signature, ..., bounds at +16, font +32,
+    alignment +36, ARGB color +40, ...).
+    """
+    data = bytearray(apt_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    m = apt.movie_offset
+    count, table = apt.u32(m + 28), apt.u32(m + 32)
+    pale, dark = 0xFF000000 | ONLINE_PALE_TEXT, 0xFF000000 | ONLINE_DARK_TEXT
+    changed = 0
+    for c in range(count):
+        ch = apt.u32(table + 4 * c)
+        if ch and apt.u32(ch + 4) == apt_dis.SIGNATURE and apt.u32(ch) == 2 \
+                and apt.u32(ch + 40) == pale:
+            struct.pack_into(">I", data, ch + 40, dark)
+            changed += 1
+    push_pale = b"\xB7" + struct.pack(">I", ONLINE_PALE_TEXT)
+    at = data.find(push_pale)
+    while at != -1:
+        struct.pack_into(">I", data, at + 1, ONLINE_DARK_TEXT)
+        changed += 1
+        at = data.find(push_pale, at + 5)
+    if not changed:
+        raise ValueError("no pale text to recolor")
+    return bytes(data), [], None
+
+
 # (archive entry, nested entry of the .apt, nested entry of the .const, patch)
 PATCHES = [
+    ("fe/ion/game/menus/mainmenuitems.big", "0", "1", patch_main_menu_items),
     ("fe/ion/game/screens/misc/pimpfullnhl.big", "0", "1", patch_pimp_full_nhl),
     ("fe/ion/game/screens/online/onlineselectteams.big", "0", "1", patch_select_teams),
     ("fe/ion/game/screens/online/onlinestartinglineups.big", "0", "1", patch_starting_lineups),
+    ("fe/ion/external/ion_online/screens/online/lobby/lobbylist.big", "0", "1",
+     patch_online_text_color),
+    ("fe/ion/external/ion_online/screens/online/lobby/room.big", "0", "1",
+     patch_online_text_color),
+    ("fe/ion/external/ion_online/components/onlinecomponents.big", "0", "1",
+     patch_online_text_color),
 ]
 
 # --- Archive rebuild ---------------------------------------------------------
@@ -639,10 +728,16 @@ def patched_screens(big, check):
         inner = {name: (o, s) for name, o, s, _ in big_directory(nested)}
         (ao, asz), (co, csz) = inner[apt_name], inner[const_name]
         apt_bytes, const_bytes = bytes(nested[ao:ao + asz]), bytes(nested[co:co + csz])
-        new_apt, ranges, pool_at = patch(apt_bytes, const_bytes)
+        # A patch may also return a new .const (same size), e.g. to overwrite
+        # a string the constant pool points at.
+        new_apt, ranges, pool_at, *new_const = patch(apt_bytes, const_bytes)
         if len(new_apt) != asz:
             raise ValueError(f"{entry}: patch changed the Apt size")
         nested[ao:ao + asz] = new_apt
+        if new_const:
+            if len(new_const[0]) != csz:
+                raise ValueError(f"{entry}: patch changed the .const size")
+            nested[co:co + csz] = const_bytes = new_const[0]
         print(f"patched {entry}")
         if check:
             apt = apt_dis.Apt(new_apt, const_bytes)

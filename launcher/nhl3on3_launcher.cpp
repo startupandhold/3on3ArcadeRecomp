@@ -54,6 +54,11 @@ const std::vector<Setting> kSettings = {
      {{"16:9", "16:9"}, {"21:9", "21:9"}, {"32:9", "32:9"}, {"auto", "auto"}},
      "Wider than 16:9 widens the in-game camera (ultrawide).\n'auto' matches the desktop; you "
      "can also type W:H or a resolution such as 3440x1440."},
+    {"Display", "portrait_camera", "Portrait: match camera", Kind::Choice, Toml::String,
+     "topdown", {{"topdown", "Top-down (whole rink)"}, {"classic", "Classic (tilted, follows play)"},
+                 {"game", "Game camera"}},
+     "Portrait aspect ratios only. Classic is closer and more tilted, like old-school hockey "
+     "games, and scrolls up and down the rink with the play."},
     {"Display", "topdown_direction", "Portrait: top of screen", Kind::Choice, Toml::String,
      "auto", {{"auto", "Auto"}, {"reverse", "Reverse"}},
      "Portrait top-down camera only. Reverse puts the other end of the rink at the top."},
@@ -78,6 +83,10 @@ const std::vector<Setting> kSettings = {
     {"Game", "skip_intro", "Skip intro movie", Kind::Bool, Toml::Bool, "true", {}},
     {"Game", "audio_mute", "Mute audio", Kind::Bool, Toml::Bool, "false", {}},
     {"Game", "mnk_mode", "Keyboard as controller", Kind::Bool, Toml::Bool, "false", {}},
+
+    {"VR", "vr", "VR headset (OpenXR)", Kind::Bool, Toml::Bool, "false", {},
+     "Matches in 3D on a tabletop rink, menus on a virtual screen.\nNeeds an OpenXR runtime "
+     "(Virtual Desktop VDXR, SteamVR, Oculus) and runs at 120 FPS (60 per eye)."},
 
     {"Online", "online", "Online play", Kind::Bool, Toml::Bool, "false", {}},
     {"Online", "online_gamertag", "Gamertag", Kind::Text, Toml::String, "", {},

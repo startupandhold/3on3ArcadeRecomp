@@ -1200,7 +1200,12 @@ void Apply(const fs::path& game_dir, const fs::path& roster_path) {
       auto it = std::find_if(claimable.begin(), claimable.end(), [&](size_t candidate) {
         return GroupOf(int(players.Num(candidate, kPos))) == group;
       });
-      if (it == claimable.end()) Fail(name + " has no arcade slot left");
+      if (it == claimable.end()) {
+        REXLOG_WARN("[roster] {} skipped: no arcade {} slot left (the game has 32 forward, 6 "
+                    "defense and 5 goalie star slots)",
+                    name, player.position);
+        continue;
+      }
       row = *it;
       claimable.erase(it);
       REXLOG_INFO("[roster] {} takes arcade slot of {} (id {})", name, players.Name(row),

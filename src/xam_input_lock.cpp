@@ -12,6 +12,7 @@
 #include <rex/cvar.h>
 #include <rex/ppc/func.h>
 
+#include "nhl3on3_chat_keyboard.h"
 #include "nhl3on3_display.h"
 #include "nhl3on3_remote_pad.h"
 #include "runtime_export.h"
@@ -29,6 +30,7 @@ std::mutex g_input_mutex;
 
 constexpr uint32_t kUserIndexAny = 0xFF;
 constexpr uint32_t kFlagAnyUser = 1u << 30;
+constexpr uint32_t kFlagKeyboard = 1u << 1;
 constexpr uint32_t kErrorEmpty = 0x10D2;
 constexpr uint32_t kKeystrokeUserIndexOffset = 6;
 
@@ -69,6 +71,10 @@ void CallPhysical(const nhl3on3::GuestFunc& original, PPCContext& ctx, uint8_t* 
 extern "C" REX_FUNC(__imp__XamInputGetCapabilities) {
   static const auto original = nhl3on3::ResolveRuntimeExport("__imp__XamInputGetCapabilities");
   std::lock_guard lock(g_input_mutex);
+  if ((ctx.r4.u32 & kFlagKeyboard) && nhl3on3::chat_keyboard::GetCapabilities(base, ctx.r5.u32)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
   if (!IsAnyUser(ctx.r3.u32, ctx.r4.u32) &&
       remote_pad::GetCapabilities(base, ctx.r3.u32, ctx.r5.u32)) {
     ctx.r3.u64 = 0;
@@ -114,6 +120,17 @@ extern "C" REX_FUNC(__imp__XamInputGetKeystrokeEx) {
   const uint32_t flags = ctx.r4.u32, keystroke = ctx.r5.u32;
   const uint32_t requested = user_index ? LoadBE32(user_index) : kUserIndexAny;
   const bool any_user = IsAnyUser(requested, flags);
+
+  if (flags & kFlagKeyboard) {
+    const uint8_t user = any_user ? 0 : uint8_t(requested);
+    if (nhl3on3::chat_keyboard::PopKeystroke(base, keystroke, user)) {
+      if (user_index) {
+        StoreBE32(user_index, user);
+      }
+      ctx.r3.u64 = 0;
+      return;
+    }
+  }
 
   const int32_t remote = remote_pad::PopKeystroke(base, requested, any_user, keystroke);
   if (remote >= 0) {

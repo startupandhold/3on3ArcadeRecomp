@@ -19,6 +19,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 
+#include "nhl3on3_chat_keyboard.h"
 #include "nhl3on3_display.h"
 #include "nhl3on3_settings.h"
 #include "nhl3on3_stfs.h"
@@ -130,6 +131,10 @@ class Nhl3on3App : public rex::ReXApp {
                    out.string().c_str());
     }
     std::_Exit(0);
+  }
+
+  void OnCreateDialogs(rex::ui::ImGuiDrawer*) override {
+    nhl3on3::chat_keyboard::Attach(app_context(), window());
   }
 
  private:
