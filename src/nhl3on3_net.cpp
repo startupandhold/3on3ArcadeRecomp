@@ -2077,15 +2077,26 @@ extern "C" REX_FUNC(sub_82761188) {
 }
 
 extern "C" void __imp__sub_82768468(PPCContext& __restrict ctx, uint8_t* base);
+int Nhl3on3GameConsoles();
 
 // XSession wrapper control(session, selector, value, ..., data). 'slot' sets the
 // public slot count that XSessionCreate/XSessionModify receive; the game asks
 // for 2, which leaves no room for a third console.
 extern "C" REX_FUNC(sub_82768468) {
   constexpr uint32_t kSlot = 0x736C6F74;  // 'slot'
+  constexpr uint32_t kSflg = 0x73666C67;  // 'sflg'
   if (ctx.r4.u32 == kSlot && REXCVAR_GET(team_play) >= 3 &&
       ctx.r5.u32 < uint32_t(REXCVAR_GET(team_play))) {
     ctx.r5.u64 = uint32_t(REXCVAR_GET(team_play));
+  }
+  // Once a peer is in the lobby, quick match ORs 0x300 into these flags
+  // (0x42E becomes 0x72E). A created session never does: its XSession stub
+  // has no member list, so the in-game link does not treat the opponent as
+  // joined and the sim drops them after the ready barrier times out.
+  if (ctx.r4.u32 == kSflg && Nhl3on3GameConsoles() >= 2 && (ctx.r5.u32 & 0x300) != 0x300) {
+    REXLOG_INFO("[mm] session flags {:X} -> {:X} ({} consoles in the lobby)", ctx.r5.u32,
+                ctx.r5.u32 | 0x300, Nhl3on3GameConsoles());
+    ctx.r5.u64 = ctx.r5.u32 | 0x300;
   }
   const uint32_t session = ctx.r3.u32, selector = ctx.r4.u32, value = ctx.r5.u32,
                  data = ctx.r7.u32;

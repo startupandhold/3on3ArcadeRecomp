@@ -56,7 +56,9 @@ class Player:
                     break
                 # An error reply's command includes its status, e.g. b"gjoiugam".
                 cmd = self.buffer[:4] if self.buffer[4:8] == b"\0\0\0\0" else self.buffer[:8]
-                out.append((cmd, lobby_fields(self.buffer[12:length].split(b"\0")[0])))
+                # Chat (+msg) separates its fields with tabs.
+                body = self.buffer[12:length].split(b"\0")[0].replace(b"\t", b"\n")
+                out.append((cmd, lobby_fields(body)))
                 self.buffer = self.buffer[length:]
         return out
 
@@ -68,6 +70,10 @@ class Player:
         self.frames(0.3)
         self.tcp.sendall(lobby_frame(b"gqwk", {
             "MODE": 2, "SYSFLAGS": RANKED_SYSFLAG if ranked else 0}))
+
+    def enter_room(self):
+        self.tcp.sendall(lobby_frame(b"move", {"IDENT": 1, "NAME": "LVL.1"}))
+        self.frames(0.5)
 
 
 def relay_packet(kind, slot, a, b, items):
@@ -140,7 +146,10 @@ def main():
 
     # The host starts the game: it closes, so Delta waits for a new one.
     a.tcp.sendall(lobby_frame(b"gsta", {}))
-    assert any(cmd == b"+ses" for cmd, _ in c.frames(1)), "no +ses"
+    started = c.frames(1)
+    assert any(cmd == b"+ses" for cmd, _ in started), "no +ses"
+    assert not any(cmd == b"+agmugam" for cmd, _ in started), \
+        "in-match player got +agmugam (OSDK_GAME_UNAVAILABLE) on start"
     d.search()
     assert d.last_mgm(1.5) is None, "joined a started game"
     print("started game is closed to new players")
@@ -189,6 +198,51 @@ def main():
     mgm = f.last_mgm()
     assert mgm and {mgm["OPPO0"], mgm["OPPO1"]} == {"Foxtrot", "Hotel"}, mgm
     print("roster packs only match the same pack")
+
+    # Invites: Kilo invites Lima by chat before creating a session; Lima is
+    # told once it exists, and Lima's search lists only that game (public).
+    k, l, m = Player("Kilo"), Player("Lima"), Player("Mike")
+    for p in (k, l, m):
+        p.enter_room()
+    m.tcp.sendall(lobby_frame(b"gcre", {"NAME": "Mike", "SYSFLAGS": 0, "MAXSIZE": 2}))
+    for p in (k, l, m):
+        p.frames(0.3)
+    # The game quotes TEXT when it has spaces (DirtySDK); that used to leave
+    # the leading quote on the command so "/invite" never matched.
+    k.tcp.sendall(lobby_frame(b"mesg", {"TEXT": '"/invite lima"', "ATTR": "C"}))
+    notes = [f for cmd, f in k.frames(1) if cmd == b"+msg"]
+    assert notes and "WILL BE INVITED" in notes[0]["T"], notes
+    assert not [f for cmd, f in l.frames(0.3) if cmd == b"+msg"], "invited before a game"
+    k.tcp.sendall(lobby_frame(b"gcre", {"NAME": "Kilo", "SYSFLAGS": 0, "MAXSIZE": 2,
+                                        "PRIV": 1}))
+    kilo_gcre = [f for cmd, f in k.frames(1.5) if cmd == b"gcre"][0]
+    kilo_game = kilo_gcre["IDENT"]
+    assert kilo_gcre.get("PRIV", "0") in ("0", 0, ""), kilo_gcre
+    assert not (int(kilo_gcre.get("SYSFLAGS", "0") or 0) & (1 << 16)), kilo_gcre
+    notes = [f for cmd, f in l.frames(1) if cmd == b"+msg"]
+    assert notes and notes[0]["N"] == "Kilo" and "INVITED YOU" in notes[0]["T"], notes
+    assert "P" not in notes[0].get("F", ""), notes[0]  # must be public chat
+    l.tcp.sendall(lobby_frame(b"gsea", {"COUNT": 20, "SYSFLAGS": 0}))
+    rows = [f for cmd, f in l.frames(1) if cmd == b"+gam"]
+    assert [r["IDENT"] for r in rows] == [kilo_game] and rows[0]["PRIV"] == "0", rows
+    assert not (int(rows[0].get("SYSFLAGS", "0") or 0) & (1 << 16)), rows[0]
+    l.tcp.sendall(lobby_frame(b"gjoi", {"IDENT": kilo_game}))
+    mgm = k.last_mgm()
+    assert mgm and mgm["COUNT"] == "2", mgm
+    print("invited player is told and finds the game")
+
+    # Starting a listed session must not send +agmugam to its players (that
+    # was OSDK_GAME_UNAVAILABLE mid-start); a room spectator still sees ugam.
+    for p in (k, l, m):
+        p.frames(0.2)
+    k.tcp.sendall(lobby_frame(b"gsta", {}))
+    host_frames, guest_frames, spectator = k.frames(1), l.frames(1), m.frames(1)
+    assert any(cmd == b"+ses" for cmd, _ in host_frames + guest_frames), "no +ses"
+    assert not any(cmd == b"+agmugam" for cmd, _ in host_frames + guest_frames), \
+        "match players got +agmugam on gsta"
+    assert any(cmd == b"+agmugam" and f.get("IDENT") == kilo_game
+               for cmd, f in spectator), "spectator did not see session unlist"
+    print("started session does not ugam its own players")
     print("PASS")
 
 

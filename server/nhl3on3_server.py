@@ -87,7 +87,6 @@ async def main():
         while True:
             await asyncio.sleep(60)
             status = {**lobby.status(), **tunnel.status()}
-            status.pop("datagrams_forwarded")
             if status != last:
                 log.info("status %s", status)
                 last = status

@@ -23,6 +23,10 @@ ROOM_ID = 1
 ROOM_NAME = "LVL.1"
 ROOM_LIMIT = 100
 RANKED_SYSFLAG = 1 << 18
+# Create Session's invite path sets this on SYSFLAGS; Custom Match then shows
+# the row as PRIVATE and will not join it. A real password uses the same bit
+# (see listing()).
+PASSWORD_SYSFLAG = 1 << 16
 MAX_FRAME = 64 * 1024
 # The lobby is silent for a whole match, so neither side may give up on an
 # idle connection sooner than a match can last.
@@ -60,13 +64,17 @@ def lobby_frame(cmd, fields, sep="\n", status=b"\0\0\0\0"):
 def lobby_fields(body):
     """Requests are KEY=VALUE lines; 'sele' puts them on one line separated by
     spaces, so a one-line body splits only at spaces that start a KEY= (a
-    chat TEXT keeps its spaces)."""
+    chat TEXT keeps its spaces). DirtySDK wraps a value that contains spaces
+    in double quotes (TEXT="/invite name"); those quotes are not part of the
+    value."""
     text = body.decode("latin1")
     fields = {}
     lines = text.split("\n") if "\n" in text else re.split(r" (?=[A-Za-z0-9_-]+=)", text)
     for line in lines:
         key, sep, value = line.partition("=")
         if sep:
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
             fields[key] = value
     return fields
 
@@ -92,6 +100,9 @@ class Client:
         self.maddr = ""
         self.room = 0  # ROOM_ID while on the lobby room's screens
         self.game = None
+        # Personas (lowercase) invited with "/invite" to the game this client
+        # hosts, or will host next.
+        self.invites = set()
         self.search = {}
         self.userflags = "0"
         self.userparams = ""
@@ -276,8 +287,10 @@ class Lobby:
             "SEED": game.id * 7919,
             "WHEN": f"{game.when:%Y.%m.%d-%H:%M:%S}",
             "AUTH": "098f6bcd4621d373cade4e832627b4f6" if ranked else "",
-            # The host's XSESSION_INFO once it has created the session; joiners
-            # wait while it is empty and fail on anything else.
+            # The host's XSESSION_INFO once it has created the session. Joiners
+            # wait while it is empty (game start returns failure, Select Sides
+            # never links, A does not ready) and accept the host's blob as-is,
+            # including the XSession stub's non-text bytes.
             "SESS": req.get("SESS", ""),
             "EVID": 0,
             "EVGID": 0,
@@ -411,7 +424,22 @@ class Lobby:
             ranked = bool(int(request.get("SYSFLAGS", "0")) & RANKED_SYSFLAG)
         except ValueError:
             ranked = False
-        private = request.get("PRIV", "0") not in ("", "0") or bool(request.get("PASS"))
+        # Create Session's invite path sets PRIV=1 and SYSFLAGS bit 16 for an
+        # Xbox Live private invite. Custom Match keys off that bit (not PRIV)
+        # for the PRIVATE label and refuses to join. A password still makes it
+        # private; otherwise store it as public.
+        request = dict(request)
+        private = bool(request.get("PASS"))
+        try:
+            sysflags = int(request.get("SYSFLAGS", "0") or 0)
+        except ValueError:
+            sysflags = 0
+        if private:
+            request["PRIV"] = "1"
+            request["SYSFLAGS"] = str(sysflags | PASSWORD_SYSFLAG)
+        else:
+            request["PRIV"] = "0"
+            request["SYSFLAGS"] = str(sysflags & ~PASSWORD_SYSFLAG)
         game = Game(request, [client], ranked, private)
         game.room = client.room
         if not game.request.get("NAME"):
@@ -421,6 +449,8 @@ class Lobby:
                  "ranked" if ranked else "team play", ", private" if private else "",
                  game.id, client.name, f"{client.roster:08x}" if client.roster else "stock")
         client.send(lobby_frame(b"gcre", self.game_info(game)))
+        for persona in sorted(client.invites):
+            self.send_invite(client, persona)
         # A team play search already waiting for a second player joins it.
         queue = self.queues.get((False, client.roster), [])
         joined = []
@@ -457,14 +487,19 @@ class Lobby:
 
     def update_listing(self, game):
         """Tells the room about a game that opened, changed or went away
-        (+agm, with status ugam for the last)."""
+        (+agm, with status ugam for the last).
+
+        Members still in the match must not get ugam: the game treats that as
+        OSDK_GAME_UNAVAILABLE, tears down its Xbox/ConnApi session, then still
+        receives +ses and loads the rink without a peer — "lost connection to
+        your opponent". Spectators in the room still see the row disappear."""
         if game not in self.open_games and not game.listed:
             return
         game.listed = True
         for member in self.room_members():
             if self.listed_to(game, member):
                 member.send(lobby_frame(b"+agm", self.listing(game)))
-            else:
+            elif member not in game.players:
                 member.send(lobby_frame(b"+agm", {"IDENT": game.id}, status=b"ugam"))
 
     def search_games(self, client, request):
@@ -482,13 +517,20 @@ class Lobby:
             except ValueError:
                 pass
         games = [g for g in self.open_games if g.joinable(client) and client.game is not g
-                 and (want_ranked is None or g.ranked == want_ranked)][:limit]
+                 and (want_ranked is None or g.ranked == want_ranked)]
+        # An invited player's search (the room's VIEW SESSIONS joins the
+        # first game it gets) finds only the games it was invited to.
+        invited = [g for g in games if self.invited_to(g, client)]
+        games = (invited or games)[:limit]
         log.info("custom match: %s searched (%s), %d games", client.name,
                  "any" if want_ranked is None else "ranked" if want_ranked else "unranked",
                  len(games))
         client.send(lobby_frame(b"gsea", {"COUNT": len(games)}))
         for game in games:
-            client.send(lobby_frame(b"+gam", self.game_row(game)))
+            row = self.game_row(game)
+            if game in invited:
+                row["PRIV"] = 0
+            client.send(lobby_frame(b"+gam", row))
 
     def join_game(self, client, request):
         """gjoi: joins the game IDENT (or NAME) from the Custom Match list.
@@ -520,6 +562,7 @@ class Lobby:
             client.userparams = sanitize(request["USERPARAMS"], 256)
         game.players.append(client)
         client.game = game
+        game.players[0].invites.discard(client.persona.lower())
         log.info("custom match: %s joins game %d (%d consoles: %s)", client.name, game.id,
                  len(game.players), ", ".join(p.name for p in game.players))
         client.send(lobby_frame(b"gjoi", self.game_info(game)))
@@ -608,6 +651,10 @@ class Lobby:
         text = "".join(c for c in request.get("TEXT", "") if c not in "\0\n\r\t")[:256]
         attr = sanitize(request.get("ATTR", ""), 16)
         priv = request.get("PRIV")
+        words = text.split()
+        if not priv and words and words[0].lower() == "/invite":
+            self.invite(client, words[1:], attr)
+            return
         frame = lobby_frame(b"+msg", {
             "F": attr + "P" if priv else attr or "Z", "T": text, "N": client.persona, "U": "",
         }, sep="\t")
@@ -620,6 +667,56 @@ class Lobby:
             targets = [c for c in self.room_members() if not c.game]
         for target in targets:
             target.send(frame)
+
+    def notice(self, client, text, attr="C", sender="LOBBY"):
+        """A chat line only `client` sees. Must not set the private "P" bit on
+        F: the room only surfaces EVENT_LOBBY_ROOM_CHATMESSAGE for public
+        messages, so invite notices with F=CP never appeared in chat."""
+        client.send(lobby_frame(b"+msg", {"F": attr or "C", "T": text[:256], "N": sender,
+                                          "U": ""}, sep="\t"))
+
+    def invited_to(self, game, client):
+        return bool(game.players) and client.persona.lower() in game.players[0].invites
+
+    def send_invite(self, host, persona):
+        target = next((c for c in self.clients
+                       if c.signed_in and c.persona.lower() == persona), None)
+        if target is None or target.game is host.game:
+            return
+        log.info("invite: %s invites %s to game %d", host.name, target.name, host.game.id)
+        self.notice(target, "INVITED YOU TO THEIR GAME. PRESS Y (VIEW SESSIONS) TO JOIN.",
+                    sender=host.persona)
+
+    def invite(self, client, names, attr):
+        """"/invite NAME ..." in the room's chat: invites players to the game
+        `client` hosts, or to the next one it creates (CREATE SESSION). Each
+        gets a chat line, and its VIEW SESSIONS search then finds only that
+        game, which it joins. "/invite" alone lists the pending invites."""
+        attr = attr or "C"
+        if not names:
+            pending = ", ".join(sorted(client.invites)) or "NONE"
+            self.notice(client, f"USAGE: /INVITE NAME. INVITED: {pending}", attr)
+            return
+        online = {c.persona.lower(): c for c in self.clients if c.signed_in}
+        hosting = client.game is not None and client.game.players[0] is client
+        for name in names:
+            target = online.get(name.lower())
+            if target is None or target is client:
+                self.notice(client, f"NO PLAYER NAMED {name} IS ONLINE.", attr)
+                continue
+            if target.roster != client.roster:
+                self.notice(client, f"{target.persona} HAS A DIFFERENT ROSTER AND CANNOT JOIN.",
+                            attr)
+                continue
+            persona = target.persona.lower()
+            client.invites.add(persona)
+            if hosting:
+                self.send_invite(client, persona)
+                self.notice(client, f"INVITED {target.persona}.", attr)
+            else:
+                log.info("invite: %s will invite %s", client.name, target.name)
+                self.notice(client, f"{target.persona} WILL BE INVITED WHEN YOU CREATE A "
+                            "SESSION.", attr)
 
     # -- requests ---------------------------------------------------------
 

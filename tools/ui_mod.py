@@ -80,6 +80,8 @@ def instr_size(at, ins, pool):
         return 2
     if name == "pushShort":
         return 3
+    if name == "pushLong":
+        return 5
     if name in BRANCHES or name == "storeRegister":
         return ((at + 1 + 3) & ~3) + 4 - at
     raise ValueError(f"unknown instruction {name}")
@@ -99,6 +101,8 @@ def encode(at, ins, pool, labels):
         return bytes([0xB5]) + struct.pack(">b", ins[1])
     if name == "pushShort":
         return bytes([0xB6]) + struct.pack(">h", ins[1])
+    if name == "pushLong":
+        return bytes([0xB7]) + struct.pack(">i", ins[1])
     size = instr_size(at, ins, pool)
     pad = bytes(size - 5)
     if name == "storeRegister":
@@ -644,42 +648,270 @@ def patch_main_menu_items(apt_bytes, const_bytes):
     return bytes(data), [(friend, friend_end)], pool_at, bytes(consts)
 
 
-ONLINE_PALE_TEXT = 0xE6E6E6
+# Greys meant for dark panels; on this game's light blue they wash out.
+# 0xE6E6E6: lobby / session list unhighlighted rows. 0xCCCCCC: stdcontrols
+# toggle labels on Create Session. 0x999999: some onlinecomponents hints.
+ONLINE_PALE_TEXTS = (0xE6E6E6, 0xCCCCCC, 0x999999)
 ONLINE_DARK_TEXT = 0x202020
 
 
 def patch_online_text_color(apt_bytes, const_bytes):
-    """EA's online screens (lobby list, lobby room, their shared components)
-    draw unhighlighted text in pale grey 0xE6E6E6, meant for a dark panel; on
-    this game's light blue panel it is nearly invisible. Highlighted rows
-    (black on a white bar) are unaffected.
+    """EA's online screens (lobby list, lobby room, create/custom match, and
+    their shared controls) draw unhighlighted text in pale greys meant for a
+    dark panel; on this game's light blue panel they are nearly invisible.
+    Highlighted rows (black on a white bar) are unaffected.
 
-    Patched: every text field defined in that grey, and every pushLong of it
-    (e.g. COLOR_UNHIGHLIGHT, which rows are reset to), use dark grey instead.
-    A text character is (type 2, signature, ..., bounds at +16, font +32,
-    alignment +36, ARGB color +40, ...).
+    Patched: every text field defined in those greys, and every pushLong of
+    them (e.g. COLOR_UNHIGHLIGHT, HEADER_FONT), use dark grey instead. A text
+    character is (type 2, signature, ..., bounds at +16, font +32, alignment
+    +36, ARGB color +40, ...).
     """
     data = bytearray(apt_bytes)
     apt = apt_dis.Apt(apt_bytes, const_bytes)
     m = apt.movie_offset
     count, table = apt.u32(m + 28), apt.u32(m + 32)
-    pale, dark = 0xFF000000 | ONLINE_PALE_TEXT, 0xFF000000 | ONLINE_DARK_TEXT
+    dark = 0xFF000000 | ONLINE_DARK_TEXT
+    pales = {0xFF000000 | c for c in ONLINE_PALE_TEXTS}
     changed = 0
     for c in range(count):
         ch = apt.u32(table + 4 * c)
         if ch and apt.u32(ch + 4) == apt_dis.SIGNATURE and apt.u32(ch) == 2 \
-                and apt.u32(ch + 40) == pale:
+                and apt.u32(ch + 40) in pales:
             struct.pack_into(">I", data, ch + 40, dark)
             changed += 1
-    push_pale = b"\xB7" + struct.pack(">I", ONLINE_PALE_TEXT)
-    at = data.find(push_pale)
-    while at != -1:
-        struct.pack_into(">I", data, at + 1, ONLINE_DARK_TEXT)
-        changed += 1
-        at = data.find(push_pale, at + 5)
+    for pale_rgb in ONLINE_PALE_TEXTS:
+        push_pale = b"\xB7" + struct.pack(">I", pale_rgb)
+        at = data.find(push_pale)
+        while at != -1:
+            struct.pack_into(">I", data, at + 1, ONLINE_DARK_TEXT)
+            changed += 1
+            at = data.find(push_pale, at + 5)
     if not changed:
         raise ValueError("no pale text to recolor")
     return bytes(data), [], None
+
+
+def rename_pool_string(consts, apt, pool_at, old, new):
+    """Overwrites the .const string that the constant pool at `pool_at` holds
+    as `old` (which must only feed trace) with the shorter `new`."""
+    if len(new) > len(old):
+        raise ValueError(f"{new!r} is longer than {old!r}")
+    off = (pool_at + 4) & ~3
+    n, p = apt.u32(off), apt.u32(off + 4)
+    items = struct.unpack(">I", consts[28:32])[0]
+    for k in range(n):
+        ci = apt.u32(p + 4 * k)
+        if apt.const(ci) == repr(old):
+            kind, at = struct.unpack(">II", consts[items + 8 * ci:items + 8 * ci + 8])
+            if kind != 1:
+                break
+            consts[at:at + len(new) + 1] = new.encode("latin1") + b"\0"
+            return
+    raise ValueError(f"{old!r} is not a string in the pool at {pool_at:#x}")
+
+
+def patch_online_main(apt_bytes, const_bytes):
+    """zoneonlinemain, EA's online framework; here ActionPopup, the menu a
+    player in the lobby room opens (INVITE TO GAME, SEND MESSAGE, ...).
+
+    Stock: INVITE TO GAME (doActionInviteGame) stores the player as
+    INVITATION_USER and opens the create session screen, which makes the
+    session private and invites the player with an Xbox Live invite, which
+    reaches no one here.
+
+    Patched: doActionInviteGame first sends "/invite <player>" as room chat
+    (OSDK_LobbyRoomAdaptor.SendChatMessage), so the lobby server invites the
+    player to the session (server/lobby.py). This replaces its opening player
+    hub telemetry (LogEvent). The pool lacks the three names, so three trace
+    strings of doActionViewGameInvite are overwritten with them in the .const
+    file.
+    """
+    data = bytearray(apt_bytes)
+    consts = bytearray(const_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool_at, func, body, body_end = 0x15530, 0x16720, 0x16740, 0x16786
+    expect(data, func, "8e")
+    expect(data, body_end, "b904")                 # pushRegister 4 (username)
+    pool = frame_pool(apt, pool_at)
+    trace = "ActionPopup::doActionViewGameInvite() - "
+    adaptor, send, command = (trace + "User = ", trace + "clearAllOverlays()",
+                              trace + "changeMainScreen()")
+    assemble(data, [Chunk(body, body_end, [
+        ("pushConst", command), ("pushRegister", 4), ("add2",), ("pushOne",),
+        ("pushValueOfVar", adaptor), ("pushConst", send), ("callMethodPop",),
+    ])], pool)
+    for old, new in ((adaptor, "OSDK_LobbyRoomAdaptor"), (send, "SendChatMessage"),
+                     (command, "/invite ")):
+        rename_pool_string(consts, apt, pool_at, old, new)
+    return bytes(data), [(func, body_end + 0x10)], pool_at, bytes(consts)
+
+
+def patch_lobby_room(apt_bytes, const_bytes):
+    """room, the ONLINE LOBBY room screen: the players in the room, chat, and
+    X (CREATE MATCH: the create session screen, with the room's game
+    settings) and Y (VIEW SESSIONS: an OptiMatch search) to start a game.
+    Both buttons and their hints only work while m_bCanCreateGame, which
+    initScreen copies from the room meta's bCanCreateGame; the native room
+    meta never sets it for the lobby server's room.
+
+    Patched: initScreen sets m_bCanCreateGame to true (pushFalse, not, not,
+    not in place of pushRegister 3, getNamedMember 'bCanCreateGame').
+    storeRoomParameters, which X and Y run first, sets CS_MATCH_TYPE (the
+    create session screen's ranked or not) from the room meta's
+    m_iRoomGameType, which the lobby server's room leaves at 0, ranked; it
+    gets Online.MATCH_TYPE_UNRANKED (1) instead, the team play session the
+    main menu's CREATE SESSION makes and Y searches for. Also recolors the
+    pale text (patch_online_text_color).
+    """
+    data = bytearray(patch_online_text_color(apt_bytes, const_bytes)[0])
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool_at, set_at, type_at = 0x4538, 0x46B5, 0x640A
+    pool = frame_pool(apt, pool_at)
+    expect(data, set_at, f"a2{pool_index(pool, 'm_bCanCreateGame'):02x}b903"
+                         f"af{pool_index(pool, 'bCanCreateGame'):02x}1d")
+    data[set_at + 2:set_at + 6] = bytes([SIMPLE["pushFalse"], SIMPLE["not"], SIMPLE["not"],
+                                         SIMPLE["not"]])
+    expect(data, type_at, f"b902a3{pool_index(pool, 'm_iRoomGameType'):04x}4e")
+    data[type_at:type_at + 6] = bytes([0xB5, 1, SIMPLE["pushTrue"], SIMPLE["pop"],
+                                       SIMPLE["pushTrue"], SIMPLE["pop"]])
+    return bytes(data), [(set_at - 0x10, set_at + 0x10), (type_at - 0x10, type_at + 0x20)], \
+        pool_at
+
+
+# Sports07_Toggle writes textColor 0 for the enabled / highlighted / unhighlighted
+# state (and ToggleWithLabel's CLR_HIGHLIGHTED / CLR_UNHIGHLIGHTED are 0). The
+# text renderer treats 0 as "no color", so the glyphs are skipped. 1 is black.
+# These are the pushZero instructions that are that color value (each is
+# followed by setMember). Offsets are in the original stdcontrols apt.
+TOGGLE_COLOR_ZERO = (
+    0x10264, 0x110F0,  # slider highlight, enabled arm of the color ternary
+    0x186FE, 0x18745,  # Toggle highlight / unhighlight
+    0x18ADE, 0x18AE4,  # ToggleWithLabel CLR_HIGHLIGHTED / CLR_UNHIGHLIGHTED
+    0x18D8A,
+    0x1CDC2, 0x1CDCA, 0x1CDDA, 0x1CDE2,
+    0x1CEC9, 0x1CED1,
+    0x1CF98, 0x1CFA0,
+)
+
+
+def patch_stdcontrols(apt_bytes, const_bytes):
+    """stdcontrols, the shared toggle / slider widgets.
+
+    The pale-grey recolor (patch_online_text_color) fixes text whose color is
+    baked into the movie. Toggle labels are not: highlight and unhighlight
+    assign textColor 0, and the create-session screen's focused row (the white
+    bar) and every unfocused row except the one given a TextFormat disappear.
+    Patched: those assignments push 1 (black) instead of 0.
+    """
+    data = bytearray(patch_online_text_color(apt_bytes, const_bytes)[0])
+    for at in TOGGLE_COLOR_ZERO:
+        expect(data, at, "594f")
+        data[at] = SIMPLE["pushOne"]
+    return bytes(data), [], None
+
+
+# createcoop's _initOptionToggle reads SessionParameter.<name>. This arcade
+# build's SessionParameter only has eSpeed / ePowerUps / eArcadeScore, so every
+# versus row is created with option = undefined and setLabel wipes the text.
+# The trace strings below are overwritten with the row titles (they only feed
+# trace). Body of _initOptionToggle, original apt.
+CREATE_SESSION_ROWS = (
+    ("tglGameSpeed", "GAME SPEED", "createcoop_custom.as:: custom_PreInitScreen()"),
+    ("tglPeriodLength", "PERIOD LENGTH", "createcoop_custom.as:: custom_PostInitScreen()"),
+    ("tglRules", "RULES", "createcoop_custom.as:: custom_SetControlReferences()"),
+    ("tglInjuries", "INJURIES", "updateMenuAndTickerHelp: m_bCreatingGame = "),
+    ("tglFighting", "FIGHTING", "custom_PostOnExitScreen: m_bCreatingGame = "),
+    ("tglPenalties", "PENALTIES", ", isAllowedToRestoreDefaults = "),
+    ("tglCreatedPlays", "CREATED PLAYS", ", m_isRestoreShowing = "),
+    ("tglLocation", "LOCATION", ", m_lobbyRoomName = "),
+    ("tglLanguage", "LANGUAGE", "Not reseting states"),
+    ("tglMyTeam", "MY TEAM", "Reseting states"),
+    ("tglOppTeam", "OPPONENT", ", option = "),
+)
+CREATE_SESSION_BODY = 0x1FD8
+CREATE_SESSION_BODY_END = 0x2139
+
+
+def _label_and_color(reg):
+    """setLabel(title, false) on toggle `reg`, then force both text fields
+    dark. title is on the stack.
+
+    Call arguments are taken last-pushed first, so the localize flag is pushed
+    before the title. Passing them the other way makes the flag the label,
+    which localizes to "*false". An empty help string keeps the ticker from
+    showing "undefined".
+    """
+    return [
+        ("storeRegister", 6), ("pop",),
+        ("pushFalse",), ("pushRegister", 6), ("pushByte", 2),
+        ("pushRegister", reg), ("pushConst", "setLabel"), ("callMethodPop",),
+        ("pushRegister", reg), ("getNamedMember", "txtLabel"),
+        ("pushConst", "textColor"), ("pushLong", 0x202020), ("setMember",),
+        ("pushRegister", reg), ("getNamedMember", "txtField"),
+        ("pushConst", "textColor"), ("pushLong", 0x202020), ("setMember",),
+        ("pushValueOfVar", "arrCustomHelp"), ("pushRegister", reg),
+        ("getNamedMember", "_name"), ("pushConst", ""), ("setMember",),
+        ("pushRegister", reg), ("pushOne",), ("pushRegister", 1),
+        ("getNamedMember", "gFM"), ("callNamedMethodPop", "addItem"),
+    ]
+
+
+def patch_create_session(apt_bytes, const_bytes):
+    """createcoop, the ONLINE VERSUS create-session screen.
+
+    Stock _initOptionToggle labels each row from SessionParameter, which this
+    game never defines for the versus rows, so the rows are blank. Game Type
+    is labeled by a different path and is the one line that shows.
+
+    Patched: the toggle name selects a literal title (GAME SPEED, PERIOD
+    LENGTH, ...), drawn without localization, in dark grey, and the row joins
+    the focus list. Also recolors the screen's pale text.
+    """
+    data = bytearray(patch_online_text_color(apt_bytes, const_bytes)[0])
+    consts = bytearray(const_bytes)
+    apt = apt_dis.Apt(apt_bytes, const_bytes)
+    pool_at = 0xD9C
+    for _name, title, trace in CREATE_SESSION_ROWS:
+        rename_pool_string(consts, apt, pool_at, trace, title)
+    rename_pool_string(
+        consts, apt, pool_at,
+        "[createcoop_custom.as::custom_RestorePersistentDefaults]: restoring defaults "
+        "for gametype UNRANKED",
+        "textColor")
+    pool = frame_pool(apt_dis.Apt(bytes(data), bytes(consts)), pool_at)
+    code = [
+        ("pushValueOfVar", "mcInviteGroup"), ("pushRegister", 7), ("getMember",),
+        ("storeRegister", 5), ("pop",),
+        ("pushValueOfVar", "mcCreateGroup"), ("pushRegister", 7), ("getMember",),
+        ("storeRegister", 4), ("pop",),
+    ]
+    for _name, title, _trace in reversed(CREATE_SESSION_ROWS):
+        code.append(("pushConst", title))
+    code += [("pushByte", len(CREATE_SESSION_ROWS)), ("initArray",),
+             ("storeRegister", 0), ("pop",)]
+    for name, _title, _trace in reversed(CREATE_SESSION_ROWS):
+        code.append(("pushConst", name))
+    code += [("pushByte", len(CREATE_SESSION_ROWS)), ("initArray",),
+             ("storeRegister", 2), ("pop",),
+             ("pushZero",), ("storeRegister", 3), ("pop",),
+             ("label", "loop"),
+             ("pushRegister", 3), ("pushByte", len(CREATE_SESSION_ROWS)), ("less2",),
+             ("not",), ("branchIfTrue", "done"),
+             ("pushRegister", 2), ("pushRegister", 3), ("getMember",),
+             ("pushRegister", 7), ("equals2",),
+             ("not",), ("branchIfTrue", "next"),
+             ("pushRegister", 0), ("pushRegister", 3), ("getMember",)]
+    code += _label_and_color(4)
+    code += [("pushRegister", 0), ("pushRegister", 3), ("getMember",)]
+    code += _label_and_color(5)
+    code += [("return",),
+             ("label", "next"),
+             ("pushRegister", 3), ("increment",), ("storeRegister", 3), ("pop",),
+             ("jump", "loop"),
+             ("label", "done"),
+             ("return",)]
+    assemble(data, [Chunk(CREATE_SESSION_BODY, CREATE_SESSION_BODY_END, code)], pool)
+    return bytes(data), [(CREATE_SESSION_BODY, CREATE_SESSION_BODY_END)], pool_at, bytes(consts)
 
 
 # (archive entry, nested entry of the .apt, nested entry of the .const, patch)
@@ -690,10 +922,16 @@ PATCHES = [
     ("fe/ion/game/screens/online/onlinestartinglineups.big", "0", "1", patch_starting_lineups),
     ("fe/ion/external/ion_online/screens/online/lobby/lobbylist.big", "0", "1",
      patch_online_text_color),
-    ("fe/ion/external/ion_online/screens/online/lobby/room.big", "0", "1",
-     patch_online_text_color),
+    ("fe/ion/external/ion_online/screens/online/lobby/room.big", "0", "1", patch_lobby_room),
     ("fe/ion/external/ion_online/components/onlinecomponents.big", "0", "1",
      patch_online_text_color),
+    ("fe/ion/external/ion_sports07/components/stdcontrols.big", "0", "1",
+     patch_stdcontrols),
+    ("fe/ion/external/ion_online/main/zoneonlinemain.big", "0", "1", patch_online_main),
+    *((f"fe/ion/game/screens/online/session/{name}.big", "0", "1", patch_online_text_color)
+      for name in ("custom_nconsole", "customarcade", "customcoop", "customshootout",
+                   "create_nconsole", "createshootout")),
+    ("fe/ion/game/screens/online/session/createcoop.big", "0", "1", patch_create_session),
 ]
 
 # --- Archive rebuild ---------------------------------------------------------

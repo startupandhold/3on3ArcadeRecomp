@@ -434,9 +434,23 @@ uint32_t NetSetupStatus(const uint8_t* base) {
 
 // Ready barrier: waits until barrier+8 (ready peers) reaches r4 (players - 1).
 // barrier+4 points at a 12-slot per-peer table; session+8 is the link module.
+// A created session leaves the Xbox member count (session+224) at 0, so the
+// caller passes -1. The count never equals that, the 15s wait fails, and net
+// setup status is set to 9, which runs the sim locally and then reports that
+// the opponent left. The lobby console count is the number of peers to wait for.
 extern "C" REX_FUNC(__imp__sub_8251CDF0);
 extern "C" REX_FUNC(sub_8251CDF0) {
   relay::DeliverMessages(ctx, base);
+  const int32_t consoles = Nhl3on3GameConsoles();
+  if (ctx.r4.s32 < 0 && consoles >= 2) {
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      REXLOG_INFO("[dist] ready barrier target {} -> {} ({} consoles in the lobby)", ctx.r4.s32,
+                  consoles - 1, consoles);
+    }
+    ctx.r4.s64 = uint32_t(consoles - 1);
+  }
   if (REXCVAR_GET(dist_trace) <= 0) {
     __imp__sub_8251CDF0(ctx, base);
     return;
@@ -995,4 +1009,84 @@ extern "C" REX_FUNC(sub_82758BE8) {
                    type != 1 && data && length ? Hex(base, data, length) : "-");
   }
   REXLOG_INFO("{}", line);
+}
+
+// Arcade does not call offsides. The linesman (sub_8239BF50) counts skaters
+// past the blue line into two bytes at 0x831541E4. The call right after it
+// (sub_823A6B78) treats a positive count as a delayed offside. The count is
+// cleared after the scan so that path never arms.
+//
+// The byte at 0x8314D395 that also gates the linesman is the "play stopped"
+// flag (set on every whistle, cleared at the puck drop). Forcing it on keeps
+// the faceoff from ever dropping and the session times out.
+//
+// The rulebook whistle (sub_82468E48 returning 128) and the warning presenter
+// (sub_82657F30 states 0 and 1; sub_8265E4D8 reason byte 6) stay swallowed so a
+// count that lands some other way still cannot call it.
+extern "C" REX_FUNC(__imp__sub_8239BF50);
+extern "C" REX_FUNC(sub_8239BF50) {
+  __imp__sub_8239BF50(ctx, base);
+  constexpr uint32_t kOffside = 0x831541E4;
+  if (base[kOffside + 8] == 0 && base[kOffside + 9] == 0) {
+    return;
+  }
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    REXLOG_INFO("[rules] offside count {} {} cleared", base[kOffside + 8], base[kOffside + 9]);
+  }
+  base[kOffside + 8] = 0;
+  base[kOffside + 9] = 0;
+}
+
+// Per-tick offside state machine. It owns the "team is offside" bytes at
+// 0x8314B87C that the whistle, the scorebug light and the AI all read. It only
+// runs when the offside rule word ([[0x8314AE74] + 26076] + 16) is non-zero;
+// at 0 it clears both teams and returns. Ranked queue and team play carry 0.
+// A created session carries the delayed-offside default, so the rule is
+// forced off before the tick.
+extern "C" REX_FUNC(__imp__sub_82349388);
+extern "C" REX_FUNC(sub_82349388) {
+  const uint32_t game = Load32(base, 0x8314AE74);
+  const uint32_t rules = game ? Load32(base, game + 26076) : 0;
+  if (rules && Load32(base, rules + 16) != 0) {
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      REXLOG_INFO("[rules] offside rule {} -> off", Load32(base, rules + 16));
+    }
+    Store32(base, rules + 16, 0);
+  }
+  __imp__sub_82349388(ctx, base);
+}
+
+extern "C" REX_FUNC(__imp__sub_82468E48);
+extern "C" REX_FUNC(sub_82468E48) {
+  __imp__sub_82468E48(ctx, base);
+  if (ctx.r3.u32 != 128) {
+    return;
+  }
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    REXLOG_INFO("[rules] offside not called");
+  }
+  ctx.r3.s64 = 1;
+}
+
+extern "C" REX_FUNC(__imp__sub_82657F30);
+extern "C" REX_FUNC(sub_82657F30) {
+  const uint32_t state = ctx.r3.u32 ? Load32(base, ctx.r3.u32) : ~0u;
+  if (state < 2) {
+    return;
+  }
+  __imp__sub_82657F30(ctx, base);
+}
+
+extern "C" REX_FUNC(__imp__sub_8265E4D8);
+extern "C" REX_FUNC(sub_8265E4D8) {
+  if (ctx.r3.u32 && base[ctx.r3.u32 + 29] == 6) {
+    return;
+  }
+  __imp__sub_8265E4D8(ctx, base);
 }

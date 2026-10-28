@@ -365,11 +365,20 @@ class Tunnel(asyncio.DatagramProtocol):
             dest_vip, dest_port, src_port = struct.unpack_from("<IHH", body)
             dest = self.by_vip.get(dest_vip)
             if not dest:
+                log.info("drop %s:%d -> %s:%d (%d bytes): no peer",
+                         format_ip(peer.vip), src_port, format_ip(dest_vip), dest_port,
+                         len(body) - 8)
                 return
             self.transport.sendto(
                 HEADER.pack(TUNNEL_MAGIC, K_DATA)
                 + struct.pack("<IHH", peer.vip, src_port, dest_port) + body[8:], dest.addr)
             self.forwarded += 1
+            # ConnApi (3659) / voice (6000): one line per new flow so we can see
+            # whether Select Sides probes are actually crossing the tunnel.
+            if dest_port in (3659, 6000) and self.forwarded <= 40:
+                log.info("forward %s:%d -> %s:%d (%d bytes)",
+                         format_ip(peer.vip), src_port, format_ip(dest_vip), dest_port,
+                         len(body) - 8)
         elif kind == K_RELAY:
             self.relay_received(peer.vip, body)
 
