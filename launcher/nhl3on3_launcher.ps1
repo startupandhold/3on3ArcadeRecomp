@@ -39,10 +39,10 @@ $Settings = @(
      Choices = [ordered]@{ 'topdown' = 'Top-down (whole rink)'; 'classic' = 'Classic (tilted, follows play)'; 'game' = 'Game camera' }
      Tip = "Portrait aspect ratios only. Classic is closer and more tilted, like old-school hockey games,`nand scrolls up and down the rink with the play." }
   @{ Tab = 'Display'; Key = 'fps_cap'; Label = 'Frame rate cap'; Kind = 'edit'; Toml = 'string'; Default = '60'
-     Choices = [ordered]@{ '60' = '60'; '90' = '90'; '120' = '120'; '144' = '144'; '165' = '165'; '240' = '240'; 'unlocked' = 'unlocked' }
-     Tip = "60 is stock. Any value from 24 to 240, or 'unlocked'." }
+     Choices = [ordered]@{ '60' = '60'; '90' = '90'; '120' = '120'; '144' = '144'; '165' = '165'; '240' = '240'; 'display' = 'display'; 'unlocked' = 'unlocked' }
+     Tip = "60 is stock. Any value from 24 to 500, 'display' (your display's refresh rate),`nor 'unlocked' (as fast as your PC can render). Matches run at half the cap or less." }
   @{ Tab = 'Display'; Key = 'vsync'; Label = 'VSync'; Kind = 'bool'; Toml = 'bool'; Default = 'true'
-     Tip = 'Off gives lower input latency and smoother pacing here; may tear without a variable refresh rate display.' }
+     Tip = 'Shows each frame in sync with the display, so the picture never tears. Off has slightly lower latency but may tear without a G-Sync / FreeSync display. Does not change the frame rate cap.' }
 
   @{ Tab = 'Graphics'; Key = 'render_quality'; Label = 'Internal resolution'; Kind = 'choice'; Toml = 'string'; Default = ''
      Choices = [ordered]@{ '' = 'Native (720p)'; '2x' = '2x (1440p)'; '3x' = '3x (2160p)' } }

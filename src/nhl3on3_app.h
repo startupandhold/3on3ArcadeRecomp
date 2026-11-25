@@ -109,11 +109,10 @@ class Nhl3on3App : public rex::ReXApp {
     // Without it popups, the legal screen and the copyright line are blank or
     // scrambled (seen on D3D12).
     SetDefaultFlag("readback_resolve", "full");
-    // NVIDIA's alpha test is exact, so a glyph that lands on the reference
-    // value flickers in and out. The in-game score does this; the epsilon
-    // compare is baked into the shader when it is translated, which happens
-    // on every launch.
-    SetDefaultFlag("use_fuzzy_alpha_epsilon", "true");
+    // use_fuzzy_alpha_epsilon stays off: its epsilon lets fully transparent
+    // texels pass the alpha test, drawing white and magenta specks around
+    // every HUD and menu sprite (jerseys, scoreboard, pause frame). The score
+    // digits draw steadily without it.
     nhl3on3::ConfigureDisplay();
   }
 
@@ -176,7 +175,9 @@ class Nhl3on3App : public rex::ReXApp {
   // Changes a cvar's default without overriding a value from the command line
   // or config file.
   static void SetDefaultFlag(std::string_view name, std::string_view value) {
-    if (!rex::cvar::HasNonDefaultValue(name)) {
+    // Not HasNonDefaultValue: a setting explicitly set to the default value
+    // (e.g. use_fuzzy_alpha_epsilon = false) must stay that way.
+    if (rex::cvar::GetFlagSource(name) == rex::cvar::Source::kDefault) {
       rex::cvar::SetFlagByName(name, value);
     }
   }

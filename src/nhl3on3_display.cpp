@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -82,9 +83,9 @@ REXCVAR_DEFINE_DOUBLE(topdown_zoom, 1.0, "NHL3on3/Display",
                       "opening face-off (smaller is closer)");
 
 REXCVAR_DEFINE_STRING(fps_cap, "60", "NHL3on3/Display",
-                      "Frame rate cap: 60 (stock), 90, 120, 144, any value 24-240, or "
-                      "unlocked. The game paces itself on the guest vblank, which runs at "
-                      "this rate")
+                      "Frame rate cap: 60 (stock), 90, 120, 144, any value 24-500, display "
+                      "(the display's refresh rate), or unlocked. The game paces itself on "
+                      "the guest vblank, which runs at this rate; vsync only stops tearing")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(log_fps, false, "NHL3on3/Display",
@@ -149,8 +150,38 @@ double ResolveAspect(std::string_view setting) {
   return w / h;
 }
 
+// The primary display's refresh rate in Hz (exact, e.g. 143.98), or 0.
+double DisplayRefreshRate() {
+#if defined(_WIN32)
+  UINT32 path_count = 0, mode_count = 0;
+  if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) !=
+      ERROR_SUCCESS) {
+    return 0.0;
+  }
+  std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+  std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+  if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count,
+                         modes.data(), nullptr) != ERROR_SUCCESS) {
+    return 0.0;
+  }
+  for (UINT32 i = 0; i < path_count; ++i) {
+    const auto& path = paths[i];
+    const UINT32 source = path.sourceInfo.modeInfoIdx;
+    if (source >= mode_count || modes[source].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+      continue;
+    }
+    const POINTL at = modes[source].sourceMode.position;
+    const auto& r = path.targetInfo.refreshRate;
+    if (at.x == 0 && at.y == 0 && r.Denominator) {  // the primary display
+      return double(r.Numerator) / double(r.Denominator);
+    }
+  }
+#endif
+  return 0.0;
+}
+
 void SetIfDefault(std::string_view name, std::string_view value) {
-  if (!rex::cvar::HasNonDefaultValue(name)) {
+  if (rex::cvar::GetFlagSource(name) == rex::cvar::Source::kDefault) {
     rex::cvar::SetFlagByName(name, value);
   }
 }
@@ -161,20 +192,37 @@ namespace nhl3on3 {
 
 void ConfigureDisplay() {
   std::string fps = REXCVAR_GET(fps_cap);
-  if (vr::Enabled() && !rex::cvar::HasNonDefaultValue("fps_cap")) {
+  if (vr::Enabled() && rex::cvar::GetFlagSource("fps_cap") == rex::cvar::Source::kDefault) {
     // Each eye gets every other frame.
     fps = "120";
   }
-  if (fps == "unlocked" || fps == "0") {
-    SetIfDefault("vsync", "false");
-    REXLOG_INFO("Frame rate: unlocked");
-  } else if (!fps.empty() && fps != "60") {
-    double rate = 0.0;
+  // The SDK's vsync flag paces the guest vblank (false: as fast as it can
+  // go), which the game paces itself on; it doesn't touch the presenter. The
+  // launcher's VSync means "no tearing", so read it as that: it picks the
+  // presenter's sync, and fps_cap alone sets the pacing.
+  const bool present_sync = rex::cvar::GetFlagSource("vsync") == rex::cvar::Source::kDefault ||
+                            rex::cvar::GetFlagByName("vsync") == "true";
+  double rate = 0.0;
+  if (fps == "display") {
+    rate = DisplayRefreshRate();
+    if (rate <= 0.0) {
+      REXLOG_WARN("fps_cap = display: refresh rate unknown; running unlocked");
+      fps = "unlocked";
+    }
+  } else if (fps != "unlocked" && fps != "0" && !fps.empty()) {
     std::from_chars(fps.data(), fps.data() + fps.size(), rate);
-    rate = std::clamp(rate, 24.0, 240.0);
-    SetIfDefault("video_mode_refresh_rate", std::to_string(rate));
-    REXLOG_INFO("Frame rate: capped at {:g}", rate);
   }
+  const bool unlocked = fps == "unlocked" || fps == "0";
+  rex::cvar::SetFlagByName("vsync", unlocked ? "false" : "true");
+  if (!unlocked && rate > 0.0 && rate != 60.0) {
+    rate = std::clamp(rate, 24.0, 500.0);
+    SetIfDefault("video_mode_refresh_rate", fmt::format("{}", rate));
+  }
+  SetIfDefault("d3d12_allow_variable_refresh_rate_and_tearing", present_sync ? "false" : "true");
+  SetIfDefault("vulkan_allow_present_mode_immediate", present_sync ? "false" : "true");
+  REXLOG_INFO("Frame rate: {}, vsync (presentation) {}",
+              unlocked ? std::string("unlocked") : fmt::format("capped at {:g}", rate > 0.0 ? rate : 60.0),
+              present_sync ? "on" : "off (tearing allowed)");
 
   const std::string quality = REXCVAR_GET(render_quality);
   if (!quality.empty()) {

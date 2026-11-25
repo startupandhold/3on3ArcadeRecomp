@@ -67,11 +67,14 @@ const std::vector<Setting> kSettings = {
      "Where the scoreboard and menus sit in a portrait window."},
     {"Display", "fps_cap", "Frame rate cap", Kind::Edit, Toml::String, "60",
      {{"60", "60"}, {"90", "90"}, {"120", "120"}, {"144", "144"}, {"165", "165"},
-      {"240", "240"}, {"unlocked", "unlocked"}},
-     "60 is stock. Any value from 24 to 240, or 'unlocked'."},
+      {"240", "240"}, {"display", "display"}, {"unlocked", "unlocked"}},
+     "60 is stock. Any value from 24 to 500, 'display' (your display's refresh rate; "
+     "unlocked on Linux), or 'unlocked' (as fast as your PC can render). Matches run at "
+     "half the cap or less."},
     {"Display", "vsync", "VSync", Kind::Bool, Toml::Bool, "true", {},
-     "Off gives lower input latency and smoother pacing here; may tear without a variable "
-     "refresh rate display."},
+     "Shows each frame in sync with the display, so the picture never tears. Off has "
+     "slightly lower latency but may tear without a G-Sync / FreeSync display. Does not "
+     "change the frame rate cap."},
 
     {"Graphics", "render_quality", "Internal resolution", Kind::Choice, Toml::String, "",
      {{"", "Native (720p)"}, {"2x", "2x (1440p)"}, {"3x", "3x (2160p)"}}},
