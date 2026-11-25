@@ -189,16 +189,21 @@ void ConfigureDisplay() {
 #endif
       SetIfDefault("native_2x_msaa", "false");
       SetIfDefault("readback_memexport", "false");
+      // The CPU reads the glyph cache back from the scaled resolve. Sampling
+      // the corner of each 2x2 block misses the stroke of a score digit, so
+      // the score box draws with the jerseys and no numbers. Sample the center.
+      SetIfDefault("readback_resolve_half_pixel_offset", "true");
     }
   }
   REXLOG_INFO("Display: vsync {}, render scale {}x{}, fullscreen {}, 2x MSAA {}, "
-              "memexport readback {}",
+              "memexport readback {}, resolve half pixel {}",
               rex::cvar::GetFlagByName("vsync"),
               rex::cvar::GetFlagByName("draw_resolution_scale_x"),
               rex::cvar::GetFlagByName("draw_resolution_scale_y"),
               rex::cvar::GetFlagByName("fullscreen"),
               rex::cvar::GetFlagByName("native_2x_msaa"),
-              rex::cvar::GetFlagByName("readback_memexport"));
+              rex::cvar::GetFlagByName("readback_memexport"),
+              rex::cvar::GetFlagByName("readback_resolve_half_pixel_offset"));
 
   double aspect = std::clamp(ResolveAspect(REXCVAR_GET(aspect_ratio)), 0.25, 4.0);
   if (std::fabs(aspect - kNativeAspect) < 0.01) {

@@ -4,7 +4,8 @@
 //   "NPAD", u8 slot, u8[3] reserved, u32 sequence,
 //   u16 buttons, u8 left_trigger, u8 right_trigger, i16 lx, ly, rx, ry
 // using XINPUT_GAMEPAD button bits. A slot counts as connected while its
-// packets keep arriving.
+// packets keep arriving; packets older than the newest one taken (by sequence,
+// wrapping around) are dropped.
 
 #include "nhl3on3_remote_pad.h"
 
@@ -63,6 +64,7 @@ struct Keystroke {
 struct Slot {
   bool seen = false;
   Clock::time_point last_packet;
+  uint32_t sequence = 0;  // of the newest packet taken
   uint32_t packet_number = 0;
   Gamepad pad;
   uint32_t pressed = 0;  // bits of kKeys
@@ -111,6 +113,11 @@ uint16_t LoadLE16(const uint8_t* p) {
   return uint16_t(p[0] | (p[1] << 8));
 }
 
+uint32_t LoadLE32(const uint8_t* p) {
+  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+         (uint32_t(p[3]) << 24);
+}
+
 void StoreBE16(uint8_t* p, uint16_t v) {
   p[0] = uint8_t(v >> 8);
   p[1] = uint8_t(v);
@@ -147,6 +154,7 @@ void HandlePacket(const uint8_t* data, size_t length, const std::string& sender)
     return;
   }
   const uint32_t index = data[4];
+  const uint32_t sequence = LoadLE32(data + 8);
   const uint8_t* p = data + 12;
   Gamepad pad;
   pad.buttons = LoadLE16(p);
@@ -173,9 +181,12 @@ void HandlePacket(const uint8_t* data, size_t length, const std::string& sender)
       connected = true;
       slot.pressed = 0;
       slot.keystrokes.clear();
+    } else if (int32_t(sequence - slot.sequence) <= 0) {
+      return;  // reordered or repeated
     }
     slot.seen = true;
     slot.last_packet = now;
+    slot.sequence = sequence;
     if (std::memcmp(&slot.pad, &pad, sizeof(pad)) != 0) {
       slot.pad = pad;
       ++slot.packet_number;
@@ -193,12 +204,25 @@ void Listen(uint16_t port) {
   WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
   auto sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#if defined(_WIN32)
+  if (sock == INVALID_SOCKET) {
+#else
+  if (sock < 0) {
+#endif
+    REXLOG_ERROR("[pad] could not create a UDP socket for remote controllers");
+    return;
+  }
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
   if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     REXLOG_ERROR("[pad] could not listen for remote controllers on UDP port {}", port);
+#if defined(_WIN32)
+    closesocket(sock);
+#else
+    close(sock);
+#endif
     return;
   }
   REXLOG_INFO("[pad] listening for remote controllers on UDP port {}", port);

@@ -8,8 +8,17 @@
 //   frame number, u16 n, n x (slot count x input)
 // kMessages (either way): u32 messages received, u32 first message number,
 //   u16 n, n x input; control messages, reliable and in order per link
-// input: u8 type, u16 length, data
+// kHash (client -> host): u32 frame number, u32 hash of the frames played up
+//   to it, every kHashEvery frames; the host logs the first mismatch
+// input: u8 type, u16 length, data (at most kMaxInput bytes, kMaxMessage for
+//   messages; a packet with a longer one is dropped whole)
 // Everything not yet acknowledged is resent until it is.
+//
+// The host (slot 0, or the server through the tunnel) binds each slot to the
+// first address that sends for it, and marks a slot dead once it goes quiet
+// (kDeadAfter, or kNeverHeardAfter if it never sent); a dead slot's input is
+// "no input" (type 1) from then on, so every console keeps playing the same
+// frames. See server/PROTOCOL_V2.md.
 
 #include "nhl3on3_lockstep_relay.h"
 
@@ -19,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,7 +69,9 @@ REXCVAR_DEFINE_BOOL(lockstep_relay, true, "NHL3on3/Online",
 
 uint32_t Nhl3on3LocalIp();
 std::vector<uint32_t> Nhl3on3GamePeers();
+void Nhl3on3ClearGamePeers();
 bool Nhl3on3TunnelActive();
+bool Nhl3on3TunnelFellBack();
 void Nhl3on3TunnelSendRelay(const uint8_t* data, size_t size);
 bool Nhl3on3TunnelReceiveRelay(std::vector<uint8_t>& packet,
                                std::chrono::steady_clock::time_point& arrived);
@@ -82,12 +94,29 @@ constexpr uint32_t kMagic = 0x3152484E;  // "NHR1"
 constexpr uint8_t kInputs = 1;
 constexpr uint8_t kFrames = 2;
 constexpr uint8_t kMessages = 3;
+constexpr uint8_t kHash = 4;
 constexpr uint32_t kMaxMessage = 1200;
 constexpr size_t kHeaderSize = 8;
 constexpr size_t kMaxPacket = 1400;
+// A frame can be bigger than one packet (12 slots x 255 bytes).
+constexpr size_t kReceiveBuffer = 65536;
 constexpr uint32_t kMaxInput = 252;  // the game's per-slot receive buffer
 constexpr uint32_t kMaxSlots = 12;
 constexpr uint32_t kWindow = 8;  // most local inputs sent ahead of the frames played
+// Host: inputs taken per slot ahead of the frames built, and control
+// messages queued for one client before it counts as gone.
+constexpr uint32_t kMaxAhead = 2 * kWindow;
+constexpr size_t kMaxQueued = 256;
+// Host: a slot is dead once it sends nothing for kDeadAfter, or never sends
+// in the first kNeverHeardAfter. Client: the host counts as lost after
+// kHostLostAfter without a packet.
+constexpr auto kDeadAfter = std::chrono::seconds(8);
+constexpr auto kNeverHeardAfter = std::chrono::seconds(30);
+constexpr auto kHostLostAfter = std::chrono::seconds(10);
+constexpr uint32_t kHashEvery = 60;  // frames played between desync checks
+constexpr size_t kHashCheckpoints = 16;  // host: checks held until every slot reports
+constexpr auto kStallLogAfter = std::chrono::milliseconds(500);
+constexpr auto kStallLogEvery = std::chrono::seconds(1);
 constexpr uint32_t kMinLead = 1;
 constexpr double kMinMarginMs = 4.0;
 // After the first kSettleFrames, the lead drops only once it could have been
@@ -96,7 +125,9 @@ constexpr uint32_t kSettleFrames = 120;
 constexpr uint32_t kPlayedSlots = 64;  // > kWindow
 constexpr auto kLowerAfter = std::chrono::seconds(3);
 constexpr auto kResend = std::chrono::milliseconds(20);
+constexpr auto kMaxResend = std::chrono::milliseconds(100);
 constexpr uint32_t kDefaultRateMs = 16;  // if the dist has no input rate set
+constexpr uint32_t kHashSeed = 2166136261u;  // FNV-1a
 
 struct Input {
   uint8_t type = 1;
@@ -110,18 +141,33 @@ struct Channel {
   uint32_t out_base = 0;
   uint32_t in_next = 0;   // next message number expected
   uint32_t ack_sent = ~0u;
+  uint32_t sent_end = 0;  // end of the messages sent at least once
   Clock::time_point last_send{};
 };
 
 struct Client {
   bool known = false;
-  sockaddr_in addr{};
+  sockaddr_in addr{};  // the first address that sent for this slot
+  // Gone (quiet too long or flooding): plays "no input" and is ignored.
+  bool dead = false;
+  Clock::time_point last_heard{};
   Channel messages;
   uint32_t inputs_received = 0;  // inputs taken from this client
   uint32_t frames_acked = 0;     // frames it has received
   uint32_t frames_sent = 0;      // frames sent so far (end of the last packet)
   Clock::time_point last_send{};
   std::deque<Input> pending;     // inputs not yet in a frame
+  // Smoothed time from sending new frames to their ack (0 = unknown), from
+  // one probe at a time: frames up to probe_frame, first sent at probe_sent.
+  double rtt_ms = 0;
+  uint32_t probe_frame = 0;
+  Clock::time_point probe_sent{};
+};
+
+// Host: the hashes every slot reported for one frame number.
+struct Checkpoint {
+  uint32_t frame = 0;
+  std::vector<std::optional<uint32_t>> hashes;  // by slot
 };
 
 struct Relay {
@@ -160,17 +206,41 @@ struct Relay {
   uint32_t lead = kWindow;
   Clock::time_point lower_since{};
   uint32_t inputs_acked = 0;
+  uint32_t inputs_put = 0;  // end of the local inputs sent at least once
   uint32_t acked_sent = ~0u;
   Clock::time_point last_send{};
 
   // Host: one entry per slot (its own slot's pending inputs included).
   std::vector<Client> clients;
+  Clock::time_point started{};  // relay set up
 
   // Client: control messages to and from the host.
   Channel host_messages;
+  // Client (direct): the host's address once a valid packet came from it;
+  // until then, any game link peer's. Packets from anywhere else are dropped.
+  bool host_bound = false;
+  uint32_t host_ip = 0;
+  Clock::time_point host_heard{};
+  bool host_lost = false;
+  bool logged_peers = false, logged_no_peers = false;
+  uint32_t foreign_logged = 0;  // host: packets logged from a slot's other addresses
 
   // Received control messages not yet handed to the game.
   std::deque<Input> inbox;
+
+  // Desync check: hash of every frame played so far; host: the checks still
+  // waiting for some slot's hash.
+  uint32_t hash = kHashSeed;
+  std::deque<Checkpoint> checkpoints;
+  bool desync_logged = false;
+
+  // Diagnostics: when frame queries started coming back empty, when that was
+  // last logged, and counters over the match.
+  Clock::time_point stall_since{};
+  Clock::time_point stall_logged{};
+  uint64_t resends = 0;
+  uint64_t dropped = 0;
+  double stalled_ms = 0;  // in stalls longer than kStallLogAfter
 };
 
 std::mutex g_mutex;
@@ -233,10 +303,12 @@ void TimeFramePlayed(uint32_t frame, uint32_t backlog) {
   REXLOG_INFO(
       "[relay] timing to frame {}: input to frame ready avg {:.1f} max {:.1f} ms, ready to "
       "played avg {:.1f} max {:.1f} ms, total avg {:.1f} ms; frames left after each play "
-      "avg {:.2f}; empty frame queries every {:.1f} ms (max {:.1f}); sent {} played {}",
+      "avg {:.2f}; empty frame queries every {:.1f} ms (max {:.1f}); sent {} played {}; this "
+      "match: resends {}, dropped packets {}, stalled {:.0f} ms",
       frame, s.build_sum / s.frames, s.build_max, s.wait_sum / s.frames, s.wait_max,
       (s.build_sum + s.wait_sum) / s.frames, double(s.backlog_sum) / s.frames,
-      s.polls ? s.poll_sum / s.polls : 0.0, s.poll_max, r.inputs_sent, r.frames_played);
+      s.polls ? s.poll_sum / s.polls : 0.0, s.poll_max, r.inputs_sent, r.frames_played,
+      r.resends, r.dropped, r.stalled_ms);
   s = TimingStats{};
 }
 
@@ -348,10 +420,14 @@ class Reader {
     p_ += 4;
     return v;
   }
-  Input Get() {
+  // An input of at most `max` data bytes; a longer one fails the packet.
+  Input Get(uint32_t max) {
     Input in;
     in.type = U8();
     const uint16_t length = U16();
+    if (length > max) {
+      ok_ = false;
+    }
     if (Need(length)) {
       in.data.assign(p_, p_ + length);
       p_ += length;
@@ -394,6 +470,25 @@ uint32_t FramesEnd() {
   return g_relay.frames_base + uint32_t(g_relay.frames.size());
 }
 
+std::string FormatAddr(const sockaddr_in& addr) {
+  return fmt::format("{}:{}", FormatIp(ntohl(addr.sin_addr.s_addr)), ntohs(addr.sin_port));
+}
+
+bool SameAddr(const sockaddr_in& a, const sockaddr_in& b) {
+  return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
+// Host: how long to wait before resending to a client; half its round trip
+// once that is known, within [kResend, kMaxResend].
+Clock::duration ResendInterval(const Client& c) {
+  if (c.rtt_ms <= 0) {
+    return kResend;
+  }
+  const auto half = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double, std::milli>(c.rtt_ms / 2));
+  return std::clamp<Clock::duration>(half, kResend, kMaxResend);
+}
+
 // Host: sends a client every frame it has not acknowledged, as many as fit.
 void SendFrames(Client& client, Clock::time_point now) {
   Relay& r = g_relay;
@@ -423,8 +518,61 @@ void SendFrames(Client& client, Clock::time_point now) {
   packet[count_at] = uint8_t(n);
   packet[count_at + 1] = uint8_t(n >> 8);
   SendTo(client.addr, packet);
+  if (n && first + n <= client.frames_sent) {  // nothing new
+    ++r.resends;
+  }
+  // Time one batch of new frames to its ack at a time.
+  if (n && !client.probe_frame && first + n > client.frames_sent) {
+    client.probe_frame = first + n;
+    client.probe_sent = now;
+  }
   client.frames_sent = first + n;
   client.last_send = now;
+}
+
+// Host: the slot's client stops counting: its input is "no input" from the
+// next frame built, and nothing it sends is taken.
+void MarkDead(uint32_t slot, const char* why) {
+  Relay& r = g_relay;
+  Client& c = r.clients[slot];
+  if (c.dead) {
+    return;
+  }
+  c.dead = true;
+  c.pending.clear();
+  c.messages.out.clear();
+  REXLOG_WARN("[relay] host: slot {} ({}) is gone: {}; it plays no input from frame {} on",
+              slot, c.known ? FormatAddr(c.addr) : "never heard from", why, FramesEnd() + 1);
+}
+
+// Host: queues a control message for slot `slot`; a client that lets
+// kMaxQueued pile up counts as gone.
+void QueueMessage(uint32_t slot, const Input& in) {
+  Client& c = g_relay.clients[slot];
+  if (c.dead) {
+    return;
+  }
+  if (c.messages.out.size() >= kMaxQueued) {
+    MarkDead(slot, "too many unacknowledged messages");
+    return;
+  }
+  c.messages.out.push_back(in);
+}
+
+// Host: marks slots that went quiet dead.
+void CheckSlots(Clock::time_point now) {
+  Relay& r = g_relay;
+  for (uint32_t s = 0; s < r.count; ++s) {
+    const Client& c = r.clients[s];
+    if (s == r.slot || c.dead) {
+      continue;
+    }
+    if (c.known && now - c.last_heard >= kDeadAfter) {
+      MarkDead(s, "nothing received for 8 s");
+    } else if (!c.known && now - r.started >= kNeverHeardAfter) {
+      MarkDead(s, "nothing received in the first 30 s");
+    }
+  }
 }
 
 // Host: turns inputs held from every slot into frames.
@@ -432,13 +580,17 @@ void BuildFrames() {
   Relay& r = g_relay;
   for (;;) {
     for (const Client& c : r.clients) {
-      if (c.pending.empty()) {
+      if (!c.dead && c.pending.empty()) {
         return;
       }
     }
     Frame frame;
     frame.reserve(r.clients.size());
     for (Client& c : r.clients) {
+      if (c.dead) {
+        frame.emplace_back();  // type 1, no input
+        continue;
+      }
       frame.push_back(std::move(c.pending.front()));
       c.pending.pop_front();
     }
@@ -451,12 +603,13 @@ void BuildFrames() {
   }
 }
 
-// Host: drops frames every client has acknowledged and the host has played.
+// Host: drops frames every live client has acknowledged and the host has
+// played.
 void TrimFrames() {
   Relay& r = g_relay;
   uint32_t keep = r.frames_played;
   for (uint32_t s = 0; s < r.count; ++s) {
-    if (s != r.slot) {
+    if (s != r.slot && !r.clients[s].dead) {
       keep = std::min(keep, r.clients[s].frames_acked);
     }
   }
@@ -466,31 +619,190 @@ void TrimFrames() {
   }
 }
 
-void HandleInputs(Reader& rd, uint8_t slot, const sockaddr_in& from) {
+// Host: the client for a packet from `from` claiming `slot`, binding the
+// slot to the first address that sends for it; null (and counted as
+// dropped) for the host's own slot, a dead slot or another address.
+Client* ClientFor(uint8_t slot, const sockaddr_in& from, Clock::time_point now) {
   Relay& r = g_relay;
   if (slot >= r.count || slot == r.slot) {
-    return;
+    ++r.dropped;
+    return nullptr;
   }
   Client& c = r.clients[slot];
+  if (c.dead) {
+    ++r.dropped;
+    return nullptr;
+  }
   if (!c.known) {
     c.known = true;
-    REXLOG_INFO("[relay] host: slot {} is {}:{}", slot, FormatIp(ntohl(from.sin_addr.s_addr)),
-                ntohs(from.sin_port));
+    c.addr = from;
+    REXLOG_INFO("[relay] host: slot {} is {}", slot, FormatAddr(from));
+  } else if (!SameAddr(c.addr, from)) {
+    ++r.dropped;
+    if (r.foreign_logged < 8) {
+      ++r.foreign_logged;
+      REXLOG_WARN("[relay] host: dropped a packet for slot {} from {} (slot is {})", slot,
+                  FormatAddr(from), FormatAddr(c.addr));
+    }
+    return nullptr;
   }
-  c.addr = from;
+  c.last_heard = now;
+  return &c;
+}
+
+void HandleInputs(Reader& rd, uint8_t slot, const sockaddr_in& from, Clock::time_point arrived) {
+  Relay& r = g_relay;
   const uint32_t acked = rd.U32();
   const uint32_t first = rd.U32();
   const uint16_t n = rd.U16();
-  c.frames_acked = std::max(c.frames_acked, std::min(acked, FramesEnd()));
+  std::vector<Input> inputs;
+  inputs.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
-    Input in = rd.Get();
-    if (!rd.ok()) {
+    inputs.push_back(rd.Get(kMaxInput));
+  }
+  if (!rd.ok()) {
+    ++r.dropped;
+    return;
+  }
+  Client* c = ClientFor(slot, from, arrived);
+  if (!c) {
+    return;
+  }
+  c->frames_acked = std::max(c->frames_acked, std::min(acked, FramesEnd()));
+  if (c->probe_frame && c->frames_acked >= c->probe_frame) {
+    const double sample = Ms(arrived - c->probe_sent);
+    c->rtt_ms = c->rtt_ms > 0 ? c->rtt_ms + (sample - c->rtt_ms) * 0.125 : sample;
+    c->probe_frame = 0;
+  }
+  for (uint32_t i = 0; i < n; ++i) {
+    // Inputs too far ahead of the frames built are left for a resend.
+    if (first + i == c->inputs_received && c->pending.size() < kMaxAhead) {
+      c->pending.push_back(std::move(inputs[i]));
+      ++c->inputs_received;
+    }
+  }
+}
+
+// Client: whether a packet from `from` comes from the host: through the
+// tunnel always; directly, from the address frames first came from, or
+// before that from a game link peer. Binds the host's address if `bind`.
+bool FromHost(const sockaddr_in& from, bool bind) {
+  Relay& r = g_relay;
+  if (r.tunnel) {
+    return true;
+  }
+  const uint32_t ip = ntohl(from.sin_addr.s_addr);
+  if (r.host_bound) {
+    return ip == r.host_ip;
+  }
+  const std::vector<uint32_t> peers = Nhl3on3GamePeers();
+  if (std::find(peers.begin(), peers.end(), ip) == peers.end()) {
+    return false;
+  }
+  if (bind) {
+    r.host_bound = true;
+    r.host_ip = ip;
+    REXLOG_INFO("[relay] client: host is {}", FormatAddr(from));
+  }
+  return true;
+}
+
+// Client: a valid packet came from the host.
+void HeardHost(Clock::time_point now) {
+  Relay& r = g_relay;
+  if (r.host_lost) {
+    r.host_lost = false;
+    REXLOG_INFO("[relay] client: the host is back after {:.1f} s", Ms(now - r.host_heard) / 1000);
+  }
+  r.host_heard = now;
+}
+
+// Adds a played frame to the running desync hash (FNV-1a over each slot's
+// type, length and data as handed to the game). No guest addresses of the
+// match state (score, clock, puck and player positions) are known, so this
+// only catches consoles playing different frames (a relay fault), not a
+// simulation that diverged on the same frames.
+void HashFrame(const Frame& frame) {
+  uint32_t h = g_relay.hash;
+  const auto mix = [&h](uint8_t byte) { h = (h ^ byte) * 16777619u; };
+  for (const Input& in : frame) {
+    const uint32_t length =
+        in.type == 1 ? 0 : std::min<uint32_t>(uint32_t(in.data.size()), kMaxInput);
+    mix(in.type);
+    mix(uint8_t(length));
+    mix(uint8_t(length >> 8));
+    for (uint32_t i = 0; i < length; ++i) {
+      mix(in.data[i]);
+    }
+  }
+  g_relay.hash = h;
+}
+
+// Host: logs a check's hashes if any two slots disagree; only the first
+// mismatch of a match is logged.
+void CompareCheckpoint(const Checkpoint& cp) {
+  Relay& r = g_relay;
+  std::optional<uint32_t> seen;
+  bool mismatch = false;
+  for (const auto& h : cp.hashes) {
+    if (h) {
+      mismatch = mismatch || (seen && *seen != *h);
+      seen = h;
+    }
+  }
+  if (!mismatch || r.desync_logged) {
+    return;
+  }
+  r.desync_logged = true;
+  std::string list;
+  for (uint32_t s = 0; s < cp.hashes.size(); ++s) {
+    list += fmt::format("{}{}:{}", list.empty() ? "" : " ", s,
+                        cp.hashes[s] ? fmt::format("{:08X}", *cp.hashes[s]) : "-");
+  }
+  REXLOG_ERROR("[relay] DESYNC: slots played different frames by frame {} (hashes {}); the "
+               "hash covers the relayed inputs, not the game state",
+               cp.frame, list);
+}
+
+// Host: one slot's hash of the frames up to `frame`. A check is compared once
+// every live slot has reported, or when it is pushed out by newer ones.
+void RecordHash(uint32_t slot, uint32_t frame, uint32_t hash) {
+  Relay& r = g_relay;
+  if (r.desync_logged || slot >= r.count) {
+    return;
+  }
+  auto it = std::find_if(r.checkpoints.begin(), r.checkpoints.end(),
+                         [frame](const Checkpoint& cp) { return cp.frame == frame; });
+  if (it == r.checkpoints.end()) {
+    if (r.checkpoints.size() >= kHashCheckpoints) {
+      CompareCheckpoint(r.checkpoints.front());
+      r.checkpoints.pop_front();
+    }
+    Checkpoint cp;
+    cp.frame = frame;
+    cp.hashes.resize(r.count);
+    r.checkpoints.push_back(std::move(cp));
+    it = std::prev(r.checkpoints.end());
+  }
+  it->hashes[slot] = hash;
+  for (uint32_t s = 0; s < r.count; ++s) {
+    if (!it->hashes[s] && (s == r.slot || !r.clients[s].dead)) {
       return;
     }
-    if (first + i == c.inputs_received) {
-      c.pending.push_back(std::move(in));
-      ++c.inputs_received;
-    }
+  }
+  CompareCheckpoint(*it);
+  r.checkpoints.erase(it);
+}
+
+void HandleHash(Reader& rd, uint8_t slot, const sockaddr_in& from, Clock::time_point arrived) {
+  const uint32_t frame = rd.U32();
+  const uint32_t hash = rd.U32();
+  if (!rd.ok()) {
+    ++g_relay.dropped;
+    return;
+  }
+  if (ClientFor(slot, from, arrived)) {
+    RecordHash(slot, frame, hash);
   }
 }
 
@@ -523,7 +835,7 @@ void UpdateLead(Clock::time_point now) {
   }
 }
 
-void HandleFrames(Reader& rd, uint8_t count, Clock::time_point arrived) {
+void HandleFrames(Reader& rd, uint8_t count, const sockaddr_in& from, Clock::time_point arrived) {
   Relay& r = g_relay;
   if (count != r.count) {
     return;
@@ -531,6 +843,17 @@ void HandleFrames(Reader& rd, uint8_t count, Clock::time_point arrived) {
   const uint32_t inputs_received = rd.U32();
   const uint32_t first = rd.U32();
   const uint16_t n = rd.U16();
+  std::vector<Frame> frames(n, Frame(r.count));
+  for (Frame& frame : frames) {
+    for (Input& in : frame) {
+      in = rd.Get(kMaxInput);
+    }
+  }
+  if (!rd.ok() || !FromHost(from, true)) {
+    ++r.dropped;
+    return;
+  }
+  HeardHost(arrived);
   while (r.inputs_acked < inputs_received && !r.unacked.empty()) {
     const double sample = Ms(arrived - r.unacked_times.front());
     if (r.turnaround_ms > 0) {
@@ -546,15 +869,8 @@ void HandleFrames(Reader& rd, uint8_t count, Clock::time_point arrived) {
   }
   UpdateLead(Clock::now());
   for (uint32_t i = 0; i < n; ++i) {
-    Frame frame(r.count);
-    for (Input& in : frame) {
-      in = rd.Get();
-    }
-    if (!rd.ok()) {
-      return;
-    }
     if (first + i == FramesEnd()) {
-      r.frames.push_back(std::move(frame));
+      r.frames.push_back(std::move(frames[i]));
       const uint32_t received = FramesEnd();
       TimeFrameReady(received);
       if (received == 1 || received % 600 == 0) {
@@ -564,13 +880,20 @@ void HandleFrames(Reader& rd, uint8_t count, Clock::time_point arrived) {
   }
 }
 
-// Client: where the host may be; every address its game link talks to.
+// Client: where the host may be; every address its game link talks to, or
+// only the host's once known.
 std::vector<sockaddr_in> HostAddrs() {
   if (g_relay.tunnel) {
     return {sockaddr_in{}};  // the server; SendTo ignores the address
   }
+  std::vector<uint32_t> ips;
+  if (g_relay.host_bound) {
+    ips.push_back(g_relay.host_ip);
+  } else {
+    ips = Nhl3on3GamePeers();
+  }
   std::vector<sockaddr_in> out;
-  for (uint32_t ip : Nhl3on3GamePeers()) {
+  for (uint32_t ip : ips) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(kPort);
@@ -602,49 +925,63 @@ void SendChannel(Channel& ch, const std::vector<sockaddr_in>& to, Clock::time_po
   for (const sockaddr_in& addr : to) {
     SendTo(addr, packet);
   }
+  if (n && ch.out_base + n <= ch.sent_end) {  // nothing new
+    ++g_relay.resends;
+  }
+  ch.sent_end = std::max(ch.sent_end, ch.out_base + n);
   ch.ack_sent = ch.in_next;
   ch.last_send = now;
 }
 
-void PumpChannel(Channel& ch, const std::vector<sockaddr_in>& to, Clock::time_point now) {
-  const bool resend = !ch.out.empty() && now - ch.last_send >= kResend;
+void PumpChannel(Channel& ch, const std::vector<sockaddr_in>& to, Clock::time_point now,
+                 Clock::duration interval = kResend) {
+  const bool resend = !ch.out.empty() && now - ch.last_send >= interval;
   if (resend || ch.ack_sent != ch.in_next) {
     SendChannel(ch, to, now);
   }
 }
 
-void HandleMessages(Reader& rd, uint8_t slot, const sockaddr_in& from) {
+void HandleMessages(Reader& rd, uint8_t slot, const sockaddr_in& from, Clock::time_point arrived) {
   Relay& r = g_relay;
-  Channel* ch = &r.host_messages;
-  if (r.host) {
-    if (slot >= r.count || slot == r.slot) {
-      return;
-    }
-    Client& c = r.clients[slot];
-    c.known = true;
-    c.addr = from;
-    ch = &c.messages;
-  }
   const uint32_t acked = rd.U32();
   const uint32_t first = rd.U32();
   const uint16_t n = rd.U16();
+  std::vector<Input> messages;
+  messages.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    messages.push_back(rd.Get(kMaxMessage));
+  }
+  if (!rd.ok()) {
+    ++r.dropped;
+    return;
+  }
+  Channel* ch = &r.host_messages;
+  if (r.host) {
+    Client* c = ClientFor(slot, from, arrived);
+    if (!c) {
+      return;
+    }
+    ch = &c->messages;
+  } else if (!FromHost(from, true)) {
+    ++r.dropped;
+    return;
+  } else {
+    HeardHost(arrived);
+  }
   while (ch->out_base < acked && !ch->out.empty()) {
     ch->out.pop_front();
     ++ch->out_base;
   }
   for (uint32_t i = 0; i < n; ++i) {
-    Input in = rd.Get();
-    if (!rd.ok()) {
-      return;
-    }
     if (first + i != ch->in_next) {
       continue;
     }
     ++ch->in_next;
+    Input& in = messages[i];
     if (r.host) {
       for (uint32_t s = 0; s < r.count; ++s) {
         if (s != slot && s != r.slot) {
-          r.clients[s].messages.out.push_back(in);
+          QueueMessage(s, in);
         }
       }
     }
@@ -676,24 +1013,39 @@ void SendInputs(Clock::time_point now) {
   for (const sockaddr_in& addr : HostAddrs()) {
     SendTo(addr, packet);
   }
+  if (n && r.inputs_acked + n <= r.inputs_put) {  // nothing new
+    ++r.resends;
+  }
+  r.inputs_put = std::max(r.inputs_put, r.inputs_acked + n);
   r.acked_sent = FramesEnd();
   r.last_send = now;
   if (r.tunnel) {
     return;
   }
   const std::vector<uint32_t> peers = Nhl3on3GamePeers();
-  static bool logged = false, logged_none = false;
-  if (peers.empty() && !logged_none) {
-    logged_none = true;
+  if (peers.empty() && !r.logged_no_peers) {
+    r.logged_no_peers = true;
     REXLOG_WARN("[relay] client: no game link peers known yet; cannot reach the host");
   }
-  if (!logged && !peers.empty()) {
-    logged = true;
+  if (!r.logged_peers && !peers.empty()) {
+    r.logged_peers = true;
     std::string list;
     for (uint32_t ip : peers) {
       list += (list.empty() ? "" : ", ") + FormatIp(ip);
     }
     REXLOG_INFO("[relay] client: sending inputs to {}", list);
+  }
+}
+
+// Client: tells the host the hash of the frames played so far.
+void SendHash(uint32_t frame, uint32_t hash) {
+  std::vector<uint8_t> packet;
+  Writer w(packet);
+  Header(w, kHash);
+  w.U32(frame);
+  w.U32(hash);
+  for (const sockaddr_in& addr : HostAddrs()) {
+    SendTo(addr, packet);
   }
 }
 
@@ -703,12 +1055,17 @@ int ReceiveOne(uint8_t* buffer, size_t capacity, sockaddr_in& from, Clock::time_
   arrived = Clock::now();
   if (r.tunnel) {
     std::vector<uint8_t> packet;
-    if (!Nhl3on3TunnelReceiveRelay(packet, arrived)) {
-      return -1;
+    for (;;) {
+      if (!Nhl3on3TunnelReceiveRelay(packet, arrived)) {
+        return -1;
+      }
+      if (packet.size() <= capacity) {
+        break;
+      }
+      ++r.dropped;
     }
-    const size_t n = std::min(packet.size(), capacity);
-    std::memcpy(buffer, packet.data(), n);
-    return int(n);
+    std::memcpy(buffer, packet.data(), packet.size());
+    return int(packet.size());
   }
   for (;;) {
 #if defined(_WIN32)
@@ -718,8 +1075,9 @@ int ReceiveOne(uint8_t* buffer, size_t capacity, sockaddr_in& from, Clock::time_
 #endif
     const int n = ::recvfrom(r.socket, reinterpret_cast<char*>(buffer), int(capacity), 0,
                              reinterpret_cast<sockaddr*>(&from), &from_len);
+    arrived = Clock::now();
 #if defined(_WIN32)
-    if (n < 0 && WSAGetLastError() == WSAECONNRESET) {
+    if (n < 0 && (WSAGetLastError() == WSAECONNRESET || WSAGetLastError() == WSAEMSGSIZE)) {
       continue;
     }
 #endif
@@ -729,18 +1087,19 @@ int ReceiveOne(uint8_t* buffer, size_t capacity, sockaddr_in& from, Clock::time_
 
 void Receive() {
   Relay& r = g_relay;
-  uint8_t buffer[2048];
+  // Only used under g_mutex; too big for the guest thread's stack.
+  static std::vector<uint8_t> buffer(kReceiveBuffer);
   for (;;) {
     sockaddr_in from{};
     Clock::time_point arrived;
-    const int n = ReceiveOne(buffer, sizeof(buffer), from, arrived);
+    const int n = ReceiveOne(buffer.data(), buffer.size(), from, arrived);
     if (n < 0) {
       return;
     }
     if (size_t(n) < kHeaderSize) {
       continue;
     }
-    Reader rd(buffer, size_t(n));
+    Reader rd(buffer.data(), size_t(n));
     if (rd.U32() != kMagic) {
       continue;
     }
@@ -750,11 +1109,13 @@ void Receive() {
       continue;
     }
     if (r.host && kind == kInputs) {
-      HandleInputs(rd, slot, from);
+      HandleInputs(rd, slot, from, arrived);
     } else if (!r.host && kind == kFrames) {
-      HandleFrames(rd, count, arrived);
+      HandleFrames(rd, count, from, arrived);
     } else if (kind == kMessages && (r.host || slot == 0)) {
-      HandleMessages(rd, slot, from);
+      HandleMessages(rd, slot, from, arrived);
+    } else if (r.host && kind == kHash) {
+      HandleHash(rd, slot, from, arrived);
     }
   }
 }
@@ -768,18 +1129,20 @@ void Pump() {
   Receive();
   const auto now = Clock::now();
   if (r.host) {
+    CheckSlots(now);
     BuildFrames();
     for (uint32_t s = 0; s < r.count; ++s) {
       Client& c = r.clients[s];
-      if (s == r.slot || !c.known) {
+      if (s == r.slot || !c.known || c.dead) {
         continue;
       }
+      const auto resend = ResendInterval(c);
       const bool fresh = c.frames_sent < FramesEnd();
-      const bool stale = c.frames_acked < FramesEnd() && now - c.last_send >= kResend;
+      const bool stale = c.frames_acked < FramesEnd() && now - c.last_send >= resend;
       if (fresh || stale || now - c.last_send >= kResend * 10) {
         SendFrames(c, now);
       }
-      PumpChannel(c.messages, {c.addr}, now);
+      PumpChannel(c.messages, {c.addr}, now, resend);
     }
     TrimFrames();
   } else {
@@ -788,7 +1151,61 @@ void Pump() {
       SendInputs(now);
     }
     PumpChannel(r.host_messages, HostAddrs(), now);
+    if (!r.host_lost && now - r.host_heard >= kHostLostAfter) {
+      r.host_lost = true;
+      REXLOG_ERROR("[relay] client: nothing from the {} for {:.0f} s (frames played {}); the "
+                   "match cannot go on until it answers. If the host has left, the game's own "
+                   "link timeout should end the match",
+                   r.tunnel ? "server" : "host", Ms(now - r.host_heard) / 1000, r.frames_played);
+    }
   }
+}
+// A frame query found no frame: once that has lasted kStallLogAfter, logs
+// what the relay waits on, once per kStallLogEvery.
+void NoteStall(Clock::time_point now) {
+  Relay& r = g_relay;
+  if (r.stall_since == Clock::time_point{}) {
+    r.stall_since = now;
+    return;
+  }
+  if (now - r.stall_since < kStallLogAfter || now - r.stall_logged < kStallLogEvery) {
+    return;
+  }
+  r.stall_logged = now;
+  const double stalled = Ms(now - r.stall_since);
+  if (!r.host) {
+    REXLOG_WARN("[relay] waiting on {} frames for {:.0f} ms (frame {}, last packet {:.0f} ms "
+                "ago)",
+                r.tunnel ? "the server's" : "host", stalled, r.frames_played + 1,
+                Ms(now - r.host_heard));
+    return;
+  }
+  for (uint32_t s = 0; s < r.count; ++s) {
+    const Client& c = r.clients[s];
+    if (c.dead || !c.pending.empty()) {
+      continue;
+    }
+    if (s == r.slot) {
+      REXLOG_WARN("[relay] waiting on slot {} (local input) for {:.0f} ms", s, stalled);
+    } else {
+      REXLOG_WARN("[relay] waiting on slot {} for {:.0f} ms (last packet {})", s, stalled,
+                  c.known ? fmt::format("{:.0f} ms ago", Ms(now - c.last_heard)) : "never");
+    }
+  }
+}
+
+// A frame was played: ends a stall.
+void EndStall(Clock::time_point now) {
+  Relay& r = g_relay;
+  if (r.stall_since != Clock::time_point{} && now - r.stall_since >= kStallLogAfter) {
+    if (r.frames_played > 0) {  // not waiting for the match to start
+      r.stalled_ms += Ms(now - r.stall_since);
+    }
+    REXLOG_INFO("[relay] frame {} arrived after a {:.0f} ms stall", r.frames_played + 1,
+                Ms(now - r.stall_since));
+  }
+  r.stall_since = {};
+  r.stall_logged = {};
 }
 
 bool Enabled() {
@@ -815,6 +1232,7 @@ void OnMultiSetup(uint32_t dist, uint32_t slot, uint32_t count) {
   r.slot = slot;
   r.count = count;
   r.clients.resize(count);
+  r.started = r.host_heard = Clock::now();
   if (Nhl3on3TunnelActive()) {
     r.tunnel = true;
     REXLOG_INFO("[relay] dist {:08X}: slot {} of {}, hosted by the server", dist, slot, count);
@@ -831,6 +1249,11 @@ void OnMultiSetup(uint32_t dist, uint32_t slot, uint32_t count) {
   }
   REXLOG_INFO("[relay] dist {:08X}: slot {} of {} ({}), listening on {}:{}", dist, slot, count,
               r.host ? "host" : "client", FormatIp(ip), kPort);
+  if (Nhl3on3TunnelFellBack()) {
+    REXLOG_WARN("[relay] the server tunnel did not answer at startup, so this match is played "
+                "DIRECT: every console must reach the host on UDP port {} itself",
+                kPort);
+  }
 }
 
 void OnDistDestroyed(uint32_t dist) {
@@ -844,11 +1267,15 @@ void OnDistDestroyed(uint32_t dist) {
               dist, r.slot, r.count, r.inputs_sent, r.inputs_acked, r.frames_played,
               r.host_messages.in_next, r.host_messages.out_base + r.host_messages.out.size(),
               r.host_messages.out.size());
+  REXLOG_INFO("[relay] dist {:08X}: resends {}, dropped packets {}, stalled {:.0f} ms", dist,
+              r.resends, r.dropped, r.stalled_ms);
   if (r.socket != kNoSocket) {
     CloseSocket(r.socket);
   }
   r = Relay{};
   g_timing = Timing{};
+  // The next match learns its host from its own game link.
+  Nhl3on3ClearGamePeers();
 }
 
 bool Carries(uint32_t dist) {
@@ -910,14 +1337,19 @@ int32_t QueryFrame(uint8_t* base, uint32_t dist, uint32_t types, uint32_t datas,
     return 0;
   }
   Pump();
+  const auto now = Clock::now();
   if (r.frames_played >= FramesEnd()) {
     TimeEmptyQuery();
+    NoteStall(now);
     return 0;
   }
+  EndStall(now);
   const Frame& frame = r.frames[r.frames_played - r.frames_base];
   for (uint32_t s = 0; s < r.count; ++s) {
     const Input& in = frame[s];
-    const uint32_t length = in.type == 1 ? 0 : uint32_t(in.data.size());
+    // The game's per-slot buffers hold kMaxInput bytes.
+    const uint32_t length =
+        in.type == 1 ? 0 : std::min<uint32_t>(uint32_t(in.data.size()), kMaxInput);
     if (types) {
       base[types + s] = in.type;
     }
@@ -929,9 +1361,17 @@ int32_t QueryFrame(uint8_t* base, uint32_t dist, uint32_t types, uint32_t datas,
       std::memcpy(base + dest, in.data.data(), length);
     }
   }
+  HashFrame(frame);
   ++r.frames_played;
-  r.played_at[r.frames_played % kPlayedSlots] = Clock::now();
+  r.played_at[r.frames_played % kPlayedSlots] = now;
   TimeFramePlayed(r.frames_played, FramesEnd() - r.frames_played);
+  if (r.frames_played % kHashEvery == 0) {
+    if (r.host) {
+      RecordHash(r.slot, r.frames_played, r.hash);
+    } else {
+      SendHash(r.frames_played, r.hash);
+    }
+  }
   if (!r.host) {
     while (r.frames_base < r.frames_played && !r.frames.empty()) {
       r.frames.pop_front();
@@ -984,7 +1424,7 @@ int32_t SendControl(const uint8_t* base, uint32_t dist, uint8_t type, uint32_t d
   if (r.host) {
     for (uint32_t s = 0; s < r.count; ++s) {
       if (s != r.slot) {
-        r.clients[s].messages.out.push_back(in);
+        QueueMessage(s, in);
         r.clients[s].messages.last_send = {};
       }
     }

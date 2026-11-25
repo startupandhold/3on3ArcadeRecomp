@@ -109,6 +109,11 @@ class Nhl3on3App : public rex::ReXApp {
     // Without it popups, the legal screen and the copyright line are blank or
     // scrambled (seen on D3D12).
     SetDefaultFlag("readback_resolve", "full");
+    // NVIDIA's alpha test is exact, so a glyph that lands on the reference
+    // value flickers in and out. The in-game score does this; the epsilon
+    // compare is baked into the shader when it is translated, which happens
+    // on every launch.
+    SetDefaultFlag("use_fuzzy_alpha_epsilon", "true");
     nhl3on3::ConfigureDisplay();
   }
 

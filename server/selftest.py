@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercises a running server the way game instances would: tunnel
-registration and forwarding, ranked and team play quick matches (a team play
+registration and forwarding (v1 and v2), ranked and team play quick matches (a team play
 game opens with two players, a third joins it, and starting it closes it),
 lockstep relay frames, renaming a gamertag that is already signed in, and a
 created session that is listed, joined and closed when its host leaves.
@@ -14,8 +14,9 @@ import sys
 import time
 
 from lobby import RANKED_SYSFLAG, lobby_fields, lobby_frame
-from tunnel import (HEADER, K_DATA, K_HELLO, K_RELAY, K_WELCOME, RELAY_HEADER, RELAY_MAGIC,
-                    R_FRAMES, R_INPUTS, R_MESSAGES, TUNNEL_MAGIC, format_ip)
+from tunnel import (HEADER, K_DATA, K_HELLO, K_KEEPALIVE, K_KEEPALIVE_ACK, K_RELAY, K_WELCOME,
+                    PROTOCOL_VERSION, RELAY_HEADER, RELAY_MAGIC, R_FRAMES, R_INPUTS, R_MESSAGES,
+                    TUNNEL_MAGIC, format_ip)
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 RELAY_SLOTS = 3
@@ -62,6 +63,10 @@ class Player:
                 self.buffer = self.buffer[length:]
         return out
 
+    def enter_room(self):
+        self.tcp.sendall(lobby_frame(b"move", {"IDENT": 1, "NAME": "LVL.1"}))
+        self.frames(0.5)
+
     def last_mgm(self, timeout=2.5):
         mgm = [f for c, f in self.frames(timeout) if c == b"+mgm"]
         return mgm[-1] if mgm else None
@@ -70,10 +75,6 @@ class Player:
         self.frames(0.3)
         self.tcp.sendall(lobby_frame(b"gqwk", {
             "MODE": 2, "SYSFLAGS": RANKED_SYSFLAG if ranked else 0}))
-
-    def enter_room(self):
-        self.tcp.sendall(lobby_frame(b"move", {"IDENT": 1, "NAME": "LVL.1"}))
-        self.frames(0.5)
 
 
 def relay_packet(kind, slot, a, b, items):
@@ -94,6 +95,24 @@ def main():
     src, _, dport = struct.unpack_from("<IHH", data, HEADER.size)
     assert src == a.vip and dport == 3659 and data[HEADER.size + 8:] == b"hello", data
     print("tunnel forwarding ok")
+
+    # v2: the welcome carries a token and the server version; keepalives
+    # with a sequence number are acknowledged.
+    v2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    v2.settimeout(2)
+    v2.sendto(HEADER.pack(TUNNEL_MAGIC, K_HELLO) + struct.pack("<5I", 99, 0, 0, 2, 0),
+              (HOST, 3670))
+    data = v2.recv(2048)
+    nonce, vip, token, version = struct.unpack_from("<4I", data, HEADER.size)
+    assert HEADER.unpack_from(data)[1] == K_WELCOME and nonce == 99 and token, data
+    assert version == PROTOCOL_VERSION, version
+    v2.sendto(HEADER.pack(TUNNEL_MAGIC, K_KEEPALIVE)
+              + struct.pack("<6I", vip, 0, 2, token, 41, 30), (HOST, 3670))
+    data = v2.recv(2048)
+    assert HEADER.unpack_from(data)[1] == K_KEEPALIVE_ACK, data
+    assert struct.unpack_from("<II", data, HEADER.size) == (41, vip), data
+    v2.close()
+    print("v2 welcome token and keepalive ack ok")
 
     # Ranked: two searchers make a 1v1.
     c.search(ranked=True)
@@ -148,8 +167,7 @@ def main():
     a.tcp.sendall(lobby_frame(b"gsta", {}))
     started = c.frames(1)
     assert any(cmd == b"+ses" for cmd, _ in started), "no +ses"
-    assert not any(cmd == b"+agmugam" for cmd, _ in started), \
-        "in-match player got +agmugam (OSDK_GAME_UNAVAILABLE) on start"
+    assert not any(cmd == b"+agmugam" for cmd, _ in started),         "in-match player got +agmugam (OSDK_GAME_UNAVAILABLE) on start"
     d.search()
     assert d.last_mgm(1.5) is None, "joined a started game"
     print("started game is closed to new players")
@@ -238,8 +256,7 @@ def main():
     k.tcp.sendall(lobby_frame(b"gsta", {}))
     host_frames, guest_frames, spectator = k.frames(1), l.frames(1), m.frames(1)
     assert any(cmd == b"+ses" for cmd, _ in host_frames + guest_frames), "no +ses"
-    assert not any(cmd == b"+agmugam" for cmd, _ in host_frames + guest_frames), \
-        "match players got +agmugam on gsta"
+    assert not any(cmd == b"+agmugam" for cmd, _ in host_frames + guest_frames),         "match players got +agmugam on gsta"
     assert any(cmd == b"+agmugam" and f.get("IDENT") == kilo_game
                for cmd, f in spectator), "spectator did not see session unlist"
     print("started session does not ugam its own players")

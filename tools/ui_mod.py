@@ -911,7 +911,27 @@ def patch_create_session(apt_bytes, const_bytes):
              ("label", "done"),
              ("return",)]
     assemble(data, [Chunk(CREATE_SESSION_BODY, CREATE_SESSION_BODY_END, code)], pool)
-    return bytes(data), [(CREATE_SESSION_BODY, CREATE_SESSION_BODY_END)], pool_at, bytes(consts)
+    # Back (localEventHandler -> StartSaveFlow -> goBackScreen) runs
+    # custom_PostOnExitScreen while the screen change is still in progress.
+    # With no lobby room — the path from quick match's "no opponent" dialog,
+    # Create Session — that resets the flow and calls gExitGameFlow, which
+    # drops the GAME critical section and starts a menu transition on top of
+    # the one goBackScreen is already doing. The two never finish and the
+    # game stops drawing. Leave the flow alone unless the screen underneath
+    # is the blank root, which is actually leaving online. r2 is "room name
+    # is set", r4 is "previous screen is custom match", r3 is "previous
+    # screen is blank". The reset block at 0x1AB4 is unchanged.
+    # 31 bytes, ending on the jump so nothing is left to fall through. Branches
+    # leave to 0x1ADE (the code after gExitGameFlow); the jump enters the
+    # original reset block.
+    assemble(data, [Chunk(0x1A95, 0x1AB4, [
+        ("pushRegister", 2), ("branchIfTrue", 0x1ADE),
+        ("pushRegister", 4), ("branchIfTrue", 0x1ADE),
+        ("pushRegister", 3), ("not",), ("branchIfTrue", 0x1ADE),
+        ("jump", 0x1AB4),
+    ])], pool)
+    return bytes(data), [(CREATE_SESSION_BODY, CREATE_SESSION_BODY_END),
+                         (0x1A95, 0x1AE0)], pool_at, bytes(consts)
 
 
 # (archive entry, nested entry of the .apt, nested entry of the .const, patch)

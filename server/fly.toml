@@ -3,6 +3,10 @@
 # your players (`fly platform regions`).
 app = "nhl3on3-turtle"
 primary_region = "yyz"
+# On shutdown (deploys too) the server stops taking new games and lets team
+# play relay matches finish for up to 240 s; Fly allows at most 300 s.
+kill_signal = "SIGTERM"
+kill_timeout = 250
 
 [build]
   dockerfile = "Dockerfile"
@@ -24,6 +28,9 @@ primary_region = "yyz"
   min_machines_running = 1
   [[services.ports]]
     port = 10901
+    # Tells the server each player's address (PROXY protocol line).
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v1" }
   [[services.tcp_checks]]
     interval = "15s"
     timeout = "2s"
@@ -35,6 +42,9 @@ primary_region = "yyz"
   auto_stop_machines = "off"
   [[services.ports]]
     port = 30380
+    # Tells the server each player's address (PROXY protocol line).
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v1" }
 
 [[services]]
   protocol = "tcp"
@@ -42,6 +52,9 @@ primary_region = "yyz"
   auto_stop_machines = "off"
   [[services.ports]]
     port = 42127
+    # Tells the server each player's address (PROXY protocol line).
+    handlers = ["proxy_proto"]
+    proxy_proto_options = { version = "v1" }
 
 [[services]]
   protocol = "udp"

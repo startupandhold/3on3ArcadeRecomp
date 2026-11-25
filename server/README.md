@@ -113,11 +113,22 @@ address is required.
 ## Updating and operating
 
 - Redeploy after editing anything in `server/`: `fly deploy --ha=false`.
-  A deploy restarts the server. Games in progress keep running, since their
-  traffic only needs the tunnel, which re-registers on its own within a few
-  seconds. Lobby searches in progress are lost.
+  A deploy restarts the server, and all its state is in memory:
+  - **Ranked 1 vs 1** games only use the tunnel, which re-registers on its
+    own (with the same virtual address) once the new server is up, so they
+    usually survive if the gap is short.
+  - **Team play** relay matches are hosted by the server and end when it
+    restarts. So on SIGTERM (`kill_signal` in `fly.toml`) the server
+    *drains*: it stops taking searches, new sessions, joins and new relay
+    matches, keeps relaying for up to 240 s until the running matches end,
+    then exits (`kill_timeout = 250`). During that time, and until the new
+    machine is up, nobody can start a game. Deploy when nobody is playing,
+    or expect matches longer than 4 minutes to be cut off.
+  - Lobby searches in progress are lost.
 - Live logs: `fly logs`. A status line (players, games, tunnel peers, relay
-  matches) is logged whenever it changes, at most once a minute.
+  matches, dead slots, desyncs, rejected registrations, datagrams forwarded)
+  is logged whenever it changes (ignoring the forwarded count), at most once
+  a minute.
 - More detail: set `LOG_LEVEL = "DEBUG"` in `fly.toml` to log every lobby request.
 - Stop it: `fly scale count 0`. Remove it completely: `fly apps destroy nhl3on3-yourname`
   (this also releases the IPv4).
@@ -149,5 +160,25 @@ on Fly.io it is found automatically from `<app>.fly.dev`.
 - Tunnel and relay: `tunnel.py`. The client side is in
   `src/nhl3on3_net.cpp` (tunnel) and `src/nhl3on3_lockstep_relay.cpp` (relay,
   where every console is a client when tunneled).
+- Protocol v2 (`PROTOCOL_V2.md`) adds optional trailing fields, so v1 games
+  still work: a protocol version, a per-address token, keepalive acks with a
+  reported ping, and state hashes. Quick match only pairs games with the same
+  roster pack and protocol version, and holds back two players whose pings
+  add up to more than 250 ms until one has searched for 20 s.
+- Disconnects in team play: a console that sends nothing for 8 s (or never
+  sends in the first 30 s) is dropped from the relay match. The others keep
+  playing with its players getting no input, and the log says
+  `match X: slot N (address) dropped after Ns`. A match no longer depends on
+  the lobby once it runs, so a dropped lobby connection doesn't end it. A
+  state hash mismatch between consoles is logged once per match (`desync at
+  frame N`).
+- A lobby connection whose tunnel address times out (120 s of silence) is
+  closed. A game may only claim a tunnel address registered from the same
+  public IP as its lobby connection (on Fly.io the `proxy_proto` handler in
+  `fly.toml` passes that IP to the server).
 - There are no accounts: anyone with the address can play, like the original
-  quick match. Each address is rate-limited to 600 packets/s.
+  quick match. Limits: 600 packets/s per tunnel address; new tunnel
+  registrations 50/s in total and 5/s per IP; 16 lobby connections per IP;
+  5 chat lines per 2 s per player; a lobby connection that stops reading
+  (1 MB unsent) is closed. Relay inputs over 252 bytes and messages over
+  1200 bytes are dropped.

@@ -47,9 +47,18 @@
 //                    its user record at match start. Clients only reach the
 //                    host, so the host's TPP carries every lock it knows
 //                    (i=lock;...) and is resent as soon as a client's arrives.
-//   TRF|id           this console's roster pack id (RosterOnlineId), on change
-//                    and every second. Mismatched packs desync in lockstep, so
-//                    the lobby refuses to start until everyone matches.
+//   TRF|id;version   this console's roster pack id (RosterOnlineId) and
+//                    protocol version (kNetProtocolVersion; older builds send
+//                    no ";version", which is version 1), on change and every
+//                    second. Mismatched packs or versions desync in lockstep,
+//                    so the lobby refuses to start until everyone matches. It
+//                    also waits up to kRosterWait for a console's TRF (the
+//                    host for everyone's, a client for the host's: clients
+//                    only hear the host).
+// Picks, locks and TRF are only taken from the console they describe (the
+// sender's name, or its guests'), except the host's TPT and TPP tables.
+// Two players with the same gamertag can't be told apart, so the title warns
+// about it, and also when tunneled (10.66.x.y) and direct players are mixed.
 // The roster step waits for every player's lock (see PositionsReady), since
 // they must agree on all of them. Two teammates with the same lock: the first
 // in session order keeps it, the other gets none.
@@ -57,11 +66,13 @@
 // every console sees its own and everyone else's.
 
 #include "nhl3on3_team_lobby.h"
+#include "nhl3on3_lockstep_relay.h"
 #include "nhl3on3_roster.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <iterator>
 #include <utility>
 #include <cstdint>
@@ -85,6 +96,7 @@ REXCVAR_DEFINE_BOOL(play_goalie, false, "NHL3on3/Online",
                     "ask gets it; otherwise a side's fourth player is its goalie)");
 
 bool Nhl3on3RankedSearch();
+uint32_t Nhl3on3LocalIp();
 
 // Script native helpers: argument (index) -> value, value -> number,
 // argument (index) -> C string ("" if not a string), C string -> returned value.
@@ -107,6 +119,9 @@ constexpr uint32_t kMaxPerSide = 4;  // three skaters and a goalie
 constexpr int kGoalieLock = 15;
 constexpr auto kResend = std::chrono::seconds(1);
 constexpr auto kLockResend = std::chrono::milliseconds(250);
+// How long the start waits for a console's TRF after its player shows up.
+constexpr auto kRosterWait = std::chrono::seconds(10);
+constexpr uint32_t kTunnelNet = 0x0A420000, kTunnelMask = 0xFFFF0000;  // 10.66.x.y
 
 uint32_t Load32(const uint8_t* base, uint32_t address) {
   const uint8_t* p = base + address;
@@ -120,6 +135,9 @@ struct Player {
   bool here = false;  // on this console (the local player or a local guest)
   bool ready = false;  // ready on the current screen
   std::string roster_id;  // TRF from that console; empty until heard
+  uint32_t version = 0;   // protocol version from that TRF
+  Clock::time_point named{};  // when the name was first seen
+  bool roster_late_logged = false;
 };
 
 // Screens whose timer ticks the lobby; ready flags are per screen.
@@ -160,15 +178,28 @@ struct Lobby {
   std::string shown_status;  // as last shown
   bool roster_mismatch = false;
   bool roster_mismatch_logged = false;
+  bool version_mismatch_logged = false;
   std::string sent_roster_id;
+  // Peer addresses seen this lobby game.
+  std::vector<uint32_t> addresses;
+  bool mixed_logged = false;
+  bool duplicate_logged = false;
 };
 Lobby g_lobby;
 
+// Sides only follow picks with three or more consoles (lockstep mode 3). Two
+// consoles play the stock 1v1 mode, where the host (index 0) is always home
+// (side 1, red) and the other console away (side 0, blue), so the screens
+// show that. Players without a pick alternate the same way, host home.
+bool PicksApply(const Lobby& lobby) {
+  return lobby.count > 2;
+}
+
 uint32_t EffectiveSide(const Lobby& lobby, uint32_t index) {
-  if (index < lobby.players.size() && lobby.players[index].side >= 0) {
+  if (PicksApply(lobby) && index < lobby.players.size() && lobby.players[index].side >= 0) {
     return uint32_t(lobby.players[index].side);
   }
-  return index % 2;
+  return (index + 1) % 2;
 }
 
 void LogTable(Lobby& lobby) {
@@ -176,7 +207,8 @@ void LogTable(Lobby& lobby) {
   for (uint32_t i = 0; i < lobby.count && i < lobby.players.size(); ++i) {
     const Player& p = lobby.players[i];
     text += fmt::format("{}{}={}{}", text.empty() ? "" : ", ", p.name.empty() ? "?" : p.name,
-                        EffectiveSide(lobby, i), p.side < 0 ? " (default)" : "");
+                        EffectiveSide(lobby, i),
+                        p.side < 0 || !PicksApply(lobby) ? " (default)" : "");
   }
   if (text != lobby.logged) {
     lobby.logged = text;
@@ -213,6 +245,8 @@ void SetLock(Lobby& lobby, uint32_t index, int lock) {
   }
 }
 
+// A leading (optionally negative) decimal number; -1 if there is none or it
+// does not fit in an int.
 int ParseInt(std::string_view text) {
   int value = 0;
   bool negative = false, any = false;
@@ -220,6 +254,9 @@ int ParseInt(std::string_view text) {
     if (c == '-' && !any) {
       negative = true;
     } else if (c >= '0' && c <= '9') {
+      if (value > (INT_MAX - (c - '0')) / 10) {
+        return -1;
+      }
       value = value * 10 + (c - '0');
       any = true;
     } else {
@@ -229,14 +266,40 @@ int ParseInt(std::string_view text) {
   return any ? (negative ? -value : value) : -1;
 }
 
-// "i=value" entries separated by ';'; the local player's own entry is skipped.
-void ApplyEntries(Lobby& lobby, std::string_view data, void (*set)(Lobby&, uint32_t, int)) {
+// Whether `name` is the player who sent as `sender`, or one of that console's
+// guests ("Name(1)", the gamertag cut short to fit the suffix in 15).
+bool OwnedBy(std::string_view name, std::string_view sender) {
+  if (name.empty() || sender.empty()) {
+    return false;
+  }
+  if (name == sender) {
+    return true;
+  }
+  const size_t paren = name.rfind('(');
+  if (paren == std::string_view::npos || paren == 0 || name.back() != ')' ||
+      ParseInt(name.substr(paren + 1)) < 0) {
+    return false;
+  }
+  const std::string_view owner = name.substr(0, paren);
+  return owner == sender || (name.size() == 15 && sender.substr(0, owner.size()) == owner);
+}
+
+bool IsHost(const Lobby& lobby, std::string_view sender) {
+  return !lobby.players.empty() && lobby.players[0].name == sender;
+}
+
+// "i=value" entries separated by ';'; the local player's own entry is skipped,
+// and unless `any`, so is every player `sender` does not own.
+void ApplyEntries(Lobby& lobby, std::string_view data, void (*set)(Lobby&, uint32_t, int),
+                  std::string_view sender, bool any) {
   while (!data.empty()) {
     const size_t end = data.find(';');
     const std::string_view entry = data.substr(0, end);
     if (const size_t eq = entry.find('='); eq != std::string_view::npos) {
       const int index = ParseInt(entry.substr(0, eq));
-      if (index >= 0 && index != lobby.local) {
+      const bool owned = index >= 0 && uint32_t(index) < lobby.players.size() &&
+                         OwnedBy(lobby.players[index].name, sender);
+      if (index >= 0 && index != lobby.local && (any || owned)) {
         set(lobby, uint32_t(index), ParseInt(entry.substr(eq + 1)));
       }
     }
@@ -265,29 +328,107 @@ void SetReady(Lobby& lobby, uint32_t index, bool ready) {
   }
 }
 
-// True when every known peer roster id matches ours. Unknown (empty) ids are
-// ignored until that console's TRF arrives.
-bool RosterMismatch(Lobby& lobby) {
+// What the roster pack exchange says about starting: mismatched packs or
+// protocol versions, and the players whose console's TRF is still awaited.
+struct RosterState {
+  bool roster = false;
+  bool version = false;
+  std::string waiting;
+};
+
+RosterState CheckRosters(Lobby& lobby) {
   const std::string local = nhl3on3::RosterOnlineId();
-  bool mismatch = false;
+  const auto now = Clock::now();
+  RosterState state;
   for (uint32_t i = 0; i < lobby.count && i < lobby.players.size(); ++i) {
-    const std::string& id = lobby.players[i].roster_id;
-    if (!id.empty() && id != local) {
-      mismatch = true;
-      break;
+    Player& p = lobby.players[i];
+    if (!p.roster_id.empty()) {
+      state.roster = state.roster || p.roster_id != local;
+      state.version = state.version || p.version != nhl3on3::kNetProtocolVersion;
+      continue;
+    }
+    // Clients only hear the host's TRF.
+    const bool expected = !p.here && int(i) != lobby.local && (lobby.local == 0 || i == 0) &&
+                          !p.name.empty();
+    if (!expected) {
+      continue;
+    }
+    if (now - p.named < kRosterWait) {
+      state.waiting += (state.waiting.empty() ? "" : ", ") + p.name;
+    } else if (!p.roster_late_logged) {
+      p.roster_late_logged = true;
+      REXLOG_WARN("[team] no roster pack id from {} after {} s; starting without checking it",
+                  p.name, std::chrono::duration_cast<std::chrono::seconds>(kRosterWait).count());
     }
   }
-  if (mismatch && !lobby.roster_mismatch_logged) {
+  if (state.roster && !lobby.roster_mismatch_logged) {
     lobby.roster_mismatch_logged = true;
     REXLOG_ERROR("[team] roster pack mismatch (local {}); everyone needs the same "
                  "roster zip or none",
                  local);
   }
-  if (!mismatch) {
+  if (!state.roster) {
     lobby.roster_mismatch_logged = false;
   }
-  lobby.roster_mismatch = mismatch;
-  return mismatch;
+  if (state.version && !lobby.version_mismatch_logged) {
+    lobby.version_mismatch_logged = true;
+    std::string versions;
+    for (uint32_t i = 0; i < lobby.count && i < lobby.players.size(); ++i) {
+      if (!lobby.players[i].roster_id.empty()) {
+        versions += fmt::format("{}{} v{}", versions.empty() ? "" : ", ", lobby.players[i].name,
+                                lobby.players[i].version);
+      }
+    }
+    REXLOG_ERROR("[team] protocol version mismatch (local v{}: {}); everyone needs the same "
+                 "game build",
+                 nhl3on3::kNetProtocolVersion, versions);
+  }
+  if (!state.version) {
+    lobby.version_mismatch_logged = false;
+  }
+  lobby.roster_mismatch = state.roster || state.version;
+  return state;
+}
+
+// True while the roster exchange blocks the start: a pack or version
+// mismatch, or a TRF still awaited.
+bool RosterMismatch(Lobby& lobby) {
+  const RosterState state = CheckRosters(lobby);
+  return state.roster || state.version || !state.waiting.empty();
+}
+
+// Whether tunneled (10.66.x.y) and direct addresses are mixed among this
+// console and the peers seen: those players can't reach each other.
+bool MixedConnection(const Lobby& lobby) {
+  bool tunneled = false, direct = false;
+  const auto note = [&](uint32_t ip) {
+    if (ip) {
+      ((ip & kTunnelMask) == kTunnelNet ? tunneled : direct) = true;
+    }
+  };
+  note(Nhl3on3LocalIp());
+  for (const uint32_t ip : lobby.addresses) {
+    note(ip);
+  }
+  return tunneled && direct;
+}
+
+// Whether two players share a gamertag (messages are told apart by name).
+bool DuplicateNames(Lobby& lobby) {
+  for (uint32_t i = 0; i < lobby.count && i < lobby.players.size(); ++i) {
+    for (uint32_t j = i + 1; j < lobby.count && j < lobby.players.size(); ++j) {
+      if (!lobby.players[i].name.empty() && lobby.players[i].name == lobby.players[j].name) {
+        if (!lobby.duplicate_logged) {
+          lobby.duplicate_logged = true;
+          REXLOG_WARN("[team] players {} and {} are both '{}'; their picks and ready flags "
+                      "can't be told apart (set online_gamertag)",
+                      i, j, lobby.players[i].name);
+        }
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // Whether `side` has players and all of them are ready.
@@ -310,12 +451,34 @@ bool SideReady(Lobby& lobby, uint32_t side) {
 // "READY: a, b   WAITING: c" for team play (more than two players). Once shown
 // it stays up to date even if players leave.
 std::string StatusText(Lobby& lobby) {
-  if (RosterMismatch(lobby)) {
-    return "ROSTER MISMATCH: same pack required";
+  const RosterState roster = CheckRosters(lobby);
+  std::string warning;
+  const auto add = [&warning](const std::string& text) {
+    warning += (warning.empty() ? "" : "   ") + text;
+  };
+  if (roster.version) {
+    add("VERSION MISMATCH: same game build required");
+  }
+  if (roster.roster) {
+    add("ROSTER MISMATCH: same pack required");
+  }
+  if (MixedConnection(lobby)) {
+    add("MIXED CONNECTION");
+  }
+  if (DuplicateNames(lobby)) {
+    add("DUPLICATE GAMERTAG");
+  }
+  if (roster.roster || roster.version) {
+    return warning;
+  }
+  if (!roster.waiting.empty()) {
+    add("WAITING FOR ROSTER: " + roster.waiting);
+    return warning;
   }
   if (lobby.count <= 2 && lobby.shown_status.empty()) {
-    return {};
+    return warning;
   }
+  const std::string suffix = warning.empty() ? "" : "   " + warning;
   std::string ready, waiting;
   for (uint32_t i = 0; i < lobby.count; ++i) {
     const bool is_ready = i < lobby.players.size() && lobby.players[i].ready;
@@ -325,9 +488,10 @@ std::string StatusText(Lobby& lobby) {
     list += (list.empty() ? "" : ", ") + name;
   }
   if (waiting.empty()) {
-    return "ALL READY";
+    return "ALL READY" + suffix;
   }
-  return ready.empty() ? "WAITING: " + waiting : "READY: " + ready + "   WAITING: " + waiting;
+  return (ready.empty() ? "WAITING: " + waiting : "READY: " + ready + "   WAITING: " + waiting) +
+         suffix;
 }
 
 // The TPP to send: the host's has every known lock, a client's only its own.
@@ -413,8 +577,9 @@ void MaybeSend(const PPCContext& ctx, uint8_t* base) {
       lobby.sent_roster_id = roster_id;
       if (uint32_t(lobby.local) < lobby.players.size()) {
         lobby.players[lobby.local].roster_id = roster_id;
+        lobby.players[lobby.local].version = nhl3on3::kNetProtocolVersion;
       }
-      roster_message = "TRF|" + roster_id;
+      roster_message = fmt::format("TRF|{};{}", roster_id, nhl3on3::kNetProtocolVersion);
     }
   }
   if (!message.empty()) {
@@ -562,7 +727,7 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
     {
       std::lock_guard lock(g_lobby.mutex);
       Lobby& lobby = g_lobby;
-      if (REXCVAR_GET(team_play) < 3 || Nhl3on3RankedSearch() || me < 0 ||
+      if (REXCVAR_GET(team_play) < 3 || Nhl3on3RankedSearch() || !PicksApply(lobby) || me < 0 ||
           uint32_t(me) >= kMaxPlayers) {
         return {};
       }
@@ -676,6 +841,7 @@ std::string Handle(const PPCContext& ctx, uint8_t* base, int32_t code) {
     if (p.name != name) {
       REXLOG_INFO("[team] player {} is {}", index, name);
       p = {name, -1};
+      p.named = Clock::now();
     }
     lobby.count = std::max(lobby.count, index + 1);
   }
@@ -760,7 +926,35 @@ void Reset() {
   lobby.shown_status.clear();
   lobby.roster_mismatch = false;
   lobby.roster_mismatch_logged = false;
+  lobby.version_mismatch_logged = false;
   lobby.sent_roster_id.clear();
+  lobby.addresses.clear();
+  lobby.mixed_logged = false;
+  lobby.duplicate_logged = false;
+}
+
+void NoteAddress(uint32_t ip) {
+  if (!ip) {
+    return;
+  }
+  std::lock_guard lock(g_lobby.mutex);
+  Lobby& lobby = g_lobby;
+  if (std::find(lobby.addresses.begin(), lobby.addresses.end(), ip) != lobby.addresses.end()) {
+    return;
+  }
+  lobby.addresses.push_back(ip);
+  if (!lobby.mixed_logged && MixedConnection(lobby)) {
+    lobby.mixed_logged = true;
+    std::string list;
+    for (const uint32_t a : lobby.addresses) {
+      list += fmt::format("{}{}.{}.{}.{}", list.empty() ? "" : ", ", a >> 24, (a >> 16) & 0xFF,
+                          (a >> 8) & 0xFF, a & 0xFF);
+    }
+    REXLOG_WARN("[team] MIXED CONNECTION: some players are on the server tunnel (10.66.x.y) "
+                "and some direct (peers {}); they can't reach each other. Everyone should "
+                "use online_tunnel, and restart if the tunnel failed",
+                list);
+  }
 }
 
 void OnControlMessage(std::string_view text) {
@@ -778,15 +972,20 @@ void OnControlMessage(std::string_view text) {
   std::lock_guard lock(g_lobby.mutex);
   Lobby& lobby = g_lobby;
   if (command == "TRF") {
+    // "id" or "id;version"; no version is version 1.
+    const size_t semi = data.find(';');
+    const std::string_view id = data.substr(0, semi);
+    const int parsed = semi == std::string_view::npos ? 1 : ParseInt(data.substr(semi + 1));
+    const uint32_t version = uint32_t(std::max(parsed, 1));
     for (uint32_t i = 0; i < lobby.players.size(); ++i) {
-      if (lobby.players[i].name == sender) {
-        if (lobby.players[i].roster_id != data) {
-          lobby.players[i].roster_id = std::string(data);
-          REXLOG_INFO("[team] player {} roster id {}", i, lobby.players[i].roster_id);
-        }
+      Player& p = lobby.players[i];
+      if (OwnedBy(p.name, sender) && (p.roster_id != id || p.version != version)) {
+        p.roster_id = std::string(id);
+        p.version = version;
+        REXLOG_INFO("[team] player {} roster id {} protocol v{}", i, p.roster_id, version);
       }
     }
-    RosterMismatch(lobby);
+    CheckRosters(lobby);
     return;
   }
   if (command == "RDY") {
@@ -812,16 +1011,18 @@ void OnControlMessage(std::string_view text) {
     for (const Player& p : lobby.players) {
       before.push_back(p.lock);
     }
-    ApplyEntries(lobby, data, SetLock);
+    // A client's TPP has its own lock; the host's has everyone's.
+    ApplyEntries(lobby, data, SetLock, sender, IsHost(lobby, sender));
     for (uint32_t i = 0; lobby.local == 0 && i < before.size(); ++i) {
       lobby.locks_dirty = lobby.locks_dirty || lobby.players[i].lock != before[i];
     }
     return;
   }
-  if (command == "TPT" && !(lobby.players.size() > 0 && lobby.players[0].name == sender)) {
+  // TPT is the host's whole table; a TPS only the sender's own pick.
+  if (command == "TPT" && !IsHost(lobby, sender)) {
     return;
   }
-  ApplyEntries(lobby, data, SetSide);
+  ApplyEntries(lobby, data, SetSide, sender, command == "TPT");
   LogTable(lobby);
 }
 

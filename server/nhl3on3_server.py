@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import socket
 
 from lobby import Lobby
@@ -19,6 +20,9 @@ from tunnel import Tunnel
 
 LOBBY_TCP_PORTS = (10901, 30380, 42127)
 TUNNEL_UDP_PORT = 3670
+# On SIGTERM/SIGINT relay matches get this long to finish (fly.toml's
+# kill_timeout must be longer).
+DRAIN_TIMEOUT = 240
 
 log = logging.getLogger("server")
 
@@ -70,7 +74,8 @@ async def main():
                         format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
 
     ip = public_ip(args.public_ip)
-    lobby = Lobby(ip)
+    # Fly's proxy names each lobby connection's real address (proxy_proto).
+    lobby = Lobby(ip, trust_proxy=bool(os.environ.get("FLY_APP_NAME")))
     tunnel = Tunnel(lobby)
     loop = asyncio.get_running_loop()
 
@@ -87,11 +92,35 @@ async def main():
         while True:
             await asyncio.sleep(60)
             status = {**lobby.status(), **tunnel.status()}
-            if status != last:
+            key = {k: v for k, v in status.items() if k != "datagrams_forwarded"}
+            if key != last:
                 log.info("status %s", status)
-                last = status
+                last = key
 
-    await asyncio.gather(tunnel.run(), report())
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError, AttributeError):
+            pass  # Windows: Ctrl+C still raises KeyboardInterrupt
+    tasks = [asyncio.ensure_future(t) for t in (tunnel.run(), lobby.run(), report())]
+    stopping = asyncio.ensure_future(stop.wait())
+    done, _ = await asyncio.wait(tasks + [stopping], return_when=asyncio.FIRST_COMPLETED)
+    for task in done:
+        if task is not stopping:
+            task.result()  # a housekeeping loop failed: raise it
+    # Relay matches can't survive a restart, so let them finish first.
+    lobby.draining = True
+    deadline = loop.time() + DRAIN_TIMEOUT
+    log.info("shutting down: no new games; %d relay matches to finish (at most %ds)",
+             len(tunnel.matches), DRAIN_TIMEOUT)
+    while tunnel.matches and loop.time() < deadline:
+        await asyncio.sleep(1)
+    log.info("shutting down now (%d relay matches left)", len(tunnel.matches))
+    for server in servers:
+        server.close()
+    for task in tasks:
+        task.cancel()
 
 
 if __name__ == "__main__":

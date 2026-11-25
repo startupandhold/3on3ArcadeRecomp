@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <random>
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -54,7 +55,9 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xmemory.h>
 
+#include "nhl3on3_lockstep_relay.h"
 #include "nhl3on3_roster.h"
+#include "nhl3on3_settings.h"
 #include "nhl3on3_team_lobby.h"
 #include "runtime_export.h"
 
@@ -200,6 +203,13 @@ uint32_t ResolveIpv4(const std::string& host) {
 // The source address the OS would use to reach the internet; no packet is sent.
 uint32_t DetectLocalIp() {
   auto sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#if defined(_WIN32)
+  if (sock == INVALID_SOCKET) {
+#else
+  if (sock < 0) {
+#endif
+    return 0;
+  }
   sockaddr_in remote{};
   remote.sin_family = AF_INET;
   remote.sin_port = htons(53);
@@ -232,14 +242,23 @@ bool Online() {
 // server, so nobody needs open ports.
 //
 // Packets (little-endian), header: u32 magic, u8 kind, 3 reserved bytes
-//   kHello     u32 nonce, u32 wanted address, u32 roster
-//                                               kWelcome  u32 nonce, u32 address
-//   kKeepalive u32 address, u32 roster
+//   kHello     u32 nonce, u32 wanted address, u32 roster, u32 version, u32 token
+//                                               kWelcome  u32 nonce, u32 address,
+//                                                         u32 token, u32 version
+//   kKeepalive u32 address, u32 roster, u32 version, u32 token, u32 seq,
+//              u32 rtt_ms
 //              roster: the roster pack id (0 = stock); quick match only pairs
-//              games with the same one
+//              games with the same one (and the same version)
+//              version: kNetProtocolVersion; token: from kWelcome (0 = none);
+//              rtt_ms: smoothed round trip to the server (0 = unknown)
+//                                               kKeepaliveAck  u32 seq, u32 address
 //   kData      out: u32 dest ip, u16 dest port, u16 source port, payload
 //              in:  u32 source ip, u16 source port, u16 dest port, payload
 //   kRelay     one lockstep relay packet (nhl3on3_lockstep_relay.cpp)
+// Everything after kHello's first three fields and kWelcome's and
+// kKeepalive's first two, and kKeepaliveAck, are v2 (server/PROTOCOL_V2.md);
+// a v1 server ignores or omits them. A server that never acks keepalives is
+// v1 and is never treated as lost.
 //----------------------------------------------------------------------------
 
 #ifdef _WIN32
@@ -253,11 +272,16 @@ constexpr TunnelSocket kNoTunnelSocket = -1;
 constexpr uint16_t kTunnelPort = 3670;
 constexpr uint32_t kTunnelMagic = 0x3154484E;  // "NHT1"
 constexpr uint8_t kTunnelHello = 1, kTunnelWelcome = 2, kTunnelKeepalive = 3, kTunnelData = 4,
-                  kTunnelRelay = 5;
+                  kTunnelRelay = 5, kTunnelKeepaliveAck = 6;
 constexpr uint32_t kTunnelNet = 0x0A420000, kTunnelMask = 0xFFFF0000;
 constexpr size_t kTunnelHeader = 8;
 constexpr size_t kTunnelQueueLimit = 256;
+constexpr size_t kTunnelReceiveBuffer = 65536;  // relayed frames can exceed one packet
 constexpr auto kTunnelKeepaliveInterval = std::chrono::seconds(5);
+// Keepalives in a row without an ack (after one was acked) before the server
+// counts as lost and is asked for the address again.
+constexpr uint32_t kTunnelMissedAcks = 3;
+constexpr auto kTunnelErrorBackoff = std::chrono::milliseconds(50);
 
 struct TunnelDatagram {
   uint32_t ip = 0;
@@ -276,6 +300,21 @@ struct Tunnel {
   // port the game asked for (by guest socket), so instances sharing one PC
   // can all use the game's fixed ports.
   std::unordered_map<uint32_t, uint16_t> ports;
+
+  // Liveness, used by the tunnel thread only (and registration before it).
+  uint32_t token = 0;        // from kWelcome; proves the address is ours
+  uint32_t hello_nonce = 0;  // of a re-sent kHello awaiting its kWelcome
+  uint32_t seq = 0;          // last keepalive sent
+  std::chrono::steady_clock::time_point seq_sent{};
+  bool awaiting_ack = false;
+  bool acked_any = false;    // the server acks keepalives (v2)
+  uint32_t missed = 0;       // keepalives in a row without an ack
+  double srtt_ms = 0;
+  // Smoothed and lowest round trip to the server in ms; 0 = unknown.
+  std::atomic<uint32_t> rtt_ms{0};
+  std::atomic<uint32_t> rtt_min_ms{0};
+  // online_tunnel was on but the server never answered, so play is direct.
+  std::atomic<bool> fell_back{false};
 };
 
 Tunnel g_tunnel;
@@ -329,25 +368,80 @@ uint32_t TunnelRosterId() {
   return value ? value : 1;
 }
 
+// The socket is connected to the server, so it only hears from the server.
 int TunnelSend(const std::vector<uint8_t>& packet) {
-  return ::sendto(g_tunnel.socket, reinterpret_cast<const char*>(packet.data()),
-                  int(packet.size()), 0, reinterpret_cast<const sockaddr*>(&g_tunnel.server),
-                  sizeof(g_tunnel.server));
+  return ::send(g_tunnel.socket, reinterpret_cast<const char*>(packet.data()),
+                int(packet.size()), 0);
 }
 
-bool TunnelReadable(int timeout_ms) {
+// select()'s result for the tunnel socket: > 0 readable, 0 timed out, < 0 failed.
+int TunnelReadable(int timeout_ms) {
   fd_set set;
   FD_ZERO(&set);
   FD_SET(g_tunnel.socket, &set);
   timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-  return ::select(int(g_tunnel.socket) + 1, &set, nullptr, nullptr, &timeout) > 0;
+  return ::select(int(g_tunnel.socket) + 1, &set, nullptr, nullptr, &timeout);
 }
 
-void TunnelReceiveOne() {
-  uint8_t buffer[2048];
-  const int n = ::recv(g_tunnel.socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
-  if (n < int(kTunnelHeader) || GetLE32(buffer) != kTunnelMagic) {
+void TunnelSendHello(uint32_t nonce, uint32_t wanted) {
+  auto hello = TunnelPacket(kTunnelHello, 20);
+  PutLE32(hello, nonce);
+  PutLE32(hello, wanted);
+  PutLE32(hello, TunnelRosterId());
+  PutLE32(hello, nhl3on3::kNetProtocolVersion);
+  PutLE32(hello, g_tunnel.token);
+  TunnelSend(hello);
+}
+
+// A kWelcome body: takes the token and logs the server's version.
+void TunnelWelcomed(const uint8_t* body, size_t size) {
+  Tunnel& t = g_tunnel;
+  if (size >= 12) {
+    t.token = GetLE32(body + 8);
+  }
+  const uint32_t version = size >= 16 ? GetLE32(body + 12) : 1;
+  if (version != nhl3on3::kNetProtocolVersion) {
+    REXLOG_WARN("[net] tunnel: server speaks protocol version {}, this build {}", version,
+                nhl3on3::kNetProtocolVersion);
+  }
+}
+
+void TunnelAcked(uint32_t seq) {
+  Tunnel& t = g_tunnel;
+  if (!t.awaiting_ack || seq != t.seq) {
     return;
+  }
+  const double sample = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t.seq_sent)
+                            .count();
+  t.srtt_ms = t.srtt_ms > 0 ? t.srtt_ms + (sample - t.srtt_ms) * 0.125 : sample;
+  t.rtt_ms.store(std::max<uint32_t>(uint32_t(t.srtt_ms + 0.5), 1));
+  const uint32_t lowest = t.rtt_min_ms.load();
+  const uint32_t sample_ms = std::max<uint32_t>(uint32_t(sample + 0.5), 1);
+  if (!lowest || sample_ms < lowest) {
+    t.rtt_min_ms.store(sample_ms);
+  }
+  if (!t.acked_any) {
+    REXLOG_INFO("[net] tunnel: server acks keepalives; round trip {:.0f} ms", sample);
+  } else if (t.missed) {
+    REXLOG_INFO("[net] tunnel: server answering again");
+  }
+  t.acked_any = true;
+  t.awaiting_ack = false;
+  t.missed = 0;
+}
+
+// Reads one datagram; false on a socket error.
+bool TunnelReceiveOne() {
+  // Only the tunnel thread receives once registration is done.
+  static std::vector<uint8_t> storage(kTunnelReceiveBuffer);
+  uint8_t* buffer = storage.data();
+  const int n = ::recv(g_tunnel.socket, reinterpret_cast<char*>(buffer), int(storage.size()), 0);
+  if (n < 0) {
+    return false;
+  }
+  if (n < int(kTunnelHeader) || GetLE32(buffer) != kTunnelMagic) {
+    return true;
   }
   const uint8_t kind = buffer[4];
   const uint8_t* body = buffer + kTunnelHeader;
@@ -374,7 +468,48 @@ void TunnelReceiveOne() {
     }
     g_tunnel.relay_inbox.emplace_back(std::chrono::steady_clock::now(),
                                       std::vector<uint8_t>(body, body + size));
+  } else if (kind == kTunnelKeepaliveAck && size >= 4) {
+    TunnelAcked(GetLE32(body));
+  } else if (kind == kTunnelWelcome && size >= 8 && g_tunnel.hello_nonce &&
+             GetLE32(body) == g_tunnel.hello_nonce) {
+    g_tunnel.hello_nonce = 0;
+    const uint32_t vip = GetLE32(body + 4), before = g_tunnel.vip.load();
+    TunnelWelcomed(body, size);
+    if (vip && vip != before) {
+      // Other players still know the old address; this one can't take it back.
+      REXLOG_ERROR("[net] tunnel: server re-registered this game as {} instead of {}; players "
+                   "already connected can no longer reach it",
+                   FormatIp(vip), FormatIp(before));
+      g_tunnel.vip.store(vip);
+    } else {
+      REXLOG_INFO("[net] tunnel: server confirmed {} again", FormatIp(before));
+    }
   }
+  return true;
+}
+
+void TunnelSendKeepalive() {
+  Tunnel& t = g_tunnel;
+  if (t.awaiting_ack) {
+    ++t.missed;
+  }
+  if (t.acked_any && t.missed >= kTunnelMissedAcks) {
+    REXLOG_WARN("[net] tunnel: {} keepalives in a row unanswered; registering {} again",
+                t.missed, FormatIp(t.vip.load()));
+    t.missed = 0;
+    t.hello_nonce = uint32_t(std::random_device{}()) | 1;
+    TunnelSendHello(t.hello_nonce, t.vip.load());
+  }
+  auto packet = TunnelPacket(kTunnelKeepalive, 24);
+  PutLE32(packet, t.vip.load());
+  PutLE32(packet, TunnelRosterId());
+  PutLE32(packet, nhl3on3::kNetProtocolVersion);
+  PutLE32(packet, t.token);
+  PutLE32(packet, ++t.seq);
+  PutLE32(packet, t.rtt_ms.load());
+  t.seq_sent = std::chrono::steady_clock::now();
+  t.awaiting_ack = true;
+  TunnelSend(packet);
 }
 
 void TunnelLoop() {
@@ -382,16 +517,24 @@ void TunnelLoop() {
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_keepalive) {
-      auto packet = TunnelPacket(kTunnelKeepalive, 8);
-      PutLE32(packet, g_tunnel.vip.load());
-      PutLE32(packet, TunnelRosterId());
-      TunnelSend(packet);
+      TunnelSendKeepalive();
       next_keepalive = now + kTunnelKeepaliveInterval;
     }
-    if (TunnelReadable(250)) {
-      TunnelReceiveOne();
+    // A failing socket would otherwise spin this thread.
+    const int readable = TunnelReadable(250);
+    if (readable < 0 || (readable > 0 && !TunnelReceiveOne())) {
+      std::this_thread::sleep_for(kTunnelErrorBackoff);
     }
   }
+}
+
+void CloseTunnelSocket() {
+#ifdef _WIN32
+  closesocket(g_tunnel.socket);
+#else
+  close(g_tunnel.socket);
+#endif
+  g_tunnel.socket = kNoTunnelSocket;
 }
 
 // Asks the server for a virtual address; 0 if it does not answer.
@@ -399,6 +542,7 @@ uint32_t TunnelRegister(uint32_t server_ip) {
   Tunnel& t = g_tunnel;
   t.socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (t.socket == kNoTunnelSocket) {
+    REXLOG_ERROR("[net] tunnel: could not create a UDP socket");
     return 0;
   }
   sockaddr_in local{};
@@ -414,37 +558,45 @@ uint32_t TunnelRegister(uint32_t server_ip) {
   t.server.sin_family = AF_INET;
   t.server.sin_port = htons(kTunnelPort);
   t.server.sin_addr.s_addr = htonl(server_ip);
+  // Only the server's datagrams are received from here on.
+  if (::connect(t.socket, reinterpret_cast<const sockaddr*>(&t.server), sizeof(t.server)) != 0) {
+    REXLOG_ERROR("[net] tunnel: could not connect a UDP socket to {}:{}", FormatIp(server_ip),
+                 kTunnelPort);
+    CloseTunnelSocket();
+    return 0;
+  }
   const uint32_t nonce = uint32_t(std::random_device{}());
   for (int attempt = 0; attempt < 10; ++attempt) {
-    auto hello = TunnelPacket(kTunnelHello, 12);
-    PutLE32(hello, nonce);
-    PutLE32(hello, 0);
-    PutLE32(hello, TunnelRosterId());
-    TunnelSend(hello);
+    TunnelSendHello(nonce, 0);
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
-    while (std::chrono::steady_clock::now() < until && TunnelReadable(50)) {
+    while (std::chrono::steady_clock::now() < until && TunnelReadable(50) > 0) {
       uint8_t buffer[64];
       const int n = ::recv(t.socket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
       if (n >= int(kTunnelHeader + 8) && GetLE32(buffer) == kTunnelMagic &&
           buffer[4] == kTunnelWelcome && GetLE32(buffer + kTunnelHeader) == nonce) {
         const uint32_t vip = GetLE32(buffer + kTunnelHeader + 4);
+        TunnelWelcomed(buffer + kTunnelHeader, size_t(n) - kTunnelHeader);
         t.vip.store(vip);
         std::thread(TunnelLoop).detach();
         return vip;
       }
     }
   }
-#ifdef _WIN32
-  closesocket(t.socket);
-#else
-  close(t.socket);
-#endif
-  t.socket = kNoTunnelSocket;
+  CloseTunnelSocket();
   return 0;
 }
 
 bool TunnelActive() {
   return g_tunnel.vip.load() != 0;
+}
+
+// QoS round trip: the measured one to the tunnel server when known (every
+// peer is reached through it), else a good-connection guess.
+void StoreQosRtt(XnQosInfo& info) {
+  const uint32_t rtt = std::min<uint32_t>(g_tunnel.rtt_ms.load(), 0xFFFF);
+  const uint32_t lowest = std::min<uint32_t>(g_tunnel.rtt_min_ms.load(), rtt);
+  StoreBE16(info.rtt_min, uint16_t(rtt ? std::max<uint32_t>(lowest, 1) : 20));
+  StoreBE16(info.rtt_med, uint16_t(rtt ? rtt : 25));
 }
 
 bool IsTunnelAddress(uint32_t ip) {
@@ -513,23 +665,42 @@ const NetState& State() {
         REXLOG_INFO("[net] tunnel: server {}:{} assigned {}", FormatIp(s.server_ip), kTunnelPort,
                     FormatIp(ip));
       } else {
-        REXLOG_WARN("[net] tunnel: no answer from {}:{}; playing direct (other players must "
-                    "be able to reach this address)",
+        g_tunnel.fell_back.store(true);
+        REXLOG_WARN("[net] ================================================================");
+        REXLOG_WARN("[net] TUNNEL FAILED: no answer from {}:{}. Playing DIRECT: other players "
+                    "must be able to reach this address, and players still on the tunnel "
+                    "(10.66.x.y) cannot play with this one",
                     FormatIp(s.server_ip), kTunnelPort);
+        REXLOG_WARN("[net] ================================================================");
       }
     }
     if (!ip) {
       const std::string ip_setting = REXCVAR_GET(online_ip);
       ip = ip_setting.empty() ? DetectLocalIp() : ResolveIpv4(ip_setting);
+      if (!ip && Online()) {
+        REXLOG_WARN("[net] could not {} the local address; advertising {} instead, so other "
+                    "machines cannot reach this one (set online_ip)",
+                    ip_setting.empty() ? "detect" : "resolve online_ip '" + ip_setting + "' to",
+                    FormatIp(s.local_ip));
+      }
     }
     if (ip) {
       s.local_ip = ip;
     }
     const std::string xuid_setting = REXCVAR_GET(online_xuid);
+    s.xuid = 0x0009000000000000ull | (uint64_t(0xEA09) << 32) | s.local_ip;
     if (!xuid_setting.empty()) {
-      s.xuid = std::stoull(xuid_setting, nullptr, 16);
-    } else {
-      s.xuid = 0x0009000000000000ull | (uint64_t(0xEA09) << 32) | s.local_ip;
+      try {
+        size_t used = 0;
+        const uint64_t xuid = std::stoull(xuid_setting, &used, 16);
+        if (used != xuid_setting.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+        s.xuid = xuid;
+      } catch (const std::exception&) {
+        REXLOG_WARN("[net] online_xuid '{}' is not a hex XUID; using {:016X}", xuid_setting,
+                    s.xuid);
+      }
     }
     REXLOG_INFO("[net] online: local {} server {} xuid {:016X}", FormatIp(s.local_ip),
                 FormatIp(s.server_ip), s.xuid);
@@ -546,6 +717,15 @@ std::atomic<uint32_t> g_last_peer_ip{0};
 std::atomic<uint32_t> g_game_port{3659};
 std::mutex g_game_peers_mutex;
 std::vector<uint32_t> g_game_peers;
+
+// Forgets the peers: a new match's game link learns its own.
+void ClearGamePeers(const char* why) {
+  std::lock_guard lock(g_game_peers_mutex);
+  if (!g_game_peers.empty()) {
+    REXLOG_INFO("[net] forgetting {} game link peer(s): {}", g_game_peers.size(), why);
+    g_game_peers.clear();
+  }
+}
 
 void NoteGamePeer(uint32_t ip, uint16_t port) {
   if (port != g_game_port.load()) {
@@ -773,6 +953,7 @@ extern "C" REX_FUNC(__imp__NetDll_XNetXnAddrToInAddr) {
   StoreBE32(base + ctx.r6.u32, ip);
   if (ip != State().local_ip) {
     g_last_peer_ip.store(ip);
+    nhl3on3::team_lobby::NoteAddress(ip);
   }
   REXLOG_INFO("[net] XNetXnAddrToInAddr -> {}", FormatIp(ip));
   ctx.r3.u64 = 0;
@@ -930,8 +1111,7 @@ extern "C" REX_FUNC(__imp__NetDll_XNetQosServiceLookup) {
     info.flags = kQosInfoContacted;
     StoreBE16(info.probes_xmit, 4);
     StoreBE16(info.probes_recv, 4);
-    StoreBE16(info.rtt_min, 20);
-    StoreBE16(info.rtt_med, 25);
+    StoreQosRtt(info);
     StoreBE32(info.up_bps, 10'000'000);
     StoreBE32(info.down_bps, 50'000'000);
     StoreBE32(base + ctx.r6.u32, guest);
@@ -1128,17 +1308,24 @@ void NoteLobbySend(const uint8_t* base, uint32_t buffer, uint32_t length) {
   if (cmd != "~png") {
     REXLOG_INFO("[lobby] -> {} {}", cmd, LobbySummary(body));
   }
+  if (cmd == "glea" || cmd == "gdel") {
+    nhl3on3::UseDefaultGameSettings(false);
+    return;
+  }
   if (cmd != "gqwk" && cmd != "gcre" && cmd != "gjoi") {
     return;
   }
   const auto flags = LobbyField(body, "SYSFLAGS");
   if (cmd == "gqwk" && !flags) {
+    nhl3on3::UseDefaultGameSettings(false);
     return;  // MODE=3 cancels a search
   }
+  nhl3on3::UseDefaultGameSettings(true);
   const bool ranked = flags && RankedFlags(*flags);
   g_ranked_search.store(ranked);
   g_game_consoles.store(0);
   nhl3on3::team_lobby::Reset();
+  ClearGamePeers("new lobby game");
   const char* kind = ranked ? "ranked" : "unranked (team play)";
   if (cmd == "gqwk") {
     REXLOG_INFO("[mm] quick match search: {}", kind);
@@ -1272,6 +1459,9 @@ void CountDatagram(const char* what, uint32_t socket, uint32_t ip, uint16_t port
     const size_t text_length = (size_t(p[0]) << 24) | (size_t(p[1]) << 16) | (size_t(p[2]) << 8) | p[3];
     const std::string_view text = view.substr(at + 12, std::min(text_length, view.size() - at - 12));
     REXLOG_INFO("[osdk] {} {} {}: {}", what, what[0] == 'r' ? "from" : "to", FormatIp(ip), text);
+    if (what[0] == 'r') {
+      nhl3on3::team_lobby::NoteAddress(ip);
+    }
     nhl3on3::team_lobby::OnControlMessage(text);
   }
   if (n <= 12 || (n & (n - 1)) == 0) {
@@ -1434,6 +1624,37 @@ void WakeTunnelReceivers(uint16_t port) {
   }
 }
 
+// Which of `sockets` are readable, waiting up to `timeout_us`; returns how
+// many, or -1 if select fails. An fd_set holds FD_SETSIZE sockets (64 on
+// Windows), so more are checked in batches; only the first batch waits.
+int ReadableSockets(const std::vector<NativeSocket>& sockets, long timeout_us,
+                    std::vector<bool>& readable) {
+  readable.assign(sockets.size(), false);
+  int total = 0;
+  for (size_t at = 0; at < sockets.size(); at += FD_SETSIZE) {
+    const size_t end = std::min<size_t>(sockets.size(), at + FD_SETSIZE);
+    fd_set set;
+    FD_ZERO(&set);
+    int max_fd = 0;
+    for (size_t i = at; i < end; ++i) {
+      FD_SET(sockets[i], &set);
+      max_fd = std::max(max_fd, int(sockets[i]));
+    }
+    timeval timeout{0, at == 0 ? timeout_us : 0};
+    const int ready = ::select(max_fd + 1, &set, nullptr, nullptr, &timeout);
+    if (ready < 0) {
+      return -1;
+    }
+    for (size_t i = at; ready > 0 && i < end; ++i) {
+      if (FD_ISSET(sockets[i], &set)) {
+        readable[i] = true;
+        ++total;
+      }
+    }
+  }
+  return total;
+}
+
 void WatchPendingRecvs() {
   for (;;) {
     struct Armed {
@@ -1454,17 +1675,13 @@ void WatchPendingRecvs() {
         return !armed.empty();
       });
     }
-    fd_set set;
-    FD_ZERO(&set);
-    int max_fd = 0;
+    std::vector<NativeSocket> natives;
     for (const Armed& a : armed) {
-      FD_SET(a.native, &set);
-      max_fd = std::max(max_fd, int(a.native));
+      natives.push_back(a.native);
     }
-    timeval timeout{0, 5000};
-    int ready = ::select(max_fd + 1, &set, nullptr, nullptr, &timeout);
+    std::vector<bool> readable;
+    const int ready = ReadableSockets(natives, 5000, readable);
     if (ready < 0) {
-      FD_ZERO(&set);
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     std::vector<uint16_t> tunneled;
@@ -1482,7 +1699,7 @@ void WatchPendingRecvs() {
       for (const Armed& a : armed) {
         auto it = g_pending_recvs.find(a.overlapped);
         const bool has_data =
-            (ready > 0 && FD_ISSET(a.native, &set)) ||
+            (ready > 0 && readable[size_t(&a - armed.data())]) ||
             std::find(tunneled.begin(), tunneled.end(), a.port) != tunneled.end();
         if (has_data && it != g_pending_recvs.end() && !it->second.signaled &&
             it->second.native == a.native) {
@@ -2120,6 +2337,7 @@ extern "C" REX_FUNC(sub_82761E08) {
   // The match ConnApi is the one sized for 2 clients; voice has its own.
   if (ctx.r4.u32 == 2 && ctx.r3.u32 && ctx.r3.u32 < 0x10000) {
     g_game_port.store(ctx.r3.u32);
+    ClearGamePeers("new match link");
   }
   if (team >= 3 && ctx.r4.u32 == 2) {
     REXLOG_INFO("[mm] team play: ConnApi port {} max clients 2 -> {}", ctx.r3.u32, team);
@@ -2336,8 +2554,7 @@ extern "C" REX_FUNC(__imp__NetDll_XNetQosLookup) {
       info.flags = kQosInfoContacted;
       StoreBE16(info.probes_xmit, 4);
       StoreBE16(info.probes_recv, 4);
-      StoreBE16(info.rtt_min, 20);
-      StoreBE16(info.rtt_med, 25);
+      StoreQosRtt(info);
       StoreBE32(info.up_bps, 10'000'000);
       StoreBE32(info.down_bps, 50'000'000);
     }
@@ -2367,6 +2584,15 @@ int Nhl3on3GameConsoles() {
 bool Nhl3on3TunnelActive() {
   State();
   return TunnelActive();
+}
+
+bool Nhl3on3TunnelFellBack() {
+  State();
+  return g_tunnel.fell_back.load();
+}
+
+void Nhl3on3ClearGamePeers() {
+  ClearGamePeers("match over");
 }
 
 void Nhl3on3TunnelSendRelay(const uint8_t* data, size_t size) {

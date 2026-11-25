@@ -11,7 +11,10 @@ import asyncio
 import datetime
 import logging
 import re
+import socket
 import struct
+import time
+from collections import deque
 
 log = logging.getLogger("lobby")
 
@@ -42,6 +45,14 @@ TEAM_MAX_PLAYERS = 8
 # reply, which can take a frame; notifications that arrive in the same read
 # as the reply are missed and the search never ends.
 MATCH_NOTIFY_DELAY = 1.0
+# Quick match keeps two players whose reported pings add up to more than this
+# apart until one of them has searched for PAIR_WAIT seconds.
+PAIR_RTT = 250
+PAIR_WAIT = 20.0
+CHAT_LIMIT, CHAT_WINDOW = 5, 2.0  # messages per that many seconds, per client
+MAX_CONNECTIONS_PER_IP = 16  # a LAN party or shared NAT has several
+SEND_BUFFER_LIMIT = 1 << 20  # unsent bytes before a client is dropped
+VIP_PREFIX = "10.66."
 # gset fields from the host that change the game everyone sees.
 GAME_SETTINGS = {"SYSFLAGS", "CUSTFLAGS", "PARAMS", "PLATPARAMS", "SESS", "PRIV",
                  "MINSIZE", "MAXSIZE"}
@@ -84,6 +95,20 @@ def sanitize(value, limit=64):
     return "".join(c for c in value if c not in "\0\n\r=")[:limit]
 
 
+def enable_keepalive(sock):
+    """TCP keepalives, so a vanished player's connection doesn't wait for the
+    read timeout (the lobby itself is silent for a whole match)."""
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 20), ("TCP_KEEPCNT", 6)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError:
+        pass
+
+
 class Client:
     """One lobby connection (one game instance)."""
     next_id = 1
@@ -96,6 +121,8 @@ class Client:
         self.persona = "Player"
         self.signed_in = False  # persona chosen at auth, unique among signed-in players
         self.peer_ip = peer_ip
+        # Whether peer_ip is the player's own address (not Fly's proxy).
+        self.trusted = True
         self.mac_ip = None
         self.maddr = ""
         self.room = 0  # ROOM_ID while on the lobby room's screens
@@ -104,6 +131,8 @@ class Client:
         # hosts, or will host next.
         self.invites = set()
         self.search = {}
+        self.search_since = 0.0
+        self.chat_times = deque()
         self.userflags = "0"
         self.userparams = ""
         # The guest list exactly as gset GUEST sent it, e.g. "Alpha(1),Alpha(2)";
@@ -132,26 +161,64 @@ class Client:
         """The game's roster pack id as its tunnel reported it; 0 is stock (and
         anyone not on the tunnel). Different packs desync, so quick match keeps
         them apart."""
+        return self.lobby.rosters.get(self.vip, 0)
+
+    @property
+    def version(self):
+        """The tunnel protocol version it reported (0: v1, or not tunneled)."""
+        return self.lobby.versions.get(self.vip, 0)
+
+    @property
+    def rtt(self):
+        """Its smoothed ping to the server (ms) as its tunnel reported it; 0 is
+        unknown."""
+        return self.lobby.rtts.get(self.vip, 0)
+
+    @property
+    def vip(self):
+        """self.ip as the tunnel's integer key; 0 if it is not IPv4."""
         try:
             a, b, c, d = (int(p) for p in self.ip.split("."))
         except ValueError:
             return 0
-        return self.lobby.rosters.get((a << 24) | (b << 16) | (c << 8) | d, 0)
+        return (a << 24) | (b << 16) | (c << 8) | d
 
     def learn(self, request):
         mac = request.get("MAC", "").lstrip("$")
         if len(mac) == 12 and mac.startswith("0022"):
             try:
-                self.mac_ip = ".".join(str(int(mac[i:i + 2], 16)) for i in range(4, 12, 2))
+                ip = ".".join(str(int(mac[i:i + 2], 16)) for i in range(4, 12, 2))
             except ValueError:
-                pass
+                ip = None
+            if ip and ip != self.mac_ip and self.lobby.owns(self, ip):
+                old, self.mac_ip = self.ip, ip
+                self.lobby.reindex(self, old)
         if request.get("MADDR"):
             self.maddr = sanitize(request["MADDR"], 256)
 
     def send(self, frame):
         if self.writer.is_closing():
             return
+        transport = self.writer.transport
+        if transport.get_write_buffer_size() > SEND_BUFFER_LIMIT:
+            log.info("%s dropped: not reading", self.name)
+            transport.abort()
+            return
         self.writer.write(frame)
+
+    def chat_allowed(self, now):
+        while self.chat_times and now - self.chat_times[0] >= CHAT_WINDOW:
+            self.chat_times.popleft()
+        if len(self.chat_times) >= CHAT_LIMIT:
+            return False
+        self.chat_times.append(now)
+        return True
+
+
+def same_build(a, b):
+    """Whether two games can play together: same roster pack and protocol
+    version (either difference desyncs)."""
+    return a.roster == b.roster and a.version == b.version
 
 
 class Game:
@@ -177,7 +244,7 @@ class Game:
             p.game = self
 
     def joinable(self, client):
-        if self.closed or not self.players or self.players[0].roster != client.roster:
+        if self.closed or not self.players or not same_build(self.players[0], client):
             return False
         if self.ranked:
             return len(self.players) < 2
@@ -190,13 +257,24 @@ class Game:
 
 
 class Lobby:
-    def __init__(self, public_ip):
+    def __init__(self, public_ip, trust_proxy=False):
         self.public_ip = public_ip
+        # Connections arrive through a proxy (Fly's) that starts each with a
+        # PROXY protocol line naming the player's address.
+        self.trust_proxy = trust_proxy
+        self.tunnel = None  # set by Tunnel
         self.clients = set()
-        # Searching clients, one queue per kind (ranked or not) and roster pack.
+        self.by_ip = {}  # Client.ip -> its clients
+        # Searching clients, one queue per kind (ranked or not), roster pack
+        # and protocol version.
         self.queues = {}
-        # Roster pack id by tunnel virtual address (see Client.roster).
+        # Roster pack id, protocol version and ping by tunnel virtual address
+        # (see Client.roster), until the tunnel peer times out.
         self.rosters = {}
+        self.versions = {}
+        self.rtts = {}
+        # Shutting down: no new games or searches.
+        self.draining = False
         # Games still taking players: unranked quick match games and created
         # sessions, until they start or lose their host.
         self.open_games = []
@@ -204,10 +282,42 @@ class Lobby:
     # -- queries used by the tunnel/relay --------------------------------
 
     def game_of_ip(self, ip):
-        for c in self.clients:
-            if c.ip == ip and c.game:
+        for c in self.by_ip.get(ip, ()):
+            if c.game:
                 return c.game
         return None
+
+    def reindex(self, client, old_ip):
+        same = self.by_ip.get(old_ip)
+        if same:
+            same.discard(client)
+            if not same:
+                del self.by_ip[old_ip]
+        if client in self.clients:
+            self.by_ip.setdefault(client.ip, set()).add(client)
+
+    def owns(self, client, ip):
+        """Whether `client` may claim `ip` as its address: a tunnel address
+        must be registered from the lobby connection's public IP. Others
+        (direct connections) are taken as they are."""
+        if not ip.startswith(VIP_PREFIX) or not client.trusted:
+            return True
+        a, b, c, d = (int(p) for p in ip.split("."))
+        peer = self.tunnel and self.tunnel.by_vip.get((a << 24) | (b << 16) | (c << 8) | d)
+        if peer and peer.addr[0] == client.peer_ip:
+            return True
+        log.info("%s: ignoring tunnel address %s (%s)", client.name, ip,
+                 f"registered from {peer.addr[0]}" if peer else "not registered")
+        return False
+
+    def tunnel_lost(self, vip):
+        """The tunnel peer `vip` timed out, so its game is gone: drops its
+        lobby connection rather than wait for the read timeout."""
+        ip = f"{vip >> 24}.{(vip >> 16) & 255}.{(vip >> 8) & 255}.{vip & 255}"
+        for c in list(self.by_ip.get(ip, ())):
+            if c.mac_ip == ip:
+                log.info("%s dropped: tunnel address timed out", c.name)
+                c.writer.transport.abort()
 
     def status(self):
         games = {id(c.game): c.game for c in self.clients if c.game}
@@ -223,15 +333,36 @@ class Lobby:
     async def handle(self, reader, writer):
         peer = writer.get_extra_info("peername") or ("?", 0)
         client = Client(self, writer, peer[0])
+        client.trusted = not self.trust_proxy
+        enable_keepalive(writer.get_extra_info("socket"))
         self.clients.add(client)
+        self.reindex(client, None)
         log.info("connection %s from %s:%s", client.id, peer[0], peer[1])
         buffer = b""
+        header = self.trust_proxy
         try:
+            self.admit(client)
             while True:
                 data = await asyncio.wait_for(reader.read(65536), timeout=READ_TIMEOUT)
                 if not data:
                     break
                 buffer += data
+                if header:
+                    # "PROXY TCP4 <client> <server> <client port> <port>\r\n"
+                    if b"PROXY ".startswith(buffer[:6]) and b"\r\n" not in buffer[:108]:
+                        if len(buffer) < 108:
+                            continue
+                        raise ValueError("bad PROXY line")
+                    header = False
+                    if buffer.startswith(b"PROXY "):
+                        line, _, buffer = buffer.partition(b"\r\n")
+                        parts = line.decode("latin1").split()
+                        if len(parts) >= 3 and parts[1] in ("TCP4", "TCP6"):
+                            ip = parts[2].removeprefix("::ffff:")
+                            old, client.peer_ip, client.trusted = client.ip, ip, True
+                            self.reindex(client, old)
+                            log.info("connection %s is from %s", client.id, client.peer_ip)
+                            self.admit(client)
                 while len(buffer) >= 12:
                     length = struct.unpack(">I", buffer[8:12])[0]
                     if length < 12 or length > MAX_FRAME:
@@ -250,12 +381,23 @@ class Lobby:
                 await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, ValueError) as e:
             log.info("%s dropped: %s", client.name, e or type(e).__name__)
+        except Exception:
+            log.exception("%s dropped: unexpected error", client.name)
         finally:
             self.leave_game(client)
             self.leave_room(client)
             self.clients.discard(client)
+            self.reindex(client, client.ip)
             log.info("%s disconnected", client.name)
             writer.close()
+
+    def admit(self, client):
+        """Caps connections per source address (once it is known)."""
+        if not client.trusted:
+            return
+        same = sum(1 for c in self.clients if c.trusted and c.peer_ip == client.peer_ip)
+        if same > MAX_CONNECTIONS_PER_IP:
+            raise ValueError(f"too many connections from {client.peer_ip}")
 
     # -- games ------------------------------------------------------------
 
@@ -287,10 +429,8 @@ class Lobby:
             "SEED": game.id * 7919,
             "WHEN": f"{game.when:%Y.%m.%d-%H:%M:%S}",
             "AUTH": "098f6bcd4621d373cade4e832627b4f6" if ranked else "",
-            # The host's XSESSION_INFO once it has created the session. Joiners
-            # wait while it is empty (game start returns failure, Select Sides
-            # never links, A does not ready) and accept the host's blob as-is,
-            # including the XSession stub's non-text bytes.
+            # The host's XSESSION_INFO once it has created the session; joiners
+            # wait while it is empty and fail on anything else.
             "SESS": req.get("SESS", ""),
             "EVID": 0,
             "EVGID": 0,
@@ -364,6 +504,9 @@ class Lobby:
         if mode != "2":
             return
         self.leave_game(client)
+        if self.draining:
+            self.notice(client, "THE SERVER IS RESTARTING. TRY AGAIN IN A FEW MINUTES.")
+            return
         client.userflags = "0"
         client.search = request
         try:
@@ -382,19 +525,45 @@ class Lobby:
                 self.notify_later(game, [client])
                 return
         roster = client.roster
-        queue = self.queues.setdefault((ranked, roster), [])
-        if not queue:
-            queue.append(client)
-            log.info("quick match (%s): %s waiting (roster %s)", kind, client.name,
-                     f"{roster:08x}" if roster else "stock")
-            return
-        players = [queue.pop(0), client]
-        game = Game(players[0].search, players, ranked)
-        if not ranked:
-            self.open_games.append(game)
-        log.info("quick match (%s): game %d: %s", kind, game.id,
-                 ", ".join(f"{p.name} ({p.ip})" for p in players))
-        self.notify_later(game, players)
+        queue = self.queues.setdefault((ranked, roster, client.version), [])
+        client.search_since = time.monotonic()
+        queue.append(client)
+        if not self.pair(ranked, queue, client.search_since):
+            log.info("quick match (%s): %s waiting (roster %s, v%d, %s)", kind, client.name,
+                     f"{roster:08x}" if roster else "stock", client.version or 1,
+                     f"{client.rtt} ms" if client.rtt else "ping unknown")
+
+    def pair(self, ranked, queue, now):
+        """Starts a game for the first two players in `queue` (oldest first)
+        that may meet: unless one has waited PAIR_WAIT, not two whose pings
+        add up to more than PAIR_RTT."""
+        for i, a in enumerate(queue):
+            for b in queue[i + 1:]:
+                if (a.rtt and b.rtt and a.rtt + b.rtt > PAIR_RTT
+                        and now - a.search_since < PAIR_WAIT):
+                    continue
+                queue.remove(a)
+                queue.remove(b)
+                players = [a, b]
+                game = Game(a.search, players, ranked)
+                if not ranked:
+                    self.open_games.append(game)
+                log.info("quick match (%s): game %d: %s", "ranked" if ranked else "team play",
+                         game.id, ", ".join(f"{p.name} ({p.ip}, {p.rtt} ms)" for p in players))
+                self.notify_later(game, players)
+                return True
+        return False
+
+    async def run(self):
+        """Pairs players kept apart by ping once they have waited long enough."""
+        while True:
+            await asyncio.sleep(1)
+            now = time.monotonic()
+            if self.draining:
+                continue
+            for (ranked, *_), queue in list(self.queues.items()):
+                while len(queue) >= 2 and self.pair(ranked, queue, now):
+                    pass
 
     def notify_later(self, game, joined, membership=True):
         """Tells `joined` they are in `game` (+who) and, with `membership`,
@@ -418,6 +587,10 @@ class Lobby:
         unranked and public, by quick match. The host starts it with gsta like
         a quick match game."""
         self.leave_game(client)
+        if self.draining:
+            self.notice(client, "THE SERVER IS RESTARTING. TRY AGAIN IN A FEW MINUTES.")
+            client.send(lobby_frame(b"gcre", {}, status=b"full"))
+            return
         client.userflags = "0"
         client.search = request
         try:
@@ -452,7 +625,7 @@ class Lobby:
         for persona in sorted(client.invites):
             self.send_invite(client, persona)
         # A team play search already waiting for a second player joins it.
-        queue = self.queues.get((False, client.roster), [])
+        queue = self.queues.get((False, client.roster, client.version), [])
         joined = []
         while queue and game.open_to(queue[0]):
             searcher = queue.pop(0)
@@ -483,7 +656,7 @@ class Lobby:
 
     def listed_to(self, game, client):
         return (game in self.open_games and bool(game.players)
-                and game.players[0].roster == client.roster)
+                and same_build(game.players[0], client))
 
     def update_listing(self, game):
         """Tells the room about a game that opened, changed or went away
@@ -547,7 +720,7 @@ class Lobby:
         if game is not None and client.game is game:
             client.send(lobby_frame(b"gjoi", self.game_info(game)))
             return
-        error = (b"ugam" if game is None else b"asta" if game.closed
+        error = (b"ugam" if game is None else b"asta" if game.closed or self.draining
                  else b"pass" if game.request.get("PASS", "") not in ("", request.get("PASS"))
                  else None if game.joinable(client) else b"full")
         if error:
@@ -648,6 +821,8 @@ class Lobby:
         """mesg: TEXT to the room (or, while in a game, to its players), or
         to the player PRIV. Everyone addressed gets +msg, the sender too."""
         client.send(lobby_frame(b"mesg", {k: v for k, v in request.items() if k != "MADDR"}))
+        if not client.chat_allowed(time.monotonic()):
+            return
         text = "".join(c for c in request.get("TEXT", "") if c not in "\0\n\r\t")[:256]
         attr = sanitize(request.get("ATTR", ""), 16)
         priv = request.get("PRIV")
@@ -704,7 +879,7 @@ class Lobby:
             if target is None or target is client:
                 self.notice(client, f"NO PLAYER NAMED {name} IS ONLINE.", attr)
                 continue
-            if target.roster != client.roster:
+            if not same_build(target, client):
                 self.notice(client, f"{target.persona} HAS A DIFFERENT ROSTER AND CANNOT JOIN.",
                             attr)
                 continue
@@ -753,7 +928,12 @@ class Lobby:
             if not client.game:
                 return [lobby_frame(cmd, request)]
             client.send(lobby_frame(cmd, request))
-            if client.game.players[0] is client and not client.game.closed:
+            if client.game.players[0] is not client:
+                # Only the host starts the game (all captured team play logs
+                # agree); another console's gsta gets the game only itself.
+                client.send(lobby_frame(b"+ses", self.game_info(client.game)))
+                return []
+            if not client.game.closed:
                 self.close(client.game)
                 log.info("game %d: started with %d consoles", client.game.id,
                          len(client.game.players))
@@ -763,7 +943,11 @@ class Lobby:
             client.userflags = sanitize(request.get("USERFLAGS", client.userflags))
             client.userparams = sanitize(request.get("USERPARAMS", client.userparams), 256)
             if "GUEST" in request:
-                client.guest_field = sanitize(request["GUEST"], 128)
+                old, client.guest_field = client.guest_field, sanitize(request["GUEST"], 128)
+                if client.game and sum(p.users for p in client.game.players) > TEAM_MAX_PLAYERS:
+                    log.info("game %d: %s guests refused (game full)", client.game.id,
+                             client.name)
+                    client.guest_field = old
             if client.game:
                 if client is client.game.players[0]:
                     client.game.request.update(

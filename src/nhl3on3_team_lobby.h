@@ -9,8 +9,9 @@
 
 namespace nhl3on3::team_lobby {
 
-// Side (0 or 1) of the player at session index `index`: their pick, or
-// session order parity if they made none.
+// Side (0 away / blue, 1 home / red) of the player at session index `index`:
+// their pick with three or more consoles, else alternating from the host at
+// home (the stock 1v1 sides with two consoles).
 uint32_t SideOf(uint32_t index);
 
 // Lineup slot for the player at `index`: side + 2 * rank among the players
@@ -37,5 +38,9 @@ void Reset();
 
 // An OSDK session control message ("name|CMD|data") sent or received.
 void OnControlMessage(std::string_view text);
+
+// A peer's address (from its XNADDR or a control message it sent); the
+// lobby warns when tunneled (10.66.x.y) and direct players are mixed.
+void NoteAddress(uint32_t ip);
 
 }  // namespace nhl3on3::team_lobby

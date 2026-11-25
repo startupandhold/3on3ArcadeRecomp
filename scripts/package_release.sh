@@ -43,12 +43,16 @@ mkdir -p "$out"
 stage_root=$(mktemp -d)
 trap 'rm -rf "$stage_root"' EXIT
 
-# Files both platforms ship: the license and an empty game/ folder.
+# Files both platforms ship: the license, an empty game/ folder, and
+# version.txt, the release tag the launchers' updater compares against the
+# latest GitHub release (a folder without it never updates). The tag must
+# be the version given here.
 # The custom roster (roster.json + headshots) is a separate zip; see
 # scripts/package_roster.sh.
 stage_common() {
   local dir=$1
   mkdir -p "$dir/game"
+  printf '%s\n' "$version" > "$dir/version.txt"
   cp LICENSE "$dir/LICENSE.txt"
   cp release/game/PUT_GAME_FILES_HERE.txt "$dir/game/"
 }

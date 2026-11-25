@@ -7,7 +7,8 @@
 // sub_82580C90(adapter, id, value) changes it, routing each id to the system
 // that owns it. Changes made in the options menus are written to the
 // game_settings line of nhl3on3.toml as "id=value" pairs and replayed through
-// the same setter once the adapter exists.
+// the same setter once the adapter exists. In online games they go back to
+// the game's defaults (see UseDefaultGameSettings).
 
 #include "nhl3on3_settings.h"
 
@@ -50,8 +51,13 @@ constexpr uint32_t kMaxSettingId = 188;
 std::mutex g_mutex;
 std::filesystem::path g_config_path;
 std::map<uint32_t, int32_t> g_saved;
+// The game's own value of each setting game_settings or a menu changed, read
+// before the first change.
+std::map<uint32_t, int32_t> g_defaults;
 bool g_loaded = false;
 std::atomic<bool> g_restored{false};
+std::atomic<bool> g_want_defaults{false};
+std::atomic<bool> g_using_defaults{false};
 
 std::map<uint32_t, int32_t> Parse(std::string_view text) {
   std::map<uint32_t, int32_t> out;
@@ -172,15 +178,58 @@ void SetConfigPath(const std::filesystem::path& path) {
   g_config_path = path;
 }
 
+void UseDefaultGameSettings(bool use_defaults) {
+  g_want_defaults.store(use_defaults);
+}
+
 }  // namespace nhl3on3
 
+extern "C" void __imp__sub_82580628(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_82580C90(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_8258B5D0(PPCContext& __restrict ctx, uint8_t* base);
+
+namespace {
+
+int32_t ReadSetting(PPCContext& ctx, uint8_t* base, uint32_t adapter, uint32_t id) {
+  const PPCContext caller = ctx;
+  ctx.r3.u64 = adapter;
+  ctx.r4.u64 = id;
+  __imp__sub_82580628(ctx, base);
+  const int32_t value = ctx.r3.s32;
+  ctx = caller;
+  return value;
+}
+
+void WriteSetting(PPCContext& ctx, uint8_t* base, uint32_t adapter, uint32_t id, int32_t value) {
+  const PPCContext caller = ctx;
+  ctx.r3.u64 = adapter;
+  ctx.r4.u64 = id;
+  ctx.r5.s64 = value;
+  __imp__sub_82580C90(ctx, base);
+  ctx = caller;
+}
+
+void NoteDefault(PPCContext& ctx, uint8_t* base, uint32_t adapter, uint32_t id) {
+  {
+    std::lock_guard lock(g_mutex);
+    if (g_defaults.contains(id)) {
+      return;
+    }
+  }
+  const int32_t value = ReadSetting(ctx, base, adapter, id);
+  std::lock_guard lock(g_mutex);
+  g_defaults.try_emplace(id, value);
+}
+
+}  // namespace
 
 // Settings adapter setter(adapter, id, value).
 extern "C" REX_FUNC(sub_82580C90) {
   const uint32_t id = ctx.r4.u32, lr = uint32_t(ctx.lr);
   const int32_t value = ctx.r5.s32;
+  if (lr == kMenuChange && id <= kMaxSettingId && ctx.r3.u32) {
+    NoteDefault(ctx, base, ctx.r3.u32, id);
+  }
   __imp__sub_82580C90(ctx, base);
   if (lr >= kSetterStart && lr < kSetterEnd) {
     return;  // one setting changing others
@@ -198,32 +247,56 @@ extern "C" REX_FUNC(sub_82580C90) {
   }
 }
 
-// Settings adapter instance (created on first use). The saved options are
-// applied through the setter the first time it exists.
+// Settings adapter instance (created on first use, then fetched for every
+// settings access). The saved options are applied through the setter the
+// first time it exists, and swapped for or back from the game's defaults when
+// UseDefaultGameSettings changes.
 extern "C" REX_FUNC(sub_8258B5D0) {
   __imp__sub_8258B5D0(ctx, base);
   const uint32_t adapter = ctx.r3.u32;
-  if (!adapter || g_restored.load(std::memory_order_relaxed) || g_restored.exchange(true)) {
+  if (!adapter) {
     return;
   }
-  std::map<uint32_t, int32_t> saved;
+  if (!g_restored.load(std::memory_order_relaxed) && !g_restored.exchange(true)) {
+    std::map<uint32_t, int32_t> saved;
+    {
+      std::lock_guard lock(g_mutex);
+      LoadOnce();
+      saved = g_saved;
+    }
+    REXLOG_INFO("[settings] adapter {:08X} created; restoring {} saved settings", adapter,
+                REXCVAR_GET(restore_game_settings) ? saved.size() : 0);
+    if (REXCVAR_GET(restore_game_settings)) {
+      for (const auto& [id, value] : saved) {
+        NoteDefault(ctx, base, adapter, id);
+        WriteSetting(ctx, base, adapter, id, value);
+        REXLOG_INFO("[settings] restored {} = {}", id, value);
+      }
+    }
+  }
+  const bool want_defaults = g_want_defaults.load(std::memory_order_relaxed);
+  if (g_using_defaults.load(std::memory_order_relaxed) == want_defaults ||
+      g_using_defaults.exchange(want_defaults) == want_defaults) {
+    return;
+  }
+  std::map<uint32_t, int32_t> values;
   {
     std::lock_guard lock(g_mutex);
-    LoadOnce();
-    saved = g_saved;
+    if (want_defaults) {
+      values = g_defaults;
+    } else {
+      for (const auto& [id, value] : g_saved) {
+        if (g_defaults.contains(id)) {
+          values.emplace(id, value);
+        }
+      }
+    }
   }
-  REXLOG_INFO("[settings] adapter {:08X} created; restoring {} saved settings", adapter,
-              REXCVAR_GET(restore_game_settings) ? saved.size() : 0);
-  if (!REXCVAR_GET(restore_game_settings)) {
-    return;
-  }
-  const PPCContext caller = ctx;
-  for (const auto& [id, value] : saved) {
-    ctx.r3.u64 = adapter;
-    ctx.r4.u64 = id;
-    ctx.r5.s64 = value;
-    __imp__sub_82580C90(ctx, base);
-    ctx = caller;
-    REXLOG_INFO("[settings] restored {} = {}", id, value);
+  REXLOG_INFO("[settings] online game {}: {} settings back to {}",
+              want_defaults ? "joined" : "left", values.size(),
+              want_defaults ? "the game's defaults" : "their saved values");
+  for (const auto& [id, value] : values) {
+    WriteSetting(ctx, base, adapter, id, value);
+    REXLOG_INFO("[settings]   {} = {}", id, value);
   }
 }

@@ -4,6 +4,15 @@
 
 #include <rex/ppc/context.h>
 
+namespace nhl3on3 {
+
+// Version of the online protocol (server/PROTOCOL_V2.md), sent in tunnel
+// hellos and keepalives and in the lobby's TRF. Bump it whenever gameplay
+// determinism or a wire format changes.
+constexpr uint32_t kNetProtocolVersion = 2;
+
+}  // namespace nhl3on3
+
 // Carries a 3+ console match's lockstep input through the host instead of the
 // game's NetGameDist links. Clients only link to the host, and the 12-slot
 // dist mode expects a server to combine every slot's input, so each console
